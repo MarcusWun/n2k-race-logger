@@ -1,0 +1,35 @@
+export interface ConnectionStatus {
+  port: string;
+  baud: number;
+  status: 'disconnected' | 'connecting' | 'connected' | 'error';
+  error?: string;
+}
+
+export interface RecordingStatus {
+  active: boolean;
+  elapsed: number;
+  count: number;
+  fileSize: number;
+}
+
+export interface PolarPerformance {
+  percentPolar: number | null;
+  targetSpeed: number | null;
+  actualSpeed: number | null;
+}
+
+export interface AppSettings {
+  serialPort: string;
+  serialBaud: number;
+  pgnFilter: number[];
+  dataDirectory: string;
+  polarDirectory: string;
+  activePolarProfile?: number;
+}
+
+export interface SerialPortInfo {
+  path: string;
+  manufacturer?: string;
+  productId?: string;
+  vendorId?: string;
+}

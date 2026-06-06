@@ -1,0 +1,56 @@
+import { contextBridge, ipcRenderer } from 'electron';
+
+const api = {
+  // Connection
+  connect: (payload: { port?: string; baud?: number }) =>
+    ipcRenderer.invoke('connection:connect', payload),
+  disconnect: () => ipcRenderer.invoke('connection:disconnect'),
+  listPorts: () => ipcRenderer.invoke('serial:list-ports'),
+
+  // Recording
+  startRecording: (payload: { label?: string }) =>
+    ipcRenderer.invoke('recording:start', payload),
+  stopRecording: () => ipcRenderer.invoke('recording:stop'),
+  getRecordingStatus: () => ipcRenderer.invoke('recording:status'),
+
+  // Polar
+  importPolar: (payload: { filePath: string }) =>
+    ipcRenderer.invoke('polar:import', payload),
+  listPolars: () => ipcRenderer.invoke('polar:list'),
+  getPolar: (payload: { id: number }) =>
+    ipcRenderer.invoke('polar:get', payload),
+  getPerformance: (payload: { tws: number | null; twa: number | null; stw: number | null; profileId: number }) =>
+    ipcRenderer.invoke('polar:performance', payload),
+
+  // Settings
+  getSettings: () => ipcRenderer.invoke('settings:get'),
+  setSettings: (payload: Record<string, any>) =>
+    ipcRenderer.invoke('settings:set', payload),
+
+  // Event listeners
+  on: (channel: string, callback: (...args: any[]) => void) => {
+    const validChannels = [
+      'connection:status',
+      'pgn:data',
+      'recording:status',
+      'serial:ports',
+      'polar:profiles',
+      'polar:data',
+      'polar:performance',
+    ];
+    if (validChannels.includes(channel)) {
+      const listener = (_event: any, ...args: any[]) => callback(...args);
+      ipcRenderer.on(channel, listener);
+      return () => ipcRenderer.removeListener(channel, listener);
+    }
+    return () => {};
+  },
+
+  removeAllListeners: (channel: string) => {
+    ipcRenderer.removeAllListeners(channel);
+  },
+};
+
+contextBridge.exposeInMainWorld('n2k', api);
+
+export type N2KAPI = typeof api;

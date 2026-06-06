@@ -39,10 +39,10 @@ jobs:
       - name: Run tests
         run: npm run test:run
 
-      - name: Rebuild native modules for Electron (packaging)
+      - name: Remove canboatjs native binding to prevent rebuild
         run: |
-          npx --yes electron-rebuild -f --only better-sqlite3
-          npx --yes electron-rebuild -f --only @serialport/bindings-cpp
+          Remove-Item -Path node_modules\@canboat\canboatjs\binding.gyp -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path node_modules\@canboat\canboatjs\native -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Build Electron app
         run: npx tsc && npx vite build && npx electron-builder --win

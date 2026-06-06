@@ -40,7 +40,7 @@ jobs:
         run: npm run test:run
 
       - name: Rebuild native modules for Electron (packaging)
-        run: npx --yes electron-rebuild -f -w better-sqlite3 -w @serialport/bindings-cpp
+        run: npx --yes electron-rebuild -f better-sqlite3 @serialport/bindings-cpp
 
       - name: Build Electron app
         run: npx tsc && npx vite build && npx electron-builder --win

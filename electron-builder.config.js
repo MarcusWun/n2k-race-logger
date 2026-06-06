@@ -1,6 +1,7 @@
 module.exports = {
   appId: 'n2k-race-logger',
   productName: 'N2K Race Logger',
+  npmRebuild: false,
   directories: {
     output: 'dist',
     buildResources: 'build',

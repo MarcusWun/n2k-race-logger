@@ -5,6 +5,7 @@ import renderer from 'vite-plugin-electron-renderer';
 import { resolve } from 'path';
 
 export default defineConfig({
+  base: './',
   plugins: [
     react(),
     electron([
@@ -14,7 +15,7 @@ export default defineConfig({
           build: {
             outDir: 'dist-electron',
             rollupOptions: {
-              external: ['electron', 'better-sqlite3', 'serialport', '@serialport/parser-readline', '@serialport/stream'],
+              external: ['electron', 'better-sqlite3', 'serialport', '@serialport/parser-readline', '@serialport/stream', '@canboat/canboatjs'],
             },
           },
         },

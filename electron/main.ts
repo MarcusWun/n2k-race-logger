@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, ipcMain } from 'electron';
 import * as path from 'path';
 import * as os from 'os';
 import { registerIPCHandlers, cleanup } from './ipc-handlers';
@@ -65,6 +65,14 @@ app.whenReady().then(() => {
   ensureDirectories();
   createWindow();
   registerIPCHandlers();
+
+  // Window control handlers
+  ipcMain.handle('window:minimize', () => mainWindow?.minimize());
+  ipcMain.handle('window:maximize', () => {
+    if (mainWindow?.isMaximized()) mainWindow.unmaximize();
+    else mainWindow?.maximize();
+  });
+  ipcMain.handle('window:close', () => mainWindow?.close());
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

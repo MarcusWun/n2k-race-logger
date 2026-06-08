@@ -1,15 +1,20 @@
 module.exports = {
   appId: 'n2k-race-logger',
   productName: 'N2K Race Logger',
-  npmRebuild: false,
+  npmRebuild: true,
   directories: {
-    output: 'dist',
+    output: 'release',
     buildResources: 'build',
   },
   files: [
     'dist/**/*',
     'dist-electron/**/*',
     'package.json',
+  ],
+  asarUnpack: [
+    'node_modules/better-sqlite3/**',
+    'node_modules/serialport/**',
+    'node_modules/@serialport/**',
   ],
   win: {
     target: [

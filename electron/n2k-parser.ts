@@ -1,5 +1,15 @@
-import { FromPgn } from '@canboat/canboatjs';
 import { EventEmitter } from 'events';
+
+// Dynamic import of canboatjs — may fail if native optional binding isn't available
+let FromPgn: any = null;
+let canboatAvailable = false;
+
+try {
+  FromPgn = require('@canboat/canboatjs').FromPgn;
+  canboatAvailable = true;
+} catch (err) {
+  console.warn('[N2KParser] canboatjs unavailable:', (err as Error).message);
+}
 
 export interface PGNMessage {
   pgn: number;
@@ -15,7 +25,7 @@ export interface N2KParserConfig {
 }
 
 export class N2KParser extends EventEmitter {
-  private fromPgn: FromPgn;
+  private fromPgn: any;
   private pgnFilter: number[];
   private buffer: PGNMessage[] = [];
   private batchTimer: NodeJS.Timeout | null = null;
@@ -23,10 +33,9 @@ export class N2KParser extends EventEmitter {
 
   constructor(config?: Partial<N2KParserConfig>) {
     super();
-    this.fromPgn = new FromPgn({
-      url: '',
-      debug: () => {},
-    });
+    this.fromPgn = canboatAvailable
+      ? new FromPgn({ url: '', debug: () => {} })
+      : null;
     this.pgnFilter = config?.pgnFilter ?? [
       128259, 129025, 129026, 129029, 127250, 130306, 130310, 127257, 129284,
     ];
@@ -52,6 +61,7 @@ export class N2KParser extends EventEmitter {
    * Returns the parsed message or null if PGN is filtered out.
    */
   parse(line: string): PGNMessage | null {
+    if (!this.fromPgn) return null;
     try {
       const result = this.fromPgn.parseString(line);
       if (!result || !result.pgn) {

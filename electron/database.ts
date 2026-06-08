@@ -1,7 +1,19 @@
-import Database, { Database as BetterSqlite3 } from 'better-sqlite3';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+
+// Dynamic import of better-sqlite3 — may fail if native bindings aren't built for this Electron version
+let Database: any = null;
+let sqliteAvailable = false;
+
+try {
+  Database = require('better-sqlite3');
+  sqliteAvailable = true;
+} catch (err) {
+  console.warn('[Database] better-sqlite3 unavailable:', (err as Error).message);
+}
+
+type BetterSqlite3 = any;
 
 interface RaceMeta {
   id: number;
@@ -25,6 +37,10 @@ export class RaceDatabase {
   private dataDirectory: string;
 
   constructor(dbPath: string, dataDir?: string) {
+    if (!sqliteAvailable) {
+      throw new Error('SQLite module is not available. Reinstall the app or check native module bindings.');
+    }
+
     this.dataDirectory = dataDir || path.join(os.homedir(), 'n2k-race-logger', 'races');
     if (!fs.existsSync(this.dataDirectory)) {
       fs.mkdirSync(this.dataDirectory, { recursive: true });
@@ -99,8 +115,16 @@ export class RaceDatabase {
     // Use current timestamp as race ID (Unix ms, truncated)
     const raceId = Math.floor(Date.now() / 1000);
 
-    const result = stmt.get(raceId, now, label, boatProfile || null);
-    return result as RaceMeta;
+    stmt.run(raceId, now, label, now, boatProfile || null);
+    return {
+      id: raceId,
+      created_at: now,
+      label: label || null,
+      start_time: now,
+      end_time: null,
+      boat_profile: boatProfile || null,
+      total_points: 0,
+    };
   }
 
   /**

@@ -1,9 +1,20 @@
-import { SerialPort } from 'serialport';
-import { ReadlineParser } from '@serialport/parser-readline';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+
+// Dynamic import of native serial modules — they may fail if bindings aren't built for this Electron version
+let SerialPort: any = null;
+let ReadlineParser: any = null;
+let serialAvailable = false;
+
+try {
+  SerialPort = require('serialport').SerialPort;
+  ReadlineParser = require('@serialport/parser-readline').ReadlineParser;
+  serialAvailable = true;
+} catch (err) {
+  console.warn('[SerialManager] Native serial modules unavailable:', (err as Error).message);
+}
 
 export interface SerialSettings {
   port: string;
@@ -18,8 +29,8 @@ export interface ConnectionStatusEvent {
 }
 
 export class SerialManager extends EventEmitter {
-  private port: SerialPort | null = null;
-  private parser: ReadlineParser | null = null;
+  private port: any = null;
+  private parser: any = null;
   private settingsPath: string;
   private settings: SerialSettings = {
     port: 'COM3',
@@ -86,10 +97,15 @@ export class SerialManager extends EventEmitter {
    * List available serial ports. Identifies Actisense by vendor/product ID
    * when available (vendorId '0403', productId '6001' for FTDI-based NGT-1).
    */
+  isAvailable(): boolean {
+    return serialAvailable;
+  }
+
   async listPorts(): Promise<Array<{ path: string; manufacturer?: string; productId?: string; vendorId?: string }>> {
+    if (!serialAvailable) return [];
     try {
       const ports = await SerialPort.list();
-      return ports.map((p) => ({
+      return ports.map((p: any) => ({
         path: p.path,
         manufacturer: p.manufacturer || undefined,
         productId: p.productId || undefined,
@@ -105,6 +121,10 @@ export class SerialManager extends EventEmitter {
    * Connect to the serial port with the configured or specified settings.
    */
   async connect(options?: { port?: string; baud?: number }): Promise<void> {
+    if (!serialAvailable) {
+      throw new Error('Serial port modules are not available. Reinstall the app or check native module bindings.');
+    }
+
     if (this.port && this.port.isOpen) {
       this.disconnect();
     }
@@ -123,7 +143,7 @@ export class SerialManager extends EventEmitter {
       });
 
       await new Promise<void>((resolve, reject) => {
-        this.port!.open((err) => {
+        this.port!.open((err: Error | null) => {
           if (err) reject(err);
           else resolve();
         });

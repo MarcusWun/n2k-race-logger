@@ -1,6 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
 const api = {
+  // Window controls
+  windowMinimize: () => ipcRenderer.invoke('window:minimize'),
+  windowMaximize: () => ipcRenderer.invoke('window:maximize'),
+  windowClose: () => ipcRenderer.invoke('window:close'),
+
   // Connection
   connect: (payload: { port?: string; baud?: number }) =>
     ipcRenderer.invoke('connection:connect', payload),

@@ -49,9 +49,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: List build output
+        run: Get-ChildItem -Recurse release/ -ErrorAction SilentlyContinue
+        if: always()
+
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
           name: n2k-race-logger-windows-x64
-          path: release/*.exe
+          path: release/**/*.exe
           retention-days: 90

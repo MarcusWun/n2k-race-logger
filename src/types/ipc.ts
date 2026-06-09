@@ -1,6 +1,9 @@
 export interface ConnectionStatus {
-  port: string;
-  baud: number;
+  mode?: 'serial' | 'wifi';
+  port?: string;
+  baud?: number;
+  host?: string;
+  tcpPort?: number;
   status: 'disconnected' | 'connecting' | 'connected' | 'error';
   error?: string;
 }

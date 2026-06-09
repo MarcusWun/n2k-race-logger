@@ -13,6 +13,24 @@ function degToRad(deg: number): number {
   return (deg * Math.PI) / 180;
 }
 
+/**
+ * Convert TWA (0°=top/upwind, 180°=bottom/downwind) and speed to canvas coordinates.
+ * Standard sailing polar: wind from top, starboard half (0-180°) on the right.
+ */
+function polarToCanvas(
+  cx: number,
+  cy: number,
+  twa: number,
+  speed: number,
+  scale: number,
+): { x: number; y: number } {
+  const rad = degToRad(twa);
+  return {
+    x: cx + speed * scale * Math.sin(rad),
+    y: cy - speed * scale * Math.cos(rad),
+  };
+}
+
 export default function PolarDiagram({ polarData }: PolarDiagramProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const performance = usePolarStore((s) => s.performance);
@@ -33,9 +51,11 @@ export default function PolarDiagram({ polarData }: PolarDiagramProps) {
 
     const w = rect.width;
     const h = rect.height;
-    const cx = w / 2;
-    const cy = h * 0.05;
-    const maxRadius = Math.min(w / 2, h * 0.85) * 0.9;
+
+    // Origin at center of canvas — TWA 0° goes up, 180° goes down
+    const cx = w * 0.15;
+    const cy = h * 0.5;
+    const maxRadius = Math.min(w * 0.8, h * 0.45) * 0.9;
 
     ctx.clearRect(0, 0, w, h);
 
@@ -43,7 +63,7 @@ export default function PolarDiagram({ polarData }: PolarDiagramProps) {
       ctx.fillStyle = '#666';
       ctx.font = '14px sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText('No polar data loaded', cx, h / 2);
+      ctx.fillText('No polar data loaded', w / 2, h / 2);
       return;
     }
 
@@ -57,40 +77,60 @@ export default function PolarDiagram({ polarData }: PolarDiagramProps) {
     if (maxSpeed === 0) return;
     const scale = maxRadius / maxSpeed;
 
-    // Draw grid circles
-    const gridSteps = Math.ceil(maxSpeed / 2);
-    for (let i = 1; i <= gridSteps; i++) {
-      const r = (i * 2) * scale;
+    // Draw grid circles (speed rings)
+    const gridStep = maxSpeed <= 8 ? 2 : maxSpeed <= 16 ? 4 : 5;
+    for (let spd = gridStep; spd <= maxSpeed + gridStep; spd += gridStep) {
+      const r = spd * scale;
       ctx.beginPath();
-      ctx.arc(cx, cy, r, 0, Math.PI);
-      ctx.strokeStyle = '#333';
-      ctx.lineWidth = 0.5;
-      ctx.stroke();
-      ctx.fillStyle = '#555';
-      ctx.font = '10px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(`${i * 2}`, cx + r + 8, cy + 4);
-    }
-
-    // Draw angle lines
-    for (let angle = 0; angle <= 180; angle += 30) {
-      const rad = degToRad(angle);
-      const x = cx + maxRadius * Math.sin(rad);
-      const y = cy + maxRadius * Math.cos(rad);
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(x, y);
+      // Draw arc from -90° to +90° (top half to bottom half on starboard side)
+      ctx.arc(cx, cy, r, -Math.PI / 2, Math.PI / 2);
       ctx.strokeStyle = '#2a2a2a';
       ctx.lineWidth = 0.5;
       ctx.stroke();
 
+      // Speed label on the right
+      ctx.fillStyle = '#555';
+      ctx.font = '10px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(`${spd} kts`, cx + r + 4, cy + 3);
+    }
+
+    // Draw TWA angle lines at 30° intervals
+    for (let angle = 0; angle <= 180; angle += 30) {
+      const pt = polarToCanvas(cx, cy, angle, maxSpeed * 1.1, scale);
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(pt.x, pt.y);
+      ctx.strokeStyle = '#2a2a2a';
+      ctx.lineWidth = 0.5;
+      ctx.stroke();
+
+      // Angle label
+      const labelPt = polarToCanvas(cx, cy, angle, maxSpeed * 1.18, scale);
       ctx.fillStyle = '#555';
       ctx.font = '10px sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText(`${angle}°`, x + (angle < 90 ? 12 : angle > 90 ? -12 : 0), y + 14);
+      ctx.textBaseline = 'middle';
+      ctx.fillText(`${angle}°`, labelPt.x, labelPt.y);
     }
 
-    // Draw polar curves
+    // Wind arrow at top
+    ctx.fillStyle = '#444';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText('WIND', cx, cy - maxRadius * 1.1 - 4);
+    // Small arrow
+    const arrowY = cy - maxRadius * 1.1;
+    ctx.beginPath();
+    ctx.moveTo(cx, arrowY);
+    ctx.lineTo(cx - 5, arrowY - 10);
+    ctx.lineTo(cx + 5, arrowY - 10);
+    ctx.closePath();
+    ctx.fillStyle = '#444';
+    ctx.fill();
+
+    // Draw polar curves for each TWS
     polarData.tws.forEach((twsVal, twsIdx) => {
       const color = COLORS[twsIdx % COLORS.length];
       ctx.beginPath();
@@ -99,34 +139,27 @@ export default function PolarDiagram({ polarData }: PolarDiagramProps) {
 
       for (let twaIdx = 0; twaIdx < polarData.twa.length; twaIdx++) {
         const speed = polarData.speeds[twsIdx]?.[twaIdx] ?? 0;
-        const angle = degToRad(polarData.twa[twaIdx]);
-        const r = speed * scale;
-        const x = cx + r * Math.sin(angle);
-        const y = cy + r * Math.cos(angle);
+        const pt = polarToCanvas(cx, cy, polarData.twa[twaIdx], speed, scale);
 
-        if (twaIdx === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
+        if (twaIdx === 0) ctx.moveTo(pt.x, pt.y);
+        else ctx.lineTo(pt.x, pt.y);
       }
       ctx.stroke();
 
-      // Label
-      const lastTwaIdx = polarData.twa.length - 1;
-      const lastSpeed = polarData.speeds[twsIdx]?.[lastTwaIdx] ?? 0;
-      const lastAngle = degToRad(polarData.twa[lastTwaIdx]);
-      const lx = cx + lastSpeed * scale * Math.sin(lastAngle);
-      const ly = cy + lastSpeed * scale * Math.cos(lastAngle);
+      // Label at the end of each curve
+      const lastIdx = polarData.twa.length - 1;
+      const lastSpeed = polarData.speeds[twsIdx]?.[lastIdx] ?? 0;
+      const lp = polarToCanvas(cx, cy, polarData.twa[lastIdx], lastSpeed, scale);
       ctx.fillStyle = color;
       ctx.font = '10px sans-serif';
       ctx.textAlign = 'left';
-      ctx.fillText(`${twsVal}kt`, lx + 4, ly);
+      ctx.textBaseline = 'middle';
+      ctx.fillText(`${twsVal}kt`, lp.x + 4, lp.y);
     });
 
     // Draw live performance dot
     if (twa !== null && stw !== null && twa > 0) {
-      const angle = degToRad(twa);
-      const r = stw * scale;
-      const x = cx + r * Math.sin(angle);
-      const y = cy + r * Math.cos(angle);
+      const pt = polarToCanvas(cx, cy, twa, stw, scale);
 
       let dotColor = '#ffffff';
       if (performance.percentPolar !== null) {
@@ -136,7 +169,7 @@ export default function PolarDiagram({ polarData }: PolarDiagramProps) {
       }
 
       ctx.beginPath();
-      ctx.arc(x, y, 6, 0, Math.PI * 2);
+      ctx.arc(pt.x, pt.y, 6, 0, Math.PI * 2);
       ctx.fillStyle = dotColor;
       ctx.fill();
       ctx.strokeStyle = '#000';

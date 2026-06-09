@@ -3,8 +3,9 @@ import * as path from 'path';
 import * as os from 'os';
 import { registerIPCHandlers, cleanup } from './ipc-handlers';
 
-// Keep a global reference to the window to prevent garbage collection
+// Keep global references to windows to prevent garbage collection
 let mainWindow: BrowserWindow | null = null;
+let debugWindow: BrowserWindow | null = null;
 
 /**
  * Create the main BrowserWindow.
@@ -36,6 +37,53 @@ function createWindow(): void {
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
+}
+
+/**
+ * Open (or focus) the debug window.
+ */
+function openDebugWindow(): void {
+  if (debugWindow) {
+    debugWindow.focus();
+    return;
+  }
+
+  debugWindow = new BrowserWindow({
+    width: 800,
+    height: 500,
+    minWidth: 400,
+    minHeight: 200,
+    frame: false,
+    titleBarStyle: 'hidden',
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'debug-preload.js'),
+    },
+    backgroundColor: '#0a0a0a',
+  });
+
+  if (app.isPackaged) {
+    debugWindow.loadFile(path.join(__dirname, '../debug.html'));
+  } else {
+    // In dev, debug.html is in the project root
+    debugWindow.loadFile(path.join(__dirname, '../debug.html'));
+  }
+
+  debugWindow.on('closed', () => {
+    debugWindow = null;
+  });
+}
+
+/**
+ * Send raw data line to the debug window (if open).
+ */
+export function sendDebugData(line: string): void {
+  if (debugWindow && !debugWindow.isDestroyed()) {
+    const now = new Date();
+    const ts = now.toTimeString().slice(0, 8) + '.' + String(now.getMilliseconds()).padStart(3, '0');
+    debugWindow.webContents.send('debug:data', ts, line);
+  }
 }
 
 /**
@@ -74,6 +122,15 @@ app.whenReady().then(() => {
   });
   ipcMain.handle('window:close', () => mainWindow?.close());
 
+  // Debug window handlers
+  ipcMain.handle('debug:open', () => openDebugWindow());
+  ipcMain.handle('debug:close', () => {
+    if (debugWindow && !debugWindow.isDestroyed()) {
+      debugWindow.close();
+      debugWindow = null;
+    }
+  });
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
@@ -82,8 +139,8 @@ app.whenReady().then(() => {
 });
 
 /**
- * All windows closed — quit on macOS only if Cmd+Q was used.
- * On Windows/Linux, just quit.
+ * All windows closed — quit only if main window is closed.
+ * Debug window alone shouldn't keep the app alive.
  */
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

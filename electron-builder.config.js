@@ -9,6 +9,7 @@ module.exports = {
   files: [
     'dist/**/*',
     'dist-electron/**/*',
+    'debug.html',
     'package.json',
   ],
   asarUnpack: [

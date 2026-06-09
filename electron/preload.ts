@@ -6,8 +6,11 @@ const api = {
   windowMaximize: () => ipcRenderer.invoke('window:maximize'),
   windowClose: () => ipcRenderer.invoke('window:close'),
 
+  // Debug
+  openDebug: () => ipcRenderer.invoke('debug:open'),
+
   // Connection
-  connect: (payload: { port?: string; baud?: number }) =>
+  connect: (payload: { mode?: string; port?: string; baud?: number; host?: string; tcpPort?: number }) =>
     ipcRenderer.invoke('connection:connect', payload),
   disconnect: () => ipcRenderer.invoke('connection:disconnect'),
   listPorts: () => ipcRenderer.invoke('serial:list-ports'),

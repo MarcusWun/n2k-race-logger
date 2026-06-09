@@ -3,6 +3,7 @@ import { SerialManager } from './serial-manager';
 import { N2KParser } from './n2k-parser';
 import { PolarEngine } from './polar-engine';
 import { RaceDatabase, createRaceDatabase } from './database';
+import { sendDebugData } from './main';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
@@ -77,6 +78,9 @@ export function registerIPCHandlers(): void {
 
   // Wire up serial → parser pipeline
   serialManager.on('data', (line: string) => {
+    // Forward raw line to debug window (always, regardless of parse result)
+    sendDebugData(line);
+
     if (!n2kParser) return;
     const message = n2kParser.parse(line as any);
     if (message) {
@@ -111,9 +115,9 @@ export function registerIPCHandlers(): void {
   });
 
   // --- connection:connect ---
-  ipcMain.handle('connection:connect', async (_event, payload: { port?: string; baud?: number }) => {
+  ipcMain.handle('connection:connect', async (_event, payload: { mode?: string; port?: string; baud?: number; host?: string; tcpPort?: number }) => {
     try {
-      await serialManager!.connect(payload);
+      await serialManager!.connect(payload as any);
       return { success: true };
     } catch (err: any) {
       return { success: false, error: err?.message || 'Connection failed' };

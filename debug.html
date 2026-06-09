@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>N2K Debug</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0a0a0a;
+      color: #c0c0c0;
+      font-family: 'Consolas', 'Courier New', monospace;
+      font-size: 12px;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    #header {
+      background: #1a1a2e;
+      padding: 6px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #333;
+      -webkit-app-region: drag;
+      flex-shrink: 0;
+    }
+    #header span { color: #00d4ff; font-size: 13px; font-weight: bold; }
+    #header button {
+      -webkit-app-region: no-drag;
+      background: none;
+      border: none;
+      color: #888;
+      font-size: 16px;
+      cursor: pointer;
+      padding: 2px 8px;
+    }
+    #header button:hover { color: #fff; background: #c0392b; }
+    #controls {
+      background: #1a1a2e;
+      padding: 4px 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-bottom: 1px solid #333;
+      flex-shrink: 0;
+    }
+    #controls button {
+      background: #333;
+      border: 1px solid #555;
+      color: #ccc;
+      padding: 3px 10px;
+      font-size: 11px;
+      cursor: pointer;
+      border-radius: 3px;
+    }
+    #controls button:hover { background: #444; color: #fff; }
+    #count { color: #666; font-size: 11px; margin-left: auto; }
+    #log {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px 12px;
+      white-space: pre;
+      line-height: 1.5;
+    }
+    .ts { color: #666; }
+    .data { color: #e0e0e0; }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <span>N2K Debug</span>
+    <button onclick="window.n2kDebug.close()" title="Close">&times;</button>
+  </div>
+  <div id="controls">
+    <button onclick="clearLog()">Clear</button>
+    <span id="count">0 lines</span>
+  </div>
+  <div id="log"></div>
+  <script>
+    const MAX_LINES = 1000;
+    const log = document.getElementById('log');
+    const countEl = document.getElementById('count');
+    let lineCount = 0;
+    let autoScroll = true;
+
+    log.addEventListener('scroll', () => {
+      const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 30;
+      autoScroll = atBottom;
+    });
+
+    function clearLog() {
+      log.innerHTML = '';
+      lineCount = 0;
+      countEl.textContent = '0 lines';
+    }
+
+    function appendLine(timestamp, data) {
+      const line = document.createElement('div');
+      line.innerHTML = '<span class="ts">' + timestamp + '</span> <span class="data">' + escapeHtml(data) + '</span>';
+      log.appendChild(line);
+      lineCount++;
+
+      // Trim old lines
+      while (log.children.length > MAX_LINES) {
+        log.removeChild(log.firstChild);
+        lineCount = MAX_LINES;
+      }
+
+      countEl.textContent = lineCount + ' lines';
+
+      if (autoScroll) {
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+
+    function escapeHtml(str) {
+      return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // Listen for data from main process
+    if (window.n2kDebug) {
+      window.n2kDebug.onData((timestamp, line) => {
+        appendLine(timestamp, line);
+      });
+    }
+  </script>
+</body>
+</html>

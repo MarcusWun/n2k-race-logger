@@ -111,6 +111,32 @@ export class N2KParser extends EventEmitter {
   }
 
   /**
+   * Parse a line without applying the PGN filter. Returns the parsed message
+   * or null if canboatjs cannot decode the line at all.
+   */
+  parseUnfiltered(line: string): PGNMessage | null {
+    if (!this.fromPgn) return null;
+    try {
+      const result = this.fromPgn.parseString(line);
+      if (!result || !result.pgn) return null;
+
+      const pgnNum = Number(result.pgn);
+      const timestamp = (result.fields as any)?.timestamp
+        ? new Date((result.fields as any).timestamp).toISOString()
+        : new Date().toISOString();
+
+      return {
+        pgn: pgnNum,
+        fields: result.fields as any,
+        timestamp,
+        raw: line,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Queue a parsed message for batch writing.
    */
   enqueue(message: PGNMessage): void {

@@ -1,12 +1,91 @@
 import { ipcMain, dialog } from 'electron';
 import { SerialManager } from './serial-manager';
-import { N2KParser } from './n2k-parser';
+import { N2KParser, PGNMessage } from './n2k-parser';
 import { PolarEngine } from './polar-engine';
 import { RaceDatabase, createRaceDatabase } from './database';
 import { sendDebugData } from './main';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
+
+// PGN names for debug display (extended set — includes PGNs beyond the default filter)
+const PGN_DISPLAY_NAMES: Record<number, string> = {
+  59392: 'ISO Acknowledgement',
+  59904: 'ISO Request',
+  60928: 'ISO Address Claim',
+  65240: 'ISO Commanded Address',
+  126208: 'NMEA Command/Request/Config',
+  126464: 'PGN List',
+  126992: 'System Time',
+  126993: 'Heartbeat',
+  126996: 'Product Information',
+  127245: 'Rudder',
+  127250: 'Vessel Heading',
+  127251: 'Rate of Turn',
+  127257: 'Attitude',
+  127258: 'Magnetic Variation',
+  127488: 'Engine Parameters - Rapid',
+  127489: 'Engine Parameters - Dynamic',
+  127493: 'Transmission Parameters',
+  127497: 'Trip Parameters - Engine',
+  127501: 'Binary Switch Bank Status',
+  127505: 'Fluid Level',
+  127508: 'Battery Status',
+  128259: 'Speed - Water Referenced',
+  128267: 'Water Depth',
+  128275: 'Distance Log',
+  129025: 'Position - Rapid Update',
+  129026: 'COG & SOG - Rapid Update',
+  129029: 'GNSS Position Data',
+  129033: 'Time & Date',
+  129038: 'AIS Class A Position Report',
+  129039: 'AIS Class B Position Report',
+  129041: 'AIS Aids to Navigation Report',
+  129283: 'Cross Track Error',
+  129284: 'Navigation Data',
+  129285: 'Navigation Route/WP Info',
+  129539: 'GNSS DOPs',
+  129540: 'GNSS Satellites in View',
+  129793: 'AIS UTC and Date Report',
+  129794: 'AIS Class A Static Data',
+  129809: 'AIS Class B CS Static Data Part A',
+  129810: 'AIS Class B CS Static Data Part B',
+  130306: 'Wind Data',
+  130310: 'Environmental Parameters',
+  130311: 'Environmental Parameters (Extended)',
+  130312: 'Temperature',
+  130313: 'Humidity',
+  130314: 'Actual Pressure',
+  130316: 'Temperature - Extended Range',
+};
+
+/**
+ * Format a parsed PGN message into a human-readable debug line.
+ * Example: "Wind Data (PGN 130306): windSpeed=12.3, windAngle=0.82, windReference=True (boat referenced)"
+ */
+function formatDebugLine(msg: PGNMessage): string {
+  const name = PGN_DISPLAY_NAMES[msg.pgn] || `PGN ${msg.pgn}`;
+  const fields = msg.fields;
+
+  // Format field values into readable key=value pairs
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(fields)) {
+    if (key === 'timestamp') continue; // Skip internal timestamp field
+    if (value === null || value === undefined) continue;
+
+    let display: string;
+    if (typeof value === 'number') {
+      // Round floats for readability
+      display = Number.isInteger(value) ? String(value) : value.toFixed(2);
+    } else {
+      display = String(value);
+    }
+    parts.push(`${key}=${display}`);
+  }
+
+  const fieldsStr = parts.length > 0 ? ': ' + parts.join(', ') : '';
+  return `${name} (PGN ${msg.pgn})${fieldsStr}`;
+}
 
 // App-wide state
 let serialManager: SerialManager | null = null;
@@ -78,16 +157,21 @@ export function registerIPCHandlers(): void {
 
   // Wire up serial → parser pipeline
   serialManager.on('data', (line: string) => {
-    // Forward raw line to debug window (always, regardless of parse result)
-    sendDebugData(line);
-
     if (!n2kParser) return;
+
+    // Parse for debug window (unfiltered — shows ALL PGNs)
+    const debugMsg = n2kParser.parseUnfiltered(line);
+    if (debugMsg) {
+      sendDebugData(formatDebugLine(debugMsg));
+    } else {
+      sendDebugData('Unknown N2K data field');
+    }
+
+    // Parse for dashboard (filtered by user's PGN list)
     const message = n2kParser.parse(line as any);
     if (message) {
-      // Forward to renderer for dashboard
       getWebContents()?.send('pgn:data', message);
 
-      // If recording, enqueue for batch write
       if (isRecording) {
         n2kParser.enqueue(message);
       }

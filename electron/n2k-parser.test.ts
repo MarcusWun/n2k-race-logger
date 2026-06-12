@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { FromPgn, encodeActisense, toPgn } from '@canboat/canboatjs';
+import { FromPgn, toPgn } from '@canboat/canboatjs';
 import { N2KParser } from './n2k-parser';
+import type { ParsedPGN } from './serial-manager';
 
 // Helper: generate a valid Actisense serial format string from a PGN + data
 function makeActisense(pgn: number, data: Buffer): string {
@@ -11,6 +12,15 @@ function makeActisense(pgn: number, data: Buffer): string {
     .match(/.{1,2}/g)!
     .join(',');
   return `${ts},2,${pgn},0,255,${data.length},${hexBytes}`;
+}
+
+// Helper: create a ParsedPGN object for testing the filter
+function makeParsedPGN(pgn: number, fields: Record<string, any> = {}): ParsedPGN {
+  return {
+    pgn,
+    fields,
+    timestamp: new Date().toISOString(),
+  };
 }
 
 // ===================================================================
@@ -74,37 +84,37 @@ describe('PGN filtering', () => {
   });
 
   it('passes through allowed PGNs (Speed 128259)', () => {
-    const data = toPgn({ pgn: 128259, 'Speed of Water': 2.5, Source: 0 })!;
-    const actisense = makeActisense(128259, data);
-    const result = parser.parse(actisense);
+    const parsed = makeParsedPGN(128259, { speedWaterReferenced: 2.5 });
+    const result = parser.filter(parsed);
     expect(result).not.toBeNull();
     expect(result!.pgn).toBe(128259);
   });
 
   it('passes through wind data (130306)', () => {
-    const data = toPgn({
-      pgn: 130306,
-      'Wind Speed': 5.5,
-      'Wind Angle': 600,
-      'Wind Reference': 'Apparent',
-      Source: 0,
-    })!;
-    const actisense = makeActisense(130306, data);
-    const result = parser.parse(actisense);
+    const parsed = makeParsedPGN(130306, { windSpeed: 5.5, windAngle: 0.6, windReference: 'Apparent' });
+    const result = parser.filter(parsed);
     expect(result).not.toBeNull();
     expect(result!.pgn).toBe(130306);
   });
 
   it('passes through heading (127250)', () => {
-    const data = toPgn({
-      pgn: 127250,
-      'Heading, Magnetic': 1800,
-      'Heading, True': 1800,
-      Source: 0,
-    })!;
-    const actisense = makeActisense(127250, data);
-    const result = parser.parse(actisense);
+    const parsed = makeParsedPGN(127250, { heading: 3.14 });
+    const result = parser.filter(parsed);
     expect(result).not.toBeNull();
     expect(result!.pgn).toBe(127250);
+  });
+
+  it('filters out PGNs not in the allowed list', () => {
+    const parsed = makeParsedPGN(129029, { latitude: 42.0, longitude: -71.0 });
+    const result = parser.filter(parsed);
+    expect(result).toBeNull();
+  });
+
+  it('allows updating the filter list', () => {
+    const parsed = makeParsedPGN(129029, { latitude: 42.0 });
+    expect(parser.filter(parsed)).toBeNull();
+
+    parser.setPGNFilter([129029]);
+    expect(parser.filter(parsed)).not.toBeNull();
   });
 });

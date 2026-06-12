@@ -4,17 +4,26 @@ import * as path from 'path';
 import * as os from 'os';
 import * as net from 'net';
 
-// Dynamic import of native serial modules — they may fail if bindings aren't built for this Electron version
+// Dynamic import of native serial modules
 let SerialPort: any = null;
-let ReadlineParser: any = null;
 let serialAvailable = false;
 
 try {
   SerialPort = require('serialport').SerialPort;
-  ReadlineParser = require('@serialport/parser-readline').ReadlineParser;
   serialAvailable = true;
 } catch (err) {
   console.warn('[SerialManager] Native serial modules unavailable:', (err as Error).message);
+}
+
+// Dynamic import of canboatjs for Actisense binary protocol parsing
+let FromPgn: any = null;
+let canboatAvailable = false;
+
+try {
+  FromPgn = require('@canboat/canboatjs').FromPgn;
+  canboatAvailable = true;
+} catch (err) {
+  console.warn('[SerialManager] canboatjs unavailable:', (err as Error).message);
 }
 
 export interface SerialSettings {
@@ -34,11 +43,23 @@ export interface ConnectionStatusEvent {
   error?: string;
 }
 
+/**
+ * Parsed PGN data emitted by the serial manager.
+ * This is what canboatjs produces after decoding the Actisense binary protocol.
+ */
+export interface ParsedPGN {
+  pgn: number;
+  src?: number;
+  dst?: number;
+  fields: Record<string, any>;
+  description?: string;
+  timestamp?: string;
+}
+
 export class SerialManager extends EventEmitter {
   private port: any = null;
-  private parser: any = null;
+  private pgnParser: any = null;
   private tcpSocket: net.Socket | null = null;
-  private tcpBuffer = '';
   private activeMode: ConnectionMode = 'serial';
   private settingsPath: string;
   private settings: SerialSettings = {
@@ -136,8 +157,37 @@ export class SerialManager extends EventEmitter {
   }
 
   /**
-   * Connect via serial or Wi-Fi depending on options.mode.
+   * Create a FromPgn parser instance to handle Actisense binary protocol.
+   * Listens for 'pgn' events (parsed PGN objects) and 'warning' events.
    */
+  private createPgnParser(): any {
+    if (!canboatAvailable) return null;
+
+    const parser = new FromPgn({ url: '' });
+
+    // canboatjs FromPgn emits 'pgn' events with parsed PGN data
+    parser.on('pgn', (pgn: any) => {
+      if (pgn && pgn.pgn != null) {
+        const parsed: ParsedPGN = {
+          pgn: Number(pgn.pgn),
+          src: pgn.src,
+          dst: pgn.dst,
+          fields: pgn.fields || {},
+          description: pgn.description,
+          timestamp: pgn.timestamp || new Date().toISOString(),
+        };
+        this.emit('pgn', parsed);
+      }
+    });
+
+    parser.on('warning', (msg: any) => {
+      // Emit unparseable data events
+      this.emit('pgn-unknown', msg);
+    });
+
+    return parser;
+  }
+
   async connect(options?: {
     mode?: ConnectionMode;
     port?: string;
@@ -146,8 +196,6 @@ export class SerialManager extends EventEmitter {
     tcpPort?: number;
   }): Promise<void> {
     const mode = options?.mode || 'serial';
-
-    // Disconnect any existing connection first
     await this.disconnect();
 
     if (mode === 'wifi') {
@@ -156,9 +204,6 @@ export class SerialManager extends EventEmitter {
     return this.connectSerial(options);
   }
 
-  /**
-   * Connect to a serial port.
-   */
   private async connectSerial(options?: { port?: string; baud?: number }): Promise<void> {
     if (!serialAvailable) {
       throw new Error('Serial port modules are not available. Reinstall the app or check native module bindings.');
@@ -185,15 +230,13 @@ export class SerialManager extends EventEmitter {
         });
       });
 
-      this.parser = new ReadlineParser({ delimiter: '\r\n' });
-      this.port.pipe(this.parser as any);
-
-      this.parser.on('data', (data: Buffer) => {
-        const line = data.toString('utf-8').trim();
-        if (line) {
-          this.emit('data', line);
-        }
-      });
+      // Pipe raw serial bytes through canboatjs FromPgn transform stream.
+      // FromPgn handles Actisense binary protocol framing internally —
+      // no ReadlineParser needed.
+      this.pgnParser = this.createPgnParser();
+      if (this.pgnParser) {
+        this.port.pipe(this.pgnParser);
+      }
 
       this.settings.port = portPath;
       this.settings.baud = baudRate;
@@ -218,13 +261,10 @@ export class SerialManager extends EventEmitter {
         }
       }
       this.port = null;
-      this.parser = null;
+      this.pgnParser = null;
     }
   }
 
-  /**
-   * Connect to a Wi-Fi/TCP NMEA gateway.
-   */
   private connectTcp(host?: string, tcpPort?: number): Promise<void> {
     this.activeMode = 'wifi';
     const h = host || this.wifiSettings.host;
@@ -234,7 +274,6 @@ export class SerialManager extends EventEmitter {
 
     return new Promise<void>((resolve, reject) => {
       this.tcpSocket = new net.Socket();
-      this.tcpBuffer = '';
 
       const onError = (err: Error) => {
         this.emit('status', {
@@ -251,21 +290,13 @@ export class SerialManager extends EventEmitter {
       this.tcpSocket.once('error', onError);
 
       this.tcpSocket.connect(p, h, () => {
-        // Connected — remove the one-shot error handler and set up persistent handlers
         this.tcpSocket!.removeListener('error', onError);
 
-        this.tcpSocket!.on('data', (chunk: Buffer) => {
-          this.tcpBuffer += chunk.toString('utf-8');
-          const lines = this.tcpBuffer.split(/\r?\n/);
-          // Keep the last partial line in the buffer
-          this.tcpBuffer = lines.pop() || '';
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (trimmed) {
-              this.emit('data', trimmed);
-            }
-          }
-        });
+        // Pipe TCP data through canboatjs — handles both binary and text formats
+        this.pgnParser = this.createPgnParser();
+        if (this.pgnParser) {
+          this.tcpSocket!.pipe(this.pgnParser);
+        }
 
         this.tcpSocket!.on('error', (err: Error) => {
           console.error('[SerialManager] TCP error:', err.message);
@@ -307,14 +338,12 @@ export class SerialManager extends EventEmitter {
       }
       this.tcpSocket = null;
     }
-    this.tcpBuffer = '';
   }
 
   async disconnect(): Promise<void> {
-    // Disconnect serial
-    if (this.parser) {
-      this.parser.removeAllListeners('data');
-      this.parser = null;
+    if (this.pgnParser) {
+      this.pgnParser.removeAllListeners();
+      this.pgnParser = null;
     }
     if (this.port && this.port.isOpen) {
       try {
@@ -327,7 +356,6 @@ export class SerialManager extends EventEmitter {
     }
     this.port = null;
 
-    // Disconnect TCP
     this.cleanupTcp();
 
     this.emit('status', {

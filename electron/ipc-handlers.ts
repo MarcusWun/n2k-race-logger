@@ -1,5 +1,5 @@
 import { ipcMain, dialog } from 'electron';
-import { SerialManager } from './serial-manager';
+import { SerialManager, ParsedPGN } from './serial-manager';
 import { N2KParser, PGNMessage } from './n2k-parser';
 import { PolarEngine } from './polar-engine';
 import { RaceDatabase, createRaceDatabase } from './database';
@@ -63,8 +63,8 @@ const PGN_DISPLAY_NAMES: Record<number, string> = {
  * Format a parsed PGN message into a human-readable debug line.
  * Example: "Wind Data (PGN 130306): windSpeed=12.3, windAngle=0.82, windReference=True (boat referenced)"
  */
-function formatDebugLine(msg: PGNMessage): string {
-  const name = PGN_DISPLAY_NAMES[msg.pgn] || `PGN ${msg.pgn}`;
+function formatDebugLine(msg: ParsedPGN): string {
+  const name = PGN_DISPLAY_NAMES[msg.pgn] || msg.description || `PGN ${msg.pgn}`;
   const fields = msg.fields;
 
   // Format field values into readable key=value pairs
@@ -156,19 +156,15 @@ export function registerIPCHandlers(): void {
   polarEngine = new PolarEngine();
 
   // Wire up serial → parser pipeline
-  serialManager.on('data', (line: string) => {
+  // SerialManager now emits pre-parsed 'pgn' events (binary protocol handled by FromPgn stream)
+  serialManager.on('pgn', (parsed: ParsedPGN) => {
     if (!n2kParser) return;
 
-    // Parse for debug window (unfiltered — shows ALL PGNs)
-    const debugMsg = n2kParser.parseUnfiltered(line);
-    if (debugMsg) {
-      sendDebugData(formatDebugLine(debugMsg));
-    } else {
-      sendDebugData('Unknown N2K data field');
-    }
+    // Send ALL parsed PGNs to debug window (unfiltered)
+    sendDebugData(formatDebugLine(parsed));
 
-    // Parse for dashboard (filtered by user's PGN list)
-    const message = n2kParser.parse(line as any);
+    // Apply PGN filter for dashboard
+    const message = n2kParser.filter(parsed);
     if (message) {
       getWebContents()?.send('pgn:data', message);
 
@@ -176,6 +172,11 @@ export function registerIPCHandlers(): void {
         n2kParser.enqueue(message);
       }
     }
+  });
+
+  // Unknown/unparseable data from serial manager
+  serialManager.on('pgn-unknown', (msg: any) => {
+    sendDebugData(`Unknown N2K data: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`);
   });
 
   // Batch write from parser

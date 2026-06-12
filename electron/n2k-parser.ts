@@ -1,31 +1,18 @@
 import { EventEmitter } from 'events';
-
-// Dynamic import of canboatjs — may fail if native optional binding isn't available
-let FromPgn: any = null;
-let canboatAvailable = false;
-
-try {
-  FromPgn = require('@canboat/canboatjs').FromPgn;
-  canboatAvailable = true;
-} catch (err) {
-  console.warn('[N2KParser] canboatjs unavailable:', (err as Error).message);
-}
+import type { ParsedPGN } from './serial-manager';
 
 export interface PGNMessage {
   pgn: number;
-  fields: Record<string, string | number>;
+  fields: Record<string, any>;
   timestamp: string;
-  raw?: string;
 }
 
 export interface N2KParserConfig {
   pgnFilter: number[];
-  bufferSize: number;
   batchIntervalMs: number;
 }
 
 export class N2KParser extends EventEmitter {
-  private fromPgn: any;
   private pgnFilter: number[];
   private buffer: PGNMessage[] = [];
   private batchTimer: NodeJS.Timeout | null = null;
@@ -33,9 +20,6 @@ export class N2KParser extends EventEmitter {
 
   constructor(config?: Partial<N2KParserConfig>) {
     super();
-    this.fromPgn = canboatAvailable
-      ? new FromPgn({ url: '', debug: () => {} })
-      : null;
     this.pgnFilter = config?.pgnFilter ?? [
       128259, 129025, 129026, 129029, 127250, 130306, 130310, 127257, 129284,
     ];
@@ -57,83 +41,18 @@ export class N2KParser extends EventEmitter {
   }
 
   /**
-   * Parse an Actisense ASCII string (e.g., "36462c3e00...").
-   * Returns the parsed message or null if PGN is filtered out.
+   * Apply the PGN filter to a pre-parsed PGN object from serial-manager.
+   * Returns a PGNMessage if the PGN is in the filter, or null if filtered out.
    */
-  parse(line: string): PGNMessage | null {
-    if (!this.fromPgn) return null;
-    try {
-      const result = this.fromPgn.parseString(line);
-      if (!result || !result.pgn) {
-        return null;
-      }
-
-      const pgnNum = Number(result.pgn);
-
-      // Check if PGN is in filter
-      if (!this.pgnFilter.includes(pgnNum)) {
-        return null;
-      }
-
-      const timestamp = (result.fields as any)?.timestamp
-        ? new Date((result.fields as any).timestamp).toISOString()
-        : new Date().toISOString();
-
-      const message: PGNMessage = {
-        pgn: pgnNum,
-        fields: result.fields as any,
-        timestamp,
-        raw: line,
-      };
-
-      return message;
-    } catch (err) {
-      // Try to extract PGN number from raw hex for unknown PGNs
-      const hexMatch = line.match(/^([0-9a-fA-F]+)/);
-      if (hexMatch) {
-        try {
-          const hexStr = hexMatch[1];
-          if (hexStr.length >= 4) {
-            const pgnHex = hexStr.slice(0, 4);
-            const pgnNum = parseInt(pgnHex, 16);
-            if (!this.pgnFilter.includes(pgnNum)) {
-              return null;
-            }
-            // Log unknown PGN with raw bytes
-            this.emit('unknown', { pgn: pgnNum, raw: line });
-          }
-        } catch {
-          // ignore parse errors on unknown format
-        }
-      }
+  filter(parsed: ParsedPGN): PGNMessage | null {
+    if (!this.pgnFilter.includes(parsed.pgn)) {
       return null;
     }
-  }
-
-  /**
-   * Parse a line without applying the PGN filter. Returns the parsed message
-   * or null if canboatjs cannot decode the line at all.
-   */
-  parseUnfiltered(line: string): PGNMessage | null {
-    if (!this.fromPgn) return null;
-    try {
-      const result = this.fromPgn.parseString(line);
-      if (!result || !result.pgn) return null;
-
-      const pgnNum = Number(result.pgn);
-      const timestamp = (result.fields as any)?.timestamp
-        ? new Date((result.fields as any).timestamp).toISOString()
-        : new Date().toISOString();
-
-      return {
-        pgn: pgnNum,
-        fields: result.fields as any,
-        timestamp,
-        raw: line,
-      };
-    } catch {
-      return null;
-    }
+    return {
+      pgn: parsed.pgn,
+      fields: parsed.fields,
+      timestamp: parsed.timestamp || new Date().toISOString(),
+    };
   }
 
   /**

@@ -15,6 +15,44 @@ try {
   console.warn('[SerialManager] Native serial modules unavailable:', (err as Error).message);
 }
 
+// BST (Binary Serial Transfer) protocol constants for Actisense NGT-1
+const BST_DLE = 0x10;
+const BST_STX = 0x02;
+const BST_ETX = 0x03;
+const NGT_MSG_SEND = 0xA1;
+const NGT_STARTUP_SEQ = Buffer.from([0x11, 0x02, 0x00]);
+
+/**
+ * Build a BST protocol frame for the Actisense NGT-1.
+ * Frame format: DLE STX <command> <len> <escaped-data> <checksum> DLE ETX
+ * Any DLE (0x10) bytes in data or checksum are escaped by doubling (DLE DLE).
+ */
+function buildBSTFrame(command: number, payload: Buffer): Buffer {
+  const len = payload.length;
+  // Checksum: (256 - (command + len + sum_of_payload_bytes)) & 0xFF
+  let sum = command + len;
+  for (let i = 0; i < payload.length; i++) {
+    sum += payload[i];
+  }
+  const checksum = (256 - sum) & 0xFF;
+
+  // Build the inner bytes (command, len, payload, checksum) with DLE escaping
+  const inner: number[] = [];
+  const addByte = (b: number) => {
+    inner.push(b);
+    if (b === BST_DLE) inner.push(BST_DLE); // escape
+  };
+
+  addByte(command);
+  addByte(len);
+  for (let i = 0; i < payload.length; i++) {
+    addByte(payload[i]);
+  }
+  addByte(checksum);
+
+  return Buffer.from([BST_DLE, BST_STX, ...inner, BST_DLE, BST_ETX]);
+}
+
 // Dynamic import of canboatjs for Actisense binary protocol parsing
 let FromPgn: any = null;
 let canboatAvailable = false;
@@ -60,6 +98,7 @@ export class SerialManager extends EventEmitter {
   private port: any = null;
   private pgnParser: any = null;
   private tcpSocket: net.Socket | null = null;
+  private keepaliveInterval: ReturnType<typeof setInterval> | null = null;
   private activeMode: ConnectionMode = 'serial';
   private settingsPath: string;
   private settings: SerialSettings = {
@@ -204,6 +243,17 @@ export class SerialManager extends EventEmitter {
     return this.connectSerial(options);
   }
 
+  /**
+   * Send the NGT-1 startup/initialization command over BST protocol.
+   * Without this, the NGT-1 stays silent and sends no N2K data.
+   */
+  private sendNGTStartup(): void {
+    if (this.port && this.port.isOpen) {
+      const frame = buildBSTFrame(NGT_MSG_SEND, NGT_STARTUP_SEQ);
+      this.port.write(frame);
+    }
+  }
+
   private async connectSerial(options?: { port?: string; baud?: number }): Promise<void> {
     if (!serialAvailable) {
       throw new Error('Serial port modules are not available. Reinstall the app or check native module bindings.');
@@ -230,13 +280,18 @@ export class SerialManager extends EventEmitter {
         });
       });
 
-      // Pipe raw serial bytes through canboatjs FromPgn transform stream.
-      // FromPgn handles Actisense binary protocol framing internally —
-      // no ReadlineParser needed.
+      // Send NGT-1 initialization command, wait for device to respond,
+      // then pipe raw serial bytes through canboatjs FromPgn transform stream.
+      this.sendNGTStartup();
+      await new Promise<void>((resolve) => setTimeout(resolve, 200));
+
       this.pgnParser = this.createPgnParser();
       if (this.pgnParser) {
         this.port.pipe(this.pgnParser);
       }
+
+      // Re-send startup periodically to keep the NGT-1 alive
+      this.keepaliveInterval = setInterval(() => this.sendNGTStartup(), 20000);
 
       this.settings.port = portPath;
       this.settings.baud = baudRate;
@@ -341,6 +396,10 @@ export class SerialManager extends EventEmitter {
   }
 
   async disconnect(): Promise<void> {
+    if (this.keepaliveInterval) {
+      clearInterval(this.keepaliveInterval);
+      this.keepaliveInterval = null;
+    }
     if (this.pgnParser) {
       this.pgnParser.removeAllListeners();
       this.pgnParser = null;

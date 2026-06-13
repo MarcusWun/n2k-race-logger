@@ -55,10 +55,13 @@ function buildBSTFrame(command: number, payload: Buffer): Buffer {
 
 // Dynamic import of canboatjs for Actisense binary protocol parsing
 let FromPgn: any = null;
+let ActisenseStream: any = null;
 let canboatAvailable = false;
 
 try {
-  FromPgn = require('@canboat/canboatjs').FromPgn;
+  const canboatjs = require('@canboat/canboatjs');
+  FromPgn = canboatjs.FromPgn;
+  ActisenseStream = canboatjs.serial;
   canboatAvailable = true;
 } catch (err) {
   console.warn('[SerialManager] canboatjs unavailable:', (err as Error).message);
@@ -97,6 +100,7 @@ export interface ParsedPGN {
 export class SerialManager extends EventEmitter {
   private port: any = null;
   private pgnParser: any = null;
+  private bstDecoder: any = null;
   private tcpSocket: net.Socket | null = null;
   private keepaliveInterval: ReturnType<typeof setInterval> | null = null;
   private activeMode: ConnectionMode = 'serial';
@@ -316,13 +320,20 @@ export class SerialManager extends EventEmitter {
     });
 
     // Send NGT-1 initialization command, wait for device to respond,
-    // then pipe raw serial bytes through canboatjs FromPgn transform stream.
+    // then decode BST framing and parse PGN data.
     this.sendNGTStartup();
     await new Promise<void>((resolve) => setTimeout(resolve, 200));
 
     this.pgnParser = this.createPgnParser();
-    if (this.pgnParser) {
-      this.port.pipe(this.pgnParser);
+    if (this.pgnParser && ActisenseStream) {
+      // ActisenseStream is a proper Transform stream that decodes BST framing
+      // (DLE/STX/ETX with byte stuffing) and pushes decoded N2K binary frames.
+      // FromPgn is NOT a stream — feed decoded frames via parseBuffer().
+      this.bstDecoder = new ActisenseStream({ fromFile: true, reconnect: false });
+      this.bstDecoder.on('data', (frame: Buffer) => {
+        this.pgnParser.parseBuffer(frame);
+      });
+      this.port.pipe(this.bstDecoder);
     }
 
     // Wait for PGN data to confirm the baud rate is correct (skip on last attempt)
@@ -346,6 +357,10 @@ export class SerialManager extends EventEmitter {
         if (this.keepaliveInterval) {
           clearInterval(this.keepaliveInterval);
           this.keepaliveInterval = null;
+        }
+        if (this.bstDecoder) {
+          this.bstDecoder.removeAllListeners();
+          this.bstDecoder = null;
         }
         if (this.pgnParser) {
           this.pgnParser.removeAllListeners();
@@ -455,6 +470,10 @@ export class SerialManager extends EventEmitter {
     if (this.keepaliveInterval) {
       clearInterval(this.keepaliveInterval);
       this.keepaliveInterval = null;
+    }
+    if (this.bstDecoder) {
+      this.bstDecoder.removeAllListeners();
+      this.bstDecoder = null;
     }
     if (this.pgnParser) {
       this.pgnParser.removeAllListeners();

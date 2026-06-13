@@ -254,6 +254,9 @@ export class SerialManager extends EventEmitter {
     }
   }
 
+  private static readonly BAUD_RATES = [115200, 230400];
+  private static readonly BAUD_DETECT_TIMEOUT_MS = 5000;
+
   private async connectSerial(options?: { port?: string; baud?: number }): Promise<void> {
     if (!serialAvailable) {
       throw new Error('Serial port modules are not available. Reinstall the app or check native module bindings.');
@@ -261,63 +264,116 @@ export class SerialManager extends EventEmitter {
 
     this.activeMode = 'serial';
     const portPath = options?.port || this.settings.port;
-    const baudRate = options?.baud || this.settings.baud;
+    const requestedBaud = options?.baud || this.settings.baud;
 
-    this.emit('status', { mode: 'serial', port: portPath, baud: baudRate, status: 'connecting' });
+    // Try the requested/saved baud rate first, then fall back to alternatives
+    const baudOrder = [requestedBaud, ...SerialManager.BAUD_RATES.filter(b => b !== requestedBaud)];
 
-    try {
-      this.port = new SerialPort({
-        path: portPath,
-        baudRate,
-        parity: 'none',
-        autoOpen: false,
-      });
+    for (let i = 0; i < baudOrder.length; i++) {
+      const baudRate = baudOrder[i];
+      const isLastAttempt = i === baudOrder.length - 1;
 
-      await new Promise<void>((resolve, reject) => {
-        this.port!.open((err: Error | null) => {
-          if (err) reject(err);
-          else resolve();
+      this.emit('status', { mode: 'serial', port: portPath, baud: baudRate, status: 'connecting' });
+
+      try {
+        const connected = await this.tryConnectAtBaud(portPath, baudRate, isLastAttempt);
+        if (connected) return;
+        // No data at this baud rate — try the next one
+        console.log(`[SerialManager] No data at ${baudRate} baud, trying next rate...`);
+      } catch (err: any) {
+        this.emit('status', {
+          mode: 'serial',
+          port: portPath,
+          baud: baudRate,
+          status: 'error',
+          error: err?.message || 'Unknown connection error',
         });
-      });
-
-      // Send NGT-1 initialization command, wait for device to respond,
-      // then pipe raw serial bytes through canboatjs FromPgn transform stream.
-      this.sendNGTStartup();
-      await new Promise<void>((resolve) => setTimeout(resolve, 200));
-
-      this.pgnParser = this.createPgnParser();
-      if (this.pgnParser) {
-        this.port.pipe(this.pgnParser);
+        this.port = null;
+        this.pgnParser = null;
+        return;
       }
-
-      // Re-send startup periodically to keep the NGT-1 alive
-      this.keepaliveInterval = setInterval(() => this.sendNGTStartup(), 20000);
-
-      this.settings.port = portPath;
-      this.settings.baud = baudRate;
-      this.saveSettings();
-
-      this.emit('status', { mode: 'serial', port: portPath, baud: baudRate, status: 'connected' });
-    } catch (err: any) {
-      this.emit('status', {
-        mode: 'serial',
-        port: portPath,
-        baud: baudRate,
-        status: 'error',
-        error: err?.message || 'Unknown connection error',
-      });
-      if (this.port && this.port.isOpen) {
-        try {
-          await new Promise<void>((resolve) => {
-            this.port!.close(() => resolve());
-          });
-        } catch {
-          // ignore close errors
-        }
-      }
-      this.port = null;
-      this.pgnParser = null;
     }
+  }
+
+  /**
+   * Attempt a serial connection at a specific baud rate.
+   * Returns true if PGN data is received within the timeout, false if no data.
+   * On the last attempt, connects without waiting for data confirmation.
+   */
+  private async tryConnectAtBaud(portPath: string, baudRate: number, isLastAttempt: boolean): Promise<boolean> {
+    this.port = new SerialPort({
+      path: portPath,
+      baudRate,
+      parity: 'none',
+      autoOpen: false,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      this.port!.open((err: Error | null) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    // Send NGT-1 initialization command, wait for device to respond,
+    // then pipe raw serial bytes through canboatjs FromPgn transform stream.
+    this.sendNGTStartup();
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+
+    this.pgnParser = this.createPgnParser();
+    if (this.pgnParser) {
+      this.port.pipe(this.pgnParser);
+    }
+
+    // Wait for PGN data to confirm the baud rate is correct (skip on last attempt)
+    if (!isLastAttempt) {
+      const gotData = await new Promise<boolean>((resolve) => {
+        const timeout = setTimeout(() => {
+          this.removeListener('pgn', onPgn);
+          resolve(false);
+        }, SerialManager.BAUD_DETECT_TIMEOUT_MS);
+
+        const onPgn = () => {
+          clearTimeout(timeout);
+          this.removeListener('pgn', onPgn);
+          resolve(true);
+        };
+        this.once('pgn', onPgn);
+      });
+
+      if (!gotData) {
+        // Clean up this attempt before trying next baud rate
+        if (this.keepaliveInterval) {
+          clearInterval(this.keepaliveInterval);
+          this.keepaliveInterval = null;
+        }
+        if (this.pgnParser) {
+          this.pgnParser.removeAllListeners();
+          this.pgnParser = null;
+        }
+        if (this.port && this.port.isOpen) {
+          try {
+            await new Promise<void>((resolve) => {
+              this.port!.close(() => resolve());
+            });
+          } catch {
+            // ignore close errors
+          }
+        }
+        this.port = null;
+        return false;
+      }
+    }
+
+    // Re-send startup periodically to keep the NGT-1 alive
+    this.keepaliveInterval = setInterval(() => this.sendNGTStartup(), 20000);
+
+    this.settings.port = portPath;
+    this.settings.baud = baudRate;
+    this.saveSettings();
+
+    this.emit('status', { mode: 'serial', port: portPath, baud: baudRate, status: 'connected' });
+    return true;
   }
 
   private connectTcp(host?: string, tcpPort?: number): Promise<void> {

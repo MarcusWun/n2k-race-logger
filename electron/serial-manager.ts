@@ -329,7 +329,7 @@ export class SerialManager extends EventEmitter {
       // ActisenseStream is a proper Transform stream that decodes BST framing
       // (DLE/STX/ETX with byte stuffing) and pushes decoded N2K binary frames.
       // FromPgn is NOT a stream — feed decoded frames via parseBuffer().
-      this.bstDecoder = new ActisenseStream({ fromFile: true, reconnect: false });
+      this.bstDecoder = new ActisenseStream({ fromFile: true, reconnect: false, app: new EventEmitter() });
       this.bstDecoder.on('data', (frame: Buffer) => {
         this.pgnParser.parseBuffer(frame);
       });

@@ -330,6 +330,9 @@ export class SerialManager extends EventEmitter {
       // (DLE/STX/ETX with byte stuffing) and pushes decoded N2K binary frames.
       // FromPgn is NOT a stream — feed decoded frames via parseBuffer().
       this.bstDecoder = new ActisenseStream({ fromFile: true, reconnect: false, app: new EventEmitter() });
+      // Mark output as available so ActisenseStream doesn't try to configure
+      // transmit PGNs via this.serial (which is null in fromFile mode).
+      this.bstDecoder.outAvailable = true;
       this.bstDecoder.on('data', (frame: Buffer) => {
         this.pgnParser.parseBuffer(frame);
       });

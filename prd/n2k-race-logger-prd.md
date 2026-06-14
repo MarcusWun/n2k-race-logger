@@ -51,7 +51,7 @@ Dual-mode connection to NMEA 2000 gateways: serial (Actisense NGT-1) or Wi-Fi (W
 - Identify Actisense devices by USB vendor/product ID when possible
 - Remember last-used port
 - Default: COM3 at 115,200 baud, 8N1, no flow control
-- **Actisense binary protocol:** The NGT-1 uses a proprietary binary serial protocol (BST), NOT ASCII text. Raw serial bytes are piped directly through canboatjs `FromPgn` transform stream, which handles binary framing and emits parsed PGN objects. No `ReadlineParser` or text-based parsing is used.
+- **Actisense binary protocol:** The NGT-1 uses a proprietary binary serial protocol (BST), NOT ASCII text. Raw serial bytes are piped through canboatjs `ActisenseStream` transform stream, which decodes BST framing (DLE/STX/ETX with byte stuffing). Decoded N2K binary frames are then fed to the canboatjs `FromPgn` parser via `parseBuffer()`, which emits parsed PGN objects. Note: `FromPgn` is an EventEmitter, NOT a Node.js stream — it cannot be piped to directly. No `ReadlineParser` or text-based parsing is used.
 - **NGT-1 initialization (REQUIRED):** After opening the serial port, the app MUST send a BST-framed startup command to the NGT-1 before data will flow. Without this, the device will not stream any N2K data to the PC. Details:
   - **Startup payload:** `[0x11, 0x02, 0x00]` — clears the device's PGN TX filter list, enabling all PGNs
   - **BST frame format:** `DLE(0x10) STX(0x02) <command> <len> <escaped-data> <checksum> DLE(0x10) ETX(0x03)`
@@ -100,7 +100,12 @@ A standalone debug window for decoded N2K data inspection, independent of the ma
 
 ### 4.2 PGN Parsing Pipeline
 
-All incoming data (serial or network) is piped as a raw byte stream through canboatjs `FromPgn` used as a Node.js transform stream. `FromPgn` handles Actisense binary protocol framing internally and emits parsed PGN objects via `pgn` events. The serial manager emits these pre-parsed objects; downstream components (PGN filter, dashboard, recording) consume structured PGN data without any text parsing.
+All incoming serial data is piped through canboatjs `ActisenseStream` (a Node.js Transform stream) which decodes BST binary framing. Decoded N2K frames are fed to canboatjs `FromPgn` parser via `parseBuffer()`, which emits parsed PGN objects via `pgn` events. The serial manager emits these pre-parsed objects; downstream components (PGN filter, dashboard, recording) consume structured PGN data without any text parsing.
+
+**Unit conversions (REQUIRED):** canboatjs outputs NMEA 2000 native units. The dashboard MUST convert before display:
+- Speeds (STW, SOG, AWS, TWS): **m/s → knots** (×1.94384)
+- Angles (AWA, COG, heading, TWA, TWD): **radians → degrees** (×180/π)
+- GPS lat/lon: already in degrees, no conversion needed
 
 **Default racing PGN set:**
 
@@ -135,16 +140,26 @@ Real-time display of current instrument readings, updated as PGNs arrive:
 | Speed Through Water (STW) | 128259 | X.X kts |
 | Speed Over Ground (SOG) | 129026 | X.X kts |
 | Course Over Ground (COG) | 129026 | XXX° |
-| True Wind Speed (TWS) | 130306 | X.X kts |
-| True Wind Angle (TWA) | 130306 | XXX° (port/starboard indicator) |
+| True Wind Speed (TWS) | 130306 or computed | X.X kts |
+| True Wind Angle (TWA) | 130306 or computed | XXX° |
+| True Wind Direction (TWD) | Computed | XXX° |
 | Apparent Wind Speed (AWS) | 130306 | X.X kts |
 | Apparent Wind Angle (AWA) | 130306 | XXX° |
 | Heading | 127250 | XXX° |
 | GPS Position | 129025 | DD°MM.MMM' N/S, DD°MM.MMM' E/W |
 
+**True wind computation:** When true wind PGNs (windReference = "True") are not available on the N2K network, TWS, TWA, and TWD are computed from apparent wind and boat speed:
+- Vector decomposition: u = AWS·sin(AWA), v = AWS·cos(AWA) − STW
+- TWS = √(u² + v²), TWA = atan2(u, v)
+- TWD = (Heading + TWA) mod 360
+- Recomputed whenever apparent wind or heading updates
+- Falls back to SOG if STW is unavailable
+
+**Dampening / smoothing:** All measured values (AWS, AWA, STW, SOG, heading, COG) are smoothed with a time-based exponential moving average (EMA, τ=1000ms) to reduce display jitter. Circular angle handling prevents artifacts at 0°/360° wrap-around. Computed values (TWS, TWA, TWD) are derived from smoothed inputs and not double-smoothed. GPS lat/lon are not smoothed.
+
 **Dashboard layout:**
 - Large numeric tiles for primary metrics (STW, SOG, TWS, TWA, heading)
-- Smaller secondary metrics below (AWS, AWA, COG, position)
+- Smaller secondary metrics below (AWS, AWA, COG, TWD, position)
 - All values update in real-time as PGNs arrive
 - Stale data indicator: if a metric hasn't updated in >5 seconds, dim or flag it
 - Dark theme appropriate for boat cockpit use (low glare)
@@ -363,8 +378,8 @@ OpenStreetMap tiles are fetched at runtime for future phases (track visualizatio
 | UI framework | React 18 + Vite | Fast HMR for development |
 | Styling | Tailwind CSS | Dark theme utilities |
 | State management | Zustand | Lightweight, minimal boilerplate |
-| PGN parser | @canboat/canboatjs | MIT, 450+ stars, used as FromPgn transform stream for Actisense binary protocol |
-| Serial I/O | @serialport | Mature Electron support; raw bytes piped through canboatjs FromPgn (no ReadlineParser) |
+| PGN parser | @canboat/canboatjs | MIT, 450+ stars; ActisenseStream for BST decoding, FromPgn.parseBuffer() for PGN parsing |
+| Serial I/O | @serialport | Mature Electron support; raw bytes piped through ActisenseStream Transform (no ReadlineParser) |
 | Database | SQLite via better-sqlite3 | Sync, zero-config, fast |
 | Build/packaging | electron-builder | Windows .exe installer |
 | Testing | Vitest | Unit + integration tests |
@@ -509,3 +524,7 @@ All resolved — see §17.
 9. **Sun Fast 3300 polar pre-loaded** — user has polar file available; stored in `~/n2k-race-logger/polars/`.
 10. **NGT-1 initialization command required** — the NGT-1 will not stream data without receiving a BST-framed startup command after serial port open. The Actisense Comms SDK DLL was evaluated and rejected (Windows-only native C DLL from 2010, NDA licensing, unnecessary complexity). Instead, the well-established canboat reverse-engineered init sequence is used (Apache 2.0, proven across multiple implementations). Added 2026-06-12.
 11. **Keepalive every 20 seconds** — prevents the NGT-1 from reverting to its default PGN filter. Same startup command re-sent on interval. Added 2026-06-12.
+12. **ActisenseStream for BST decoding** — `FromPgn` is an EventEmitter (not a Node.js stream), so serial data cannot be piped to it directly. `ActisenseStream` (from canboatjs) is a proper Transform stream that decodes BST framing; decoded frames are then fed to `FromPgn.parseBuffer()`. The stream is created with `{ fromFile: true, reconnect: false, app: new EventEmitter() }` to use it as a standalone decoder without its own serial port management. `outAvailable` is set to `true` to prevent it from attempting transmit PGN configuration on the null serial port. Added 2026-06-14.
+13. **Unit conversions at PGN ingestion** — canboatjs outputs NMEA 2000 native units (m/s for speeds, radians for angles). Conversions to knots (×1.94384) and degrees (×180/π) are applied in the Dashboard PGN handler before storing in Zustand. GPS coordinates are already in degrees. Added 2026-06-14.
+14. **EMA dampening (τ=1000ms)** — time-based exponential moving average applied to measured values (AWS, AWA, STW, SOG, heading, COG) in the Zustand store. Uses `alpha = 1 - e^(-dt/τ)` for rate-independent smoothing. Circular angle handling prevents artifacts at 0°/360° wrap. GPS and computed values are not smoothed. Added 2026-06-14.
+15. **True wind computed client-side** — TWS, TWA, and TWD are computed from apparent wind + STW (or SOG) + heading using standard vector decomposition, since Marcus's B&G system does not send true wind PGNs on the N2K bus. TWD is recomputed whenever heading updates. Added 2026-06-14.

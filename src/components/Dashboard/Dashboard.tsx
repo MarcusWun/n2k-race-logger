@@ -7,6 +7,21 @@ import InstrumentTile from './InstrumentTile';
 import GPSTile from './GPSTile';
 import RecordingControls from '../Controls/RecordingControls';
 
+// Unit conversion constants
+const MS_TO_KTS = 1.94384;
+const RAD_TO_DEG = 180 / Math.PI;
+
+/** Compute true wind from apparent wind and boat speed (all in knots/degrees). */
+function computeTrueWind(awsKts: number, awaDeg: number, stwKts: number): { tws: number; twa: number } {
+  const awaRad = awaDeg / RAD_TO_DEG;
+  const u = awsKts * Math.sin(awaRad);
+  const v = awsKts * Math.cos(awaRad) - stwKts;
+  const tws = Math.sqrt(u * u + v * v);
+  const twaRad = Math.atan2(u, v);
+  const twaDeg = ((twaRad * RAD_TO_DEG) % 360 + 360) % 360;
+  return { tws, twa: twaDeg };
+}
+
 export default function Dashboard() {
   const setMetric = useN2KStore((s) => s.setMetric);
   const updateLastUpdated = useN2KStore((s) => s.updateLastUpdated);
@@ -18,48 +33,62 @@ export default function Dashboard() {
 
     const unsubPgn = ipc.on('pgn:data', (msg: any) => {
       const { pgn, fields } = msg;
-      const now = Date.now();
 
       if (pgn === 128259 && fields.speedWaterReferenced != null) {
-        const stw = Number(fields.speedWaterReferenced);
-        setMetric('stw', stw);
+        setMetric('stw', Number(fields.speedWaterReferenced) * MS_TO_KTS);
         updateLastUpdated('stw');
       }
       if (pgn === 129026) {
         if (fields.sogWaterReferenced != null || fields.sog != null) {
-          setMetric('sog', Number(fields.sogWaterReferenced ?? fields.sog));
+          setMetric('sog', Number(fields.sogWaterReferenced ?? fields.sog) * MS_TO_KTS);
           updateLastUpdated('sog');
         }
         if (fields.cogWaterReferenced != null || fields.cog != null) {
-          setMetric('cog', Number(fields.cogWaterReferenced ?? fields.cog));
+          setMetric('cog', Number(fields.cogWaterReferenced ?? fields.cog) * RAD_TO_DEG);
           updateLastUpdated('cog');
         }
       }
       if (pgn === 130306) {
-        if (fields.windSpeed != null) {
-          if (fields.windReference === 'True (boat referenced)' || fields.windReference === 'True (ground referenced to North)') {
-            setMetric('tws', Number(fields.windSpeed));
-            updateLastUpdated('tws');
-          } else {
-            setMetric('aws', Number(fields.windSpeed));
-            updateLastUpdated('aws');
-          }
-        }
-        if (fields.windAngle != null) {
-          if (fields.windReference === 'True (boat referenced)' || fields.windReference === 'True (ground referenced to North)') {
-            setMetric('twa', Number(fields.windAngle));
-            updateLastUpdated('twa');
-          } else {
-            setMetric('awa', Number(fields.windAngle));
-            updateLastUpdated('awa');
+        const speedKts = fields.windSpeed != null ? Number(fields.windSpeed) * MS_TO_KTS : null;
+        const angleDeg = fields.windAngle != null ? Number(fields.windAngle) * RAD_TO_DEG : null;
+        const isTrue = fields.windReference === 'True (boat referenced)' || fields.windReference === 'True (ground referenced to North)';
+
+        if (isTrue) {
+          if (speedKts != null) { setMetric('tws', speedKts); updateLastUpdated('tws'); }
+          if (angleDeg != null) { setMetric('twa', angleDeg); updateLastUpdated('twa'); }
+        } else {
+          if (speedKts != null) { setMetric('aws', speedKts); updateLastUpdated('aws'); }
+          if (angleDeg != null) { setMetric('awa', angleDeg); updateLastUpdated('awa'); }
+
+          // Compute true wind from apparent wind + boat speed
+          const state = useN2KStore.getState();
+          const aws = speedKts ?? state.aws;
+          const awa = angleDeg ?? state.awa;
+          const stw = state.stw ?? state.sog ?? 0;
+          if (aws != null && awa != null) {
+            const tw = computeTrueWind(aws, awa, stw);
+            setMetric('tws', tw.tws); updateLastUpdated('tws');
+            setMetric('twa', tw.twa); updateLastUpdated('twa');
+            const heading = state.heading;
+            if (heading != null) {
+              setMetric('twd', (heading + tw.twa) % 360);
+              updateLastUpdated('twd');
+            }
           }
         }
       }
       if (pgn === 127250) {
         const heading = fields.heading ?? fields.headingMagnetic ?? fields.headingTrue;
         if (heading != null) {
-          setMetric('heading', Number(heading));
+          const headingDeg = Number(heading) * RAD_TO_DEG;
+          setMetric('heading', headingDeg);
           updateLastUpdated('heading');
+          // Recompute TWD when heading updates
+          const twa = useN2KStore.getState().twa;
+          if (twa != null) {
+            setMetric('twd', (headingDeg + twa) % 360);
+            updateLastUpdated('twd');
+          }
         }
       }
       if (pgn === 129025) {
@@ -102,6 +131,7 @@ export default function Dashboard() {
         <InstrumentTile label="AWS" metricKey="aws" unit="kts" />
         <InstrumentTile label="AWA" metricKey="awa" unit="°" format={(v) => `${Math.round(v)}°`} />
         <InstrumentTile label="COG" metricKey="cog" unit="°" format={(v) => `${Math.round(v)}°`} />
+        <InstrumentTile label="TWD" metricKey="twd" unit="°" format={(v) => `${Math.round(v)}°`} />
         <PolarTile />
       </div>
 

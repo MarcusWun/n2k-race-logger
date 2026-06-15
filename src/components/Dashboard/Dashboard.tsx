@@ -51,7 +51,7 @@ export default function Dashboard() {
       if (pgn === 130306) {
         const speedKts = fields.windSpeed != null ? Number(fields.windSpeed) * MS_TO_KTS : null;
         const angleDeg = fields.windAngle != null ? Number(fields.windAngle) * RAD_TO_DEG : null;
-        const ref = fields.windReference;
+        const ref = fields.reference;
 
         if (ref === 'Apparent') {
           // Apparent wind — relative to boat bow
@@ -130,7 +130,7 @@ export default function Dashboard() {
         <InstrumentTile label="SOG" metricKey="sog" unit="kts" large />
         <InstrumentTile label="TWS" metricKey="tws" unit="kts" large />
         <InstrumentTile label="TWA" metricKey="twa" unit="°" format={(v) => `${Math.round(v)}°`} large />
-        <InstrumentTile label="Heading" metricKey="heading" unit="°" format={(v) => `${Math.round(v)}°`} large />
+        <InstrumentTile label="Heading" metricKey="heading" unit="°M" format={(v) => `${Math.round(v)}°M`} large />
       </div>
 
       {/* Secondary instruments */}

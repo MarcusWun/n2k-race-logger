@@ -51,12 +51,10 @@ export default function Dashboard() {
       if (pgn === 130306) {
         const speedKts = fields.windSpeed != null ? Number(fields.windSpeed) * MS_TO_KTS : null;
         const angleDeg = fields.windAngle != null ? Number(fields.windAngle) * RAD_TO_DEG : null;
-        const isTrue = fields.windReference === 'True (boat referenced)' || fields.windReference === 'True (ground referenced to North)';
+        const ref = fields.windReference;
 
-        if (isTrue) {
-          if (speedKts != null) { setMetric('tws', speedKts); updateLastUpdated('tws'); }
-          if (angleDeg != null) { setMetric('twa', angleDeg); updateLastUpdated('twa'); }
-        } else {
+        if (ref === 'Apparent') {
+          // Apparent wind — relative to boat bow
           if (speedKts != null) { setMetric('aws', speedKts); updateLastUpdated('aws'); }
           if (angleDeg != null) { setMetric('awa', angleDeg); updateLastUpdated('awa'); }
 
@@ -75,7 +73,16 @@ export default function Dashboard() {
               updateLastUpdated('twd');
             }
           }
+        } else if (ref === 'True (boat referenced)' || ref === 'True (water referenced)') {
+          // True wind angle relative to boat bow
+          if (speedKts != null) { setMetric('tws', speedKts); updateLastUpdated('tws'); }
+          if (angleDeg != null) { setMetric('twa', angleDeg); updateLastUpdated('twa'); }
+        } else if (ref === 'True (ground referenced to North)' || ref === 'Magnetic (ground referenced to Magnetic North)') {
+          // Wind direction (absolute) — store as TWD directly
+          if (speedKts != null) { setMetric('tws', speedKts); updateLastUpdated('tws'); }
+          if (angleDeg != null) { setMetric('twd', angleDeg); updateLastUpdated('twd'); }
         }
+        // Ignore unknown/error wind reference types
       }
       if (pgn === 127250) {
         const heading = fields.heading ?? fields.headingMagnetic ?? fields.headingTrue;
@@ -130,8 +137,8 @@ export default function Dashboard() {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <InstrumentTile label="AWS" metricKey="aws" unit="kts" />
         <InstrumentTile label="AWA" metricKey="awa" unit="°" format={(v) => `${Math.round(v)}°`} />
-        <InstrumentTile label="COG" metricKey="cog" unit="°" format={(v) => `${Math.round(v)}°`} />
-        <InstrumentTile label="TWD" metricKey="twd" unit="°" format={(v) => `${Math.round(v)}°`} />
+        <InstrumentTile label="COG" metricKey="cog" unit="°M" format={(v) => `${Math.round(v)}°M`} />
+        <InstrumentTile label="TWD" metricKey="twd" unit="°M" format={(v) => `${Math.round(v)}°M`} />
         <PolarTile />
       </div>
 

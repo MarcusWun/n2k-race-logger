@@ -51,7 +51,8 @@ export default function Dashboard() {
       if (pgn === 130306) {
         const speedKts = fields.windSpeed != null ? Number(fields.windSpeed) * MS_TO_KTS : null;
         const angleDeg = fields.windAngle != null ? Number(fields.windAngle) * RAD_TO_DEG : null;
-        const ref = fields.reference;
+        const ref = fields.reference ?? fields.windReference;
+        console.log(`[Wind PGN 130306] reference="${ref}" (raw field keys: ${Object.keys(fields).join(', ')}), speed=${speedKts?.toFixed(1)}, angle=${angleDeg?.toFixed(0)}`);
 
         if (ref === 'Apparent') {
           // Apparent wind — relative to boat bow

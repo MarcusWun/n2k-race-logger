@@ -116,7 +116,7 @@ All incoming serial data is piped through canboatjs `ActisenseStream` (a Node.js
 | 129026 | COG & SOG — Rapid Update | COG, SOG |
 | 129029 | GNSS Position Data | Lat, Lon, altitude, satellites |
 | 127250 | Vessel Heading | Heading (magnetic/true) |
-| 130306 | Wind Data | Wind speed, wind angle, reference (true/apparent) |
+| 130306 | Wind Data | Wind speed, wind angle, reference (see wind reference filtering below) |
 | 130310 | Environmental Parameters | Water temp, outside temp, atmospheric pressure |
 | 127257 | Attitude | Roll, pitch, yaw |
 | 129284 | Navigation Data | Distance/bearing to waypoint, VMG |
@@ -139,16 +139,29 @@ Real-time display of current instrument readings, updated as PGNs arrive:
 |--------|-----------|----------------|
 | Speed Through Water (STW) | 128259 | X.X kts |
 | Speed Over Ground (SOG) | 129026 | X.X kts |
-| Course Over Ground (COG) | 129026 | XXX° |
+| Course Over Ground (COG) | 129026 | XXX°M (magnetic) |
 | True Wind Speed (TWS) | 130306 or computed | X.X kts |
 | True Wind Angle (TWA) | 130306 or computed | XXX° |
-| True Wind Direction (TWD) | Computed | XXX° |
-| Apparent Wind Speed (AWS) | 130306 | X.X kts |
-| Apparent Wind Angle (AWA) | 130306 | XXX° |
-| Heading | 127250 | XXX° |
+| True Wind Direction (TWD) | 130306 (ground ref) or computed | XXX°M (magnetic) |
+| Apparent Wind Speed (AWS) | 130306 (Apparent only) | X.X kts |
+| Apparent Wind Angle (AWA) | 130306 (Apparent only) | XXX° |
+| Heading | 127250 | XXX°M (magnetic) |
 | GPS Position | 129025 | DD°MM.MMM' N/S, DD°MM.MMM' E/W |
 
-**True wind computation:** When true wind PGNs (windReference = "True") are not available on the N2K network, TWS, TWA, and TWD are computed from apparent wind and boat speed:
+**Wind reference filtering (PGN 130306):** PGN 130306 carries a `reference` field (WIND_REFERENCE enum) that determines how the data is routed. Multiple devices on the N2K bus may send this PGN with different reference types simultaneously:
+
+| Reference value | Routing |
+|-----------------|---------|
+| `"Apparent"` | → AWS, AWA. Also triggers true wind computation (below). |
+| `"True (boat referenced)"` | → TWS, TWA |
+| `"True (water referenced)"` | → TWS, TWA |
+| `"True (ground referenced to North)"` | → TWS, TWD (angle is absolute direction, not relative to bow) |
+| `"Magnetic (ground referenced to Magnetic North)"` | → TWS, TWD (angle is magnetic direction) |
+| Unknown / error values | Ignored |
+
+**IMPORTANT:** The canboatjs field name is `reference` (matching the PGN definition ID), NOT `windReference`. Using the wrong field name will cause silent failures since the value will be `undefined`.
+
+**True wind computation:** When true wind PGNs (reference = "True") are not available on the N2K network, TWS, TWA, and TWD are computed from apparent wind and boat speed:
 - Vector decomposition: u = AWS·sin(AWA), v = AWS·cos(AWA) − STW
 - TWS = √(u² + v²), TWA = atan2(u, v)
 - TWD = (Heading + TWA) mod 360
@@ -528,3 +541,5 @@ All resolved — see §17.
 13. **Unit conversions at PGN ingestion** — canboatjs outputs NMEA 2000 native units (m/s for speeds, radians for angles). Conversions to knots (×1.94384) and degrees (×180/π) are applied in the Dashboard PGN handler before storing in Zustand. GPS coordinates are already in degrees. Added 2026-06-14.
 14. **EMA dampening (τ=1000ms)** — time-based exponential moving average applied to measured values (AWS, AWA, STW, SOG, heading, COG) in the Zustand store. Uses `alpha = 1 - e^(-dt/τ)` for rate-independent smoothing. Circular angle handling prevents artifacts at 0°/360° wrap. GPS and computed values are not smoothed. Added 2026-06-14.
 15. **True wind computed client-side** — TWS, TWA, and TWD are computed from apparent wind + STW (or SOG) + heading using standard vector decomposition, since Marcus's B&G system does not send true wind PGNs on the N2K bus. TWD is recomputed whenever heading updates. Added 2026-06-14.
+16. **Wind reference filtering** — PGN 130306 `reference` field must be explicitly matched: only `"Apparent"` routes to AWS/AWA; `"True (boat/water referenced)"` routes to TWS/TWA; `"Magnetic"` and `"True (ground referenced)"` route to TWS/TWD. Marcus's B&G system sends both Apparent and Magnetic references simultaneously — treating all non-true as apparent caused AWA/AWS to jump between correct values and the magnetic wind direction. The canboatjs field name is `reference` (not `windReference`). Added 2026-06-14.
+17. **Magnetic degree indicator (°M)** — COG, TWD, and Heading display with °M suffix to distinguish magnetic from true bearings. Added 2026-06-14.

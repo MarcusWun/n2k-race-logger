@@ -163,6 +163,11 @@ export function registerIPCHandlers(): void {
     // Send ALL parsed PGNs to debug window (unfiltered)
     sendDebugData(formatDebugLine(parsed));
 
+    // Diagnostic: log wind PGN reference field to stdout
+    if (parsed.pgn === 130306) {
+      console.log(`[Wind 130306] src=${parsed.src} fields=${JSON.stringify(parsed.fields)}`);
+    }
+
     // Apply PGN filter for dashboard
     const message = n2kParser.filter(parsed);
     if (message) {

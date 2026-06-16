@@ -148,6 +148,13 @@ Real-time display of current instrument readings, updated as PGNs arrive:
 | Heading | 127250 | XXX°M (magnetic) |
 | GPS Position | 129025 | DD°MM.MMM' N/S, DD°MM.MMM' E/W |
 
+**Wind source filtering (PGN 130306):** Multiple devices on the N2K bus may transmit PGN 130306. On Marcus's B&G system, three sources were observed:
+- **src=16** — the real wind instrument. Sends Apparent, True (boat referenced), and True (ground referenced to North) with valid, varying readings.
+- **src=22** — sends constant bogus Apparent data (windSpeed=0.25 m/s, windAngle=π rad / 180°). Must be filtered out.
+- **src=8** — sends incomplete PGN 130306 messages (reference field only, no speed/angle). Must be filtered out.
+
+Wind PGNs from src=22 and src=8 are dropped before reaching the dashboard or recording pipeline. This filter is applied in `ipc-handlers.ts` at the serial event handler level so bogus data never enters any downstream processing.
+
 **Wind reference filtering (PGN 130306):** PGN 130306 carries a `reference` field (WIND_REFERENCE enum) that determines how the data is routed. Multiple devices on the N2K bus may send this PGN with different reference types simultaneously:
 
 | Reference value | Routing |
@@ -543,3 +550,4 @@ All resolved — see §17.
 15. **True wind computed client-side** — TWS, TWA, and TWD are computed from apparent wind + STW (or SOG) + heading using standard vector decomposition, since Marcus's B&G system does not send true wind PGNs on the N2K bus. TWD is recomputed whenever heading updates. Added 2026-06-14.
 16. **Wind reference filtering** — PGN 130306 `reference` field must be explicitly matched: only `"Apparent"` routes to AWS/AWA; `"True (boat/water referenced)"` routes to TWS/TWA; `"Magnetic"` and `"True (ground referenced)"` route to TWS/TWD. Marcus's B&G system sends both Apparent and Magnetic references simultaneously — treating all non-true as apparent caused AWA/AWS to jump between correct values and the magnetic wind direction. The canboatjs field name is `reference` (not `windReference`). Added 2026-06-14.
 17. **Magnetic degree indicator (°M)** — COG, TWD, and Heading display with °M suffix to distinguish magnetic from true bearings. Added 2026-06-14.
+18. **Wind source filtering (src=22, src=8 dropped)** — Marcus's N2K bus has three devices sending PGN 130306. src=22 transmits constant bogus Apparent wind (0.25 m/s at exactly 180°), causing AWS/AWA to jump between correct and incorrect values. src=8 sends incomplete messages with no speed or angle data. Both are dropped at the serial event handler level in `ipc-handlers.ts` before any downstream processing. Only src=16 (the real B&G wind instrument) is accepted. Added 2026-06-15.

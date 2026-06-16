@@ -163,9 +163,9 @@ export function registerIPCHandlers(): void {
     // Send ALL parsed PGNs to debug window (unfiltered)
     sendDebugData(formatDebugLine(parsed));
 
-    // Diagnostic: log wind PGN reference field to stdout
-    if (parsed.pgn === 130306) {
-      console.log(`[Wind 130306] src=${parsed.src} fields=${JSON.stringify(parsed.fields)}`);
+    // Filter out bogus wind sources (src=22 sends constant 0.25m/s @ 180°, src=8 sends incomplete data)
+    if (parsed.pgn === 130306 && (parsed.src === 22 || parsed.src === 8)) {
+      return;
     }
 
     // Apply PGN filter for dashboard

@@ -25,6 +25,7 @@ export interface AppSettings {
   serialPort: string;
   serialBaud: number;
   pgnFilter: number[];
+  sourcePreferences: Record<number, number>; // PGN → preferred source address
   dataDirectory: string;
   polarDirectory: string;
   activePolarProfile?: number;

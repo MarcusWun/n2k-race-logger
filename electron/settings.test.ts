@@ -32,6 +32,7 @@ describe('Settings load/save round-trip', () => {
       serialPort: 'COM3',
       serialBaud: 115200,
       pgnFilter: [128259, 129025, 129026, 129029, 127250, 130306, 130310, 127257, 129284],
+      sourcePreferences: { 130306: 16 },
       dataDirectory: '~/n2k-race-logger/races/',
       polarDirectory: '~/n2k-race-logger/polars/',
     };
@@ -42,7 +43,42 @@ describe('Settings load/save round-trip', () => {
     expect(loaded.serialPort).toBe('COM3');
     expect(loaded.serialBaud).toBe(115200);
     expect(loaded.pgnFilter).toEqual(original.pgnFilter);
+    expect(loaded.sourcePreferences).toEqual({ 130306: 16 });
     expect(loaded.dataDirectory).toBe('~/n2k-race-logger/races/');
+  });
+
+  it('saves and loads sourcePreferences correctly', () => {
+    const settings = {
+      serialPort: 'COM3',
+      serialBaud: 115200,
+      pgnFilter: [130306, 127250],
+      sourcePreferences: { 130306: 16, 127250: 3 },
+      dataDirectory: '~/n2k-race-logger/races/',
+      polarDirectory: '~/n2k-race-logger/polars/',
+    };
+
+    writeSettings(settings);
+    const loaded = readSettings();
+
+    expect(loaded.sourcePreferences).toEqual({ 130306: 16, 127250: 3 });
+  });
+
+  it('defaults sourcePreferences to { 130306: 16 } when field is missing', () => {
+    // Simulate old settings file without sourcePreferences
+    const legacy = {
+      serialPort: 'COM3',
+      serialBaud: 115200,
+      pgnFilter: [130306],
+      dataDirectory: '~/n2k-race-logger/races/',
+      polarDirectory: '~/n2k-race-logger/polars/',
+    };
+
+    writeSettings(legacy);
+    const loaded = readSettings();
+
+    // After migration, sourcePreferences should be applied
+    const migrated = { ...loaded, sourcePreferences: loaded.sourcePreferences ?? { 130306: 16 } };
+    expect(migrated.sourcePreferences).toEqual({ 130306: 16 });
   });
 
   it('handles partial updates', () => {

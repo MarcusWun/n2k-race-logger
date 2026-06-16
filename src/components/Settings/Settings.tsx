@@ -12,6 +12,7 @@ export default function Settings() {
   const [draft, setDraft] = useState<AppSettings>({ ...settings });
   const [ports, setPorts] = useState<Array<{ path: string; manufacturer?: string }>>([]);
   const [saved, setSaved] = useState(false);
+  const [discoveredSources, setDiscoveredSources] = useState<Record<number, number[]>>({});
 
   useEffect(() => {
     const ipc = getIPC();
@@ -20,7 +21,7 @@ export default function Settings() {
     ipc.getSettings().then((s: AppSettings) => {
       if (s) {
         setSettings(s);
-        setDraft(s);
+        setDraft({ ...s, sourcePreferences: s.sourcePreferences ?? {} });
       }
     });
     ipc.listPorts().then((p: any[]) => {
@@ -29,6 +30,14 @@ export default function Settings() {
     ipc.listPolars().then((p: BoatProfile[]) => {
       if (Array.isArray(p)) setProfiles(p);
     });
+    ipc.getSources().then((sources: Record<number, number[]>) => {
+      if (sources) setDiscoveredSources(sources);
+    });
+
+    const unsub = ipc.on('sources:discovered', (sources: Record<number, number[]>) => {
+      setDiscoveredSources(sources);
+    });
+    return () => { if (unsub) unsub(); };
   }, [setSettings, setProfiles]);
 
   const handleSave = async () => {
@@ -51,6 +60,24 @@ export default function Settings() {
       setDraft({ ...draft, pgnFilter: current.filter((p) => p !== pgn) });
     } else {
       setDraft({ ...draft, pgnFilter: [...current, pgn] });
+    }
+  };
+
+  const setSourcePreference = (pgn: number, src: number | null) => {
+    const current = { ...(draft.sourcePreferences || {}) };
+    if (src == null) {
+      delete current[pgn];
+    } else {
+      current[pgn] = src;
+    }
+    setDraft({ ...draft, sourcePreferences: current });
+  };
+
+  const handleRescan = async () => {
+    const ipc = getIPC();
+    if (ipc) {
+      await ipc.rescanSources();
+      setDiscoveredSources({});
     }
   };
 
@@ -109,6 +136,49 @@ export default function Settings() {
               <span>{PGN_NAMES[pgn] || 'Unknown'}</span>
             </label>
           ))}
+        </div>
+      </section>
+
+      {/* PGN Sources */}
+      <section>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-lg font-semibold text-n2k-accent">PGN Sources</h2>
+          <button
+            onClick={handleRescan}
+            className="px-3 py-1 rounded text-xs font-medium bg-gray-700 hover:bg-gray-600 text-white"
+          >
+            Rescan Sources
+          </button>
+        </div>
+        <div className="flex flex-col gap-2">
+          {DEFAULT_PGN_FILTER.map((pgn) => {
+            const sources = discoveredSources[pgn] ?? [];
+            const preferred = (draft.sourcePreferences ?? {})[pgn];
+            return (
+              <div key={pgn} className="flex items-center justify-between text-sm">
+                <div className="flex gap-2 text-gray-300">
+                  <span className="font-mono text-gray-500">{pgn}</span>
+                  <span>{PGN_NAMES[pgn] || 'Unknown'}</span>
+                </div>
+                {sources.length === 0 ? (
+                  <span className="text-gray-600 text-xs italic">No sources observed</span>
+                ) : sources.length === 1 ? (
+                  <span className="text-gray-400 text-xs">src {sources[0]}</span>
+                ) : (
+                  <select
+                    value={preferred ?? ''}
+                    onChange={(e) => setSourcePreference(pgn, e.target.value ? Number(e.target.value) : null)}
+                    className="bg-n2k-bg border border-gray-700 rounded px-2 py-0.5 text-xs text-white"
+                  >
+                    <option value="">Any source</option>
+                    {sources.map((src) => (
+                      <option key={src} value={src}>src {src}</option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            );
+          })}
         </div>
       </section>
 

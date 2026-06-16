@@ -15,9 +15,10 @@ function makeActisense(pgn: number, data: Buffer): string {
 }
 
 // Helper: create a ParsedPGN object for testing the filter
-function makeParsedPGN(pgn: number, fields: Record<string, any> = {}): ParsedPGN {
+function makeParsedPGN(pgn: number, fields: Record<string, any> = {}, src?: number): ParsedPGN {
   return {
     pgn,
+    src,
     fields,
     timestamp: new Date().toISOString(),
   };
@@ -116,5 +117,19 @@ describe('PGN filtering', () => {
 
     parser.setPGNFilter([129029]);
     expect(parser.filter(parsed)).not.toBeNull();
+  });
+
+  it('passes through src when present', () => {
+    const parsed = makeParsedPGN(130306, { windSpeed: 5.5 }, 16);
+    const result = parser.filter(parsed);
+    expect(result).not.toBeNull();
+    expect(result!.src).toBe(16);
+  });
+
+  it('src is undefined when not provided', () => {
+    const parsed = makeParsedPGN(128259, { speedWaterReferenced: 2.5 });
+    const result = parser.filter(parsed);
+    expect(result).not.toBeNull();
+    expect(result!.src).toBeUndefined();
   });
 });

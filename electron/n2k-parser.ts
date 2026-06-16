@@ -3,6 +3,7 @@ import type { ParsedPGN } from './serial-manager';
 
 export interface PGNMessage {
   pgn: number;
+  src?: number;
   fields: Record<string, any>;
   timestamp: string;
 }
@@ -50,6 +51,7 @@ export class N2KParser extends EventEmitter {
     }
     return {
       pgn: parsed.pgn,
+      src: parsed.src,
       fields: parsed.fields,
       timestamp: parsed.timestamp || new Date().toISOString(),
     };

@@ -3,6 +3,7 @@ import { SerialManager, ParsedPGN } from './serial-manager';
 import { N2KParser, PGNMessage } from './n2k-parser';
 import { PolarEngine } from './polar-engine';
 import { RaceDatabase, createRaceDatabase } from './database';
+import { SourceDiscovery } from './source-discovery';
 import { sendDebugData } from './main';
 import * as path from 'path';
 import * as os from 'os';
@@ -91,10 +92,15 @@ function formatDebugLine(msg: ParsedPGN): string {
 let serialManager: SerialManager | null = null;
 let n2kParser: N2KParser | null = null;
 let polarEngine: PolarEngine | null = null;
+let sourceDiscovery: SourceDiscovery | null = null;
 let raceDb: RaceDatabase | null = null;
 let isRecording = false;
 let recordingStartTime: number | null = null;
 let recordingRecordCount = 0;
+
+// Cached source preferences — loaded at startup and updated on settings:set.
+// Avoids disk reads in the hot PGN event path.
+let cachedSourcePreferences: Record<number, number> = {};
 
 // Settings file path
 function getSettingsPath(): string {
@@ -105,12 +111,19 @@ function getSettingsPath(): string {
   );
 }
 
+const DEFAULT_SOURCE_PREFERENCES: Record<number, number> = { 130306: 16 };
+
 // Load app settings
 function loadAppSettings(): Record<string, any> {
   const sp = getSettingsPath();
   try {
     if (fs.existsSync(sp)) {
-      return JSON.parse(fs.readFileSync(sp, 'utf-8'));
+      const saved = JSON.parse(fs.readFileSync(sp, 'utf-8'));
+      // Migrate: apply default source preferences if field is missing
+      if (saved.sourcePreferences == null) {
+        saved.sourcePreferences = { ...DEFAULT_SOURCE_PREFERENCES };
+      }
+      return saved;
     }
   } catch {
     // ignore
@@ -119,6 +132,7 @@ function loadAppSettings(): Record<string, any> {
     serialPort: 'COM3',
     serialBaud: 115200,
     pgnFilter: [128259, 129025, 129026, 129029, 127250, 130306, 130310, 127257, 129284],
+    sourcePreferences: { ...DEFAULT_SOURCE_PREFERENCES },
     dataDirectory: path.join(os.homedir(), 'n2k-race-logger', 'races'),
     polarDirectory: path.join(os.homedir(), 'n2k-race-logger', 'polars'),
     activePolarProfile: undefined,
@@ -150,10 +164,27 @@ function getWebContents() {
 /**
  * Initialize all IPC handlers. Call this once during app ready.
  */
+// Debounced push of updated source map to renderer (fires 1s after last new source seen)
+let sourceUpdateTimer: NodeJS.Timeout | null = null;
+function scheduleSourceUpdate(): void {
+  if (sourceUpdateTimer) return;
+  sourceUpdateTimer = setTimeout(() => {
+    sourceUpdateTimer = null;
+    if (sourceDiscovery) {
+      getWebContents()?.send('sources:discovered', sourceDiscovery.getDiscoveredSources());
+    }
+  }, 1000);
+}
+
 export function registerIPCHandlers(): void {
   serialManager = new SerialManager();
   n2kParser = new N2KParser();
   polarEngine = new PolarEngine();
+  sourceDiscovery = new SourceDiscovery();
+
+  // Load cached source preferences at startup (avoids disk I/O in the hot PGN path)
+  const startupSettings = loadAppSettings();
+  cachedSourcePreferences = startupSettings.sourcePreferences || {};
 
   // Wire up serial → parser pipeline
   // SerialManager now emits pre-parsed 'pgn' events (binary protocol handled by FromPgn stream)
@@ -163,8 +194,14 @@ export function registerIPCHandlers(): void {
     // Send ALL parsed PGNs to debug window (unfiltered)
     sendDebugData(formatDebugLine(parsed));
 
-    // Filter out bogus wind sources (src=22 sends constant 0.25m/s @ 180°, src=8 sends incomplete data)
-    if (parsed.pgn === 130306 && (parsed.src === 22 || parsed.src === 8)) {
+    // Track source discovery — notify renderer when new sources appear
+    if (parsed.src != null) {
+      const isNew = sourceDiscovery!.observe(parsed.pgn, parsed.src);
+      if (isNew) scheduleSourceUpdate();
+    }
+
+    // Apply source preference filter (uses cached prefs, no disk I/O)
+    if (parsed.src != null && !sourceDiscovery!.shouldAccept(parsed.pgn, parsed.src, cachedSourcePreferences)) {
       return;
     }
 
@@ -375,7 +412,24 @@ export function registerIPCHandlers(): void {
       n2kParser!.setPGNFilter(updated.pgnFilter);
     }
 
+    // Update cached source preferences immediately
+    cachedSourcePreferences = updated.sourcePreferences || {};
+
     return { success: true, settings: updated };
+  });
+
+  // --- sources:get ---
+  ipcMain.handle('sources:get', async () => {
+    return sourceDiscovery ? sourceDiscovery.getDiscoveredSources() : {};
+  });
+
+  // --- sources:rescan ---
+  ipcMain.handle('sources:rescan', async () => {
+    if (sourceDiscovery) {
+      sourceDiscovery.clear();
+      getWebContents()?.send('sources:discovered', {});
+    }
+    return { success: true };
   });
 
   console.log('[IPC] All handlers registered.');

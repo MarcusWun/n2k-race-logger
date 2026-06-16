@@ -5,6 +5,7 @@ const defaultSettings: AppSettings = {
   serialPort: 'COM3',
   serialBaud: 115200,
   pgnFilter: [128259, 129025, 129026, 129029, 127250, 130306, 130310, 127257, 129284],
+  sourcePreferences: { 130306: 16 },
   dataDirectory: '~/n2k-race-logger/races/',
   polarDirectory: '~/n2k-race-logger/polars/',
 };

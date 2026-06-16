@@ -35,6 +35,10 @@ const api = {
   setSettings: (payload: Record<string, any>) =>
     ipcRenderer.invoke('settings:set', payload),
 
+  // Source discovery
+  getSources: () => ipcRenderer.invoke('sources:get'),
+  rescanSources: () => ipcRenderer.invoke('sources:rescan'),
+
   // Event listeners
   on: (channel: string, callback: (...args: any[]) => void) => {
     const validChannels = [
@@ -45,6 +49,7 @@ const api = {
       'polar:profiles',
       'polar:data',
       'polar:performance',
+      'sources:discovered',
     ];
     if (validChannels.includes(channel)) {
       const listener = (_event: any, ...args: any[]) => callback(...args);

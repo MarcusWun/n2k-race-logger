@@ -407,11 +407,6 @@ export function registerIPCHandlers(): void {
     const updated = { ...settings, ...payload };
     saveAppSettings(updated);
 
-    // Update parser filter if changed
-    if (updated.pgnFilter) {
-      n2kParser!.setPGNFilter(updated.pgnFilter);
-    }
-
     // Update cached source preferences immediately
     cachedSourcePreferences = updated.sourcePreferences || {};
 

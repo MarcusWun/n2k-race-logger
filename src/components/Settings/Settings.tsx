@@ -54,15 +54,6 @@ export default function Settings() {
     setDraft({ ...settings });
   };
 
-  const togglePGN = (pgn: number) => {
-    const current = draft.pgnFilter || [];
-    if (current.includes(pgn)) {
-      setDraft({ ...draft, pgnFilter: current.filter((p) => p !== pgn) });
-    } else {
-      setDraft({ ...draft, pgnFilter: [...current, pgn] });
-    }
-  };
-
   const setSourcePreference = (pgn: number, src: number | null) => {
     const current = { ...(draft.sourcePreferences || {}) };
     if (src == null) {
@@ -114,28 +105,6 @@ export default function Settings() {
               ))}
             </select>
           </div>
-        </div>
-      </section>
-
-      {/* PGN Filter */}
-      <section>
-        <h2 className="text-lg font-semibold text-n2k-accent mb-3">PGN Filter</h2>
-        <div className="grid grid-cols-1 gap-1">
-          {DEFAULT_PGN_FILTER.map((pgn) => (
-            <label
-              key={pgn}
-              className="flex items-center gap-2 text-sm text-gray-300 hover:text-white cursor-pointer"
-            >
-              <input
-                type="checkbox"
-                checked={(draft.pgnFilter || []).includes(pgn)}
-                onChange={() => togglePGN(pgn)}
-                className="accent-n2k-accent"
-              />
-              <span className="font-mono text-gray-500">{pgn}</span>
-              <span>{PGN_NAMES[pgn] || 'Unknown'}</span>
-            </label>
-          ))}
         </div>
       </section>
 

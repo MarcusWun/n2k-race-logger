@@ -105,17 +105,18 @@ describe('PGN filtering', () => {
     expect(result!.pgn).toBe(127250);
   });
 
-  it('filters out PGNs not in the allowed list', () => {
+  it('passes through PGNs not in the default filter list', () => {
     const parsed = makeParsedPGN(129029, { latitude: 42.0, longitude: -71.0 });
     const result = parser.filter(parsed);
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result!.pgn).toBe(129029);
   });
 
-  it('allows updating the filter list', () => {
+  it('passes through all PGNs regardless of filter updates', () => {
     const parsed = makeParsedPGN(129029, { latitude: 42.0 });
-    expect(parser.filter(parsed)).toBeNull();
+    expect(parser.filter(parsed)).not.toBeNull();
 
-    parser.setPGNFilter([129029]);
+    parser.setPGNFilter([128259]);
     expect(parser.filter(parsed)).not.toBeNull();
   });
 

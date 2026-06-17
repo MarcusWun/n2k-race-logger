@@ -46,9 +46,6 @@ export class N2KParser extends EventEmitter {
    * Returns a PGNMessage if the PGN is in the filter, or null if filtered out.
    */
   filter(parsed: ParsedPGN): PGNMessage | null {
-    if (!this.pgnFilter.includes(parsed.pgn)) {
-      return null;
-    }
     return {
       pgn: parsed.pgn,
       src: parsed.src,

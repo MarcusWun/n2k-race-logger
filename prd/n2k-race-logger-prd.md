@@ -44,7 +44,7 @@ No authentication. No multi-user. Everything is local.
 
 ### 4.1 Connection Manager
 
-Dual-mode connection to NMEA 2000 gateways: serial (Actisense NGT-1) or Wi-Fi (W2K/TCP).
+Dual-mode connection to NMEA 2000 gateways: serial (Actisense NGT-1) or TCP (network gateway).
 
 **Serial mode (default):**
 - Auto-detect available COM ports via `SerialPort.list()`
@@ -67,17 +67,17 @@ Dual-mode connection to NMEA 2000 gateways: serial (Actisense NGT-1) or Wi-Fi (W
 - **Baud rate auto-detection (optional):** Default 115200 is correct for NGT-1 firmware v2.680+. If no data is received within 5 seconds of init, retry at 230400 (used by some firmware versions between v2.660-v2.670). Persist working baud rate in settings.
 - Graceful handling of Windows UAC prompts for first-run COM access
 
-**Wi-Fi / TCP mode:**
-- Connect to a W2K or compatible Wi-Fi NMEA 2000 gateway via TCP socket
+**TCP mode:**
+- Connect to a compatible NMEA 2000 gateway (e.g., Yacht Devices, iKommunicate) via TCP socket
 - User configures IP address and port in settings (default: 192.168.1.1:2000)
 - TCP data piped through the same `FromPgn` transform stream as serial (handles both Actisense binary and text formats)
 - Reconnect on disconnect with configurable retry (default: 5 seconds, max 3 attempts)
 - Remember last-used IP/port
 
 **Connection UI:**
-- Mode selector: Serial / Wi-Fi toggle
+- Mode selector: Serial / TCP toggle
 - Serial mode: dropdown of detected COM ports with refresh button, baud rate selector (default 115,200)
-- Wi-Fi mode: IP address input, port input
+- TCP mode: IP address input, port input
 - Connect / Disconnect button with status indicator (disconnected / connecting / connected / error)
 - Connection status persists visually in the header area at all times
 
@@ -175,7 +175,7 @@ Wind PGNs from src=22 and src=8 are dropped before reaching the dashboard or rec
 - Recomputed whenever apparent wind or heading updates
 - Falls back to SOG if STW is unavailable
 
-**Dampening / smoothing:** All measured values (AWS, AWA, STW, SOG, heading, COG) are smoothed with a time-based exponential moving average (EMA, τ=1000ms) to reduce display jitter. Circular angle handling prevents artifacts at 0°/360° wrap-around. Computed values (TWS, TWA, TWD) are derived from smoothed inputs and not double-smoothed. GPS lat/lon are not smoothed.
+**Dampening / smoothing:** All measured and computed wind values (AWS, AWA, STW, SOG, heading, COG, TWS, TWD) are smoothed with a time-based exponential moving average (EMA, τ=1000ms) to reduce display jitter. Circular angle handling prevents artifacts at 0°/360° wrap-around. TWA is not smoothed (it feeds polar performance calculation and should reflect instantaneous angle). GPS lat/lon are not smoothed.
 
 **Dashboard layout:**
 - Large numeric tiles for primary metrics (STW, SOG, TWS, TWA, heading)
@@ -213,9 +213,9 @@ Persistent settings stored in a local `settings.json` file:
 | Data directory | `~/n2k-race-logger/races/` | Where race .db files are stored |
 | Polar directory | `~/n2k-race-logger/polars/` | Where imported polar files are stored |
 | Active polar profile | (none) | Currently selected boat polar for % of polar calculation |
-| Wi-Fi IP | `192.168.1.1` | W2K gateway IP address |
-| Wi-Fi port | `2000` | W2K gateway TCP port |
-| Connection mode | `serial` | Last-used mode: `serial` or `wifi` |
+| TCP IP | `192.168.1.1` | Network gateway IP address |
+| TCP port | `2000` | Network gateway TCP port |
+| Connection mode | `serial` | Last-used mode: `serial` or `tcp` |
 
 Settings UI: a simple settings page/modal accessible from the main navigation.
 
@@ -533,7 +533,7 @@ All resolved — see §17.
 
 ## 17. CTO Design Decisions (User-Approved)
 
-1. **Phase 1 scope: connect + monitor + record + polars + Wi-Fi + debug** — polars, Wi-Fi, and debug pulled into Phase 1 per user request.
+1. **Phase 1 scope: connect + monitor + record + polars + TCP + debug** — polars, TCP (network gateway), and debug pulled into Phase 1 per user request.
 2. **Serial defaults: COM3 at 115,200 baud** — per user specification.
 3. **Dark theme by default** — cockpit-appropriate, low glare. No light mode toggle in v1.
 4. **One SQLite file per race** — self-contained, portable.
@@ -546,8 +546,10 @@ All resolved — see §17.
 11. **Keepalive every 20 seconds** — prevents the NGT-1 from reverting to its default PGN filter. Same startup command re-sent on interval. Added 2026-06-12.
 12. **ActisenseStream for BST decoding** — `FromPgn` is an EventEmitter (not a Node.js stream), so serial data cannot be piped to it directly. `ActisenseStream` (from canboatjs) is a proper Transform stream that decodes BST framing; decoded frames are then fed to `FromPgn.parseBuffer()`. The stream is created with `{ fromFile: true, reconnect: false, app: new EventEmitter() }` to use it as a standalone decoder without its own serial port management. `outAvailable` is set to `true` to prevent it from attempting transmit PGN configuration on the null serial port. Added 2026-06-14.
 13. **Unit conversions at PGN ingestion** — canboatjs outputs NMEA 2000 native units (m/s for speeds, radians for angles). Conversions to knots (×1.94384) and degrees (×180/π) are applied in the Dashboard PGN handler before storing in Zustand. GPS coordinates are already in degrees. Added 2026-06-14.
-14. **EMA dampening (τ=1000ms)** — time-based exponential moving average applied to measured values (AWS, AWA, STW, SOG, heading, COG) in the Zustand store. Uses `alpha = 1 - e^(-dt/τ)` for rate-independent smoothing. Circular angle handling prevents artifacts at 0°/360° wrap. GPS and computed values are not smoothed. Added 2026-06-14.
+14. **EMA dampening (τ=1000ms)** — time-based exponential moving average applied to measured and computed wind values (AWS, AWA, STW, SOG, heading, COG, TWS, TWD) in the Zustand store. Uses `alpha = 1 - e^(-dt/τ)` for rate-independent smoothing. Circular angle handling prevents artifacts at 0°/360° wrap. TWA is not smoothed (feeds polar performance). GPS lat/lon not smoothed. Updated 2026-06-16.
 15. **True wind computed client-side** — TWS, TWA, and TWD are computed from apparent wind + STW (or SOG) + heading using standard vector decomposition, since Marcus's B&G system does not send true wind PGNs on the N2K bus. TWD is recomputed whenever heading updates. Added 2026-06-14.
 16. **Wind reference filtering** — PGN 130306 `reference` field must be explicitly matched: only `"Apparent"` routes to AWS/AWA; `"True (boat/water referenced)"` routes to TWS/TWA; `"Magnetic"` and `"True (ground referenced)"` route to TWS/TWD. Marcus's B&G system sends both Apparent and Magnetic references simultaneously — treating all non-true as apparent caused AWA/AWS to jump between correct values and the magnetic wind direction. The canboatjs field name is `reference` (not `windReference`). Added 2026-06-14.
 17. **Magnetic degree indicator (°M)** — COG, TWD, and Heading display with °M suffix to distinguish magnetic from true bearings. Added 2026-06-14.
 18. **Wind source filtering (src=22, src=8 dropped)** — Marcus's N2K bus has three devices sending PGN 130306. src=22 transmits constant bogus Apparent wind (0.25 m/s at exactly 180°), causing AWS/AWA to jump between correct and incorrect values. src=8 sends incomplete messages with no speed or angle data. Both are dropped at the serial event handler level in `ipc-handlers.ts` before any downstream processing. Only src=16 (the real B&G wind instrument) is accepted. Added 2026-06-15.
+19. **WiFi → TCP rename** — The "Wi-Fi" label in the connection UI was renamed to "TCP" because WiFi implies wireless router connectivity, which is misleading. The feature is a raw TCP socket connection to a network N2K gateway (e.g., Yacht Devices, iKommunicate). Internal mode type changed from `'wifi'` to `'tcp'`. Added 2026-06-16.
+20. **TWS and TWD dampening** — TWS and TWD added to EMA dampening alongside measured values. Raw computed values were too jittery for useful display. TWA excluded from dampening because it feeds polar performance calculation and should reflect instantaneous angle. Added 2026-06-16.

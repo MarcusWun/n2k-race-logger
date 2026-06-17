@@ -72,7 +72,7 @@ export interface SerialSettings {
   baud: number;
 }
 
-export type ConnectionMode = 'serial' | 'wifi';
+export type ConnectionMode = 'serial' | 'tcp';
 
 export interface ConnectionStatusEvent {
   mode: ConnectionMode;
@@ -109,7 +109,7 @@ export class SerialManager extends EventEmitter {
     port: 'COM3',
     baud: 115200,
   };
-  private wifiSettings = {
+  private tcpSettings = {
     host: '192.168.1.1',
     tcpPort: 2000,
   };
@@ -135,8 +135,8 @@ export class SerialManager extends EventEmitter {
         const parsed = JSON.parse(raw);
         if (parsed.port) this.settings.port = parsed.port;
         if (parsed.baud) this.settings.baud = parsed.baud;
-        if (parsed.wifiHost) this.wifiSettings.host = parsed.wifiHost;
-        if (parsed.wifiPort) this.wifiSettings.tcpPort = parsed.wifiPort;
+        if (parsed.tcpHost) this.tcpSettings.host = parsed.tcpHost;
+        if (parsed.tcpPort) this.tcpSettings.tcpPort = parsed.tcpPort;
       }
     } catch {
       // If loading fails, use defaults
@@ -154,8 +154,8 @@ export class SerialManager extends EventEmitter {
         JSON.stringify({
           port: this.settings.port,
           baud: this.settings.baud,
-          wifiHost: this.wifiSettings.host,
-          wifiPort: this.wifiSettings.tcpPort,
+          tcpHost: this.tcpSettings.host,
+          tcpPort: this.tcpSettings.tcpPort,
         }, null, 2),
         'utf-8',
       );
@@ -168,8 +168,8 @@ export class SerialManager extends EventEmitter {
     return { ...this.settings };
   }
 
-  getWifiSettings(): { host: string; tcpPort: number } {
-    return { ...this.wifiSettings };
+  getTcpSettings(): { host: string; tcpPort: number } {
+    return { ...this.tcpSettings };
   }
 
   isAvailable(): boolean {
@@ -241,7 +241,7 @@ export class SerialManager extends EventEmitter {
     const mode = options?.mode || 'serial';
     await this.disconnect();
 
-    if (mode === 'wifi') {
+    if (mode === 'tcp') {
       return this.connectTcp(options?.host, options?.tcpPort);
     }
     return this.connectSerial(options);
@@ -395,18 +395,18 @@ export class SerialManager extends EventEmitter {
   }
 
   private connectTcp(host?: string, tcpPort?: number): Promise<void> {
-    this.activeMode = 'wifi';
-    const h = host || this.wifiSettings.host;
-    const p = tcpPort || this.wifiSettings.tcpPort;
+    this.activeMode = 'tcp';
+    const h = host || this.tcpSettings.host;
+    const p = tcpPort || this.tcpSettings.tcpPort;
 
-    this.emit('status', { mode: 'wifi', host: h, tcpPort: p, status: 'connecting' });
+    this.emit('status', { mode: 'tcp', host: h, tcpPort: p, status: 'connecting' });
 
     return new Promise<void>((resolve, reject) => {
       this.tcpSocket = new net.Socket();
 
       const onError = (err: Error) => {
         this.emit('status', {
-          mode: 'wifi',
+          mode: 'tcp',
           host: h,
           tcpPort: p,
           status: 'error',
@@ -430,7 +430,7 @@ export class SerialManager extends EventEmitter {
         this.tcpSocket!.on('error', (err: Error) => {
           console.error('[SerialManager] TCP error:', err.message);
           this.emit('status', {
-            mode: 'wifi',
+            mode: 'tcp',
             host: h,
             tcpPort: p,
             status: 'error',
@@ -441,7 +441,7 @@ export class SerialManager extends EventEmitter {
 
         this.tcpSocket!.on('close', () => {
           this.emit('status', {
-            mode: 'wifi',
+            mode: 'tcp',
             host: h,
             tcpPort: p,
             status: 'disconnected',
@@ -449,11 +449,11 @@ export class SerialManager extends EventEmitter {
           this.cleanupTcp();
         });
 
-        this.wifiSettings.host = h;
-        this.wifiSettings.tcpPort = p;
+        this.tcpSettings.host = h;
+        this.tcpSettings.tcpPort = p;
         this.saveSettings();
 
-        this.emit('status', { mode: 'wifi', host: h, tcpPort: p, status: 'connected' });
+        this.emit('status', { mode: 'tcp', host: h, tcpPort: p, status: 'connected' });
         resolve();
       });
     });
@@ -499,8 +499,8 @@ export class SerialManager extends EventEmitter {
       mode: this.activeMode,
       port: this.settings.port,
       baud: this.settings.baud,
-      host: this.wifiSettings.host,
-      tcpPort: this.wifiSettings.tcpPort,
+      host: this.tcpSettings.host,
+      tcpPort: this.tcpSettings.tcpPort,
       status: 'disconnected',
     });
   }
@@ -510,8 +510,8 @@ export class SerialManager extends EventEmitter {
       mode: this.activeMode,
       port: this.settings.port,
       baud: this.settings.baud,
-      host: this.wifiSettings.host,
-      tcpPort: this.wifiSettings.tcpPort,
+      host: this.tcpSettings.host,
+      tcpPort: this.tcpSettings.tcpPort,
       status: this.isConnected() ? 'connected' : 'disconnected',
     };
   }

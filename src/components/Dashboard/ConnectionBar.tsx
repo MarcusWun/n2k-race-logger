@@ -2,15 +2,15 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { getIPC } from '../../ipc';
 import type { ConnectionStatus, SerialPortInfo } from '../../types/ipc';
 
-type ConnectionMode = 'serial' | 'wifi';
+type ConnectionMode = 'serial' | 'tcp';
 
 export default function ConnectionBar() {
   const [mode, setMode] = useState<ConnectionMode>('serial');
   const [ports, setPorts] = useState<SerialPortInfo[]>([]);
   const [selectedPort, setSelectedPort] = useState('COM3');
   const [baudRate, setBaudRate] = useState(115200);
-  const [wifiHost, setWifiHost] = useState('192.168.1.1');
-  const [wifiPort, setWifiPort] = useState(2000);
+  const [tcpHost, setTcpHost] = useState('192.168.1.1');
+  const [tcpPort, setTcpPort] = useState(2000);
   const [status, setStatus] = useState<ConnectionStatus>({
     port: 'COM3',
     baud: 115200,
@@ -29,11 +29,11 @@ export default function ConnectionBar() {
     const ipc = getIPC();
     if (!ipc) return;
 
-    // Load saved settings for mode/wifi
+    // Load saved settings for mode/tcp
     ipc.getSettings().then((s: any) => {
       if (s?.connectionMode) setMode(s.connectionMode);
-      if (s?.wifiHost) setWifiHost(s.wifiHost);
-      if (s?.wifiPort) setWifiPort(s.wifiPort);
+      if (s?.tcpHost) setTcpHost(s.tcpHost);
+      if (s?.tcpPort) setTcpPort(s.tcpPort);
       if (s?.serialPort) setSelectedPort(s.serialPort);
       if (s?.serialBaud) setBaudRate(s.serialBaud);
     });
@@ -53,7 +53,7 @@ export default function ConnectionBar() {
       await ipc.connect(
         mode === 'serial'
           ? { mode: 'serial', port: selectedPort, baud: baudRate }
-          : { mode: 'wifi', host: wifiHost, tcpPort: wifiPort },
+          : { mode: 'tcp', host: tcpHost, tcpPort: tcpPort },
       );
     }
   };
@@ -91,13 +91,13 @@ export default function ConnectionBar() {
           Serial
         </button>
         <button
-          onClick={() => setMode('wifi')}
+          onClick={() => setMode('tcp')}
           disabled={isConnected}
           className={`px-3 py-1 text-xs font-medium ${
-            mode === 'wifi' ? 'bg-n2k-accent text-black' : 'bg-n2k-bg text-gray-400'
+            mode === 'tcp' ? 'bg-n2k-accent text-black' : 'bg-n2k-bg text-gray-400'
           }`}
         >
-          Wi-Fi
+          TCP
         </button>
       </div>
 
@@ -141,8 +141,8 @@ export default function ConnectionBar() {
         <>
           <input
             type="text"
-            value={wifiHost}
-            onChange={(e) => setWifiHost(e.target.value)}
+            value={tcpHost}
+            onChange={(e) => setTcpHost(e.target.value)}
             disabled={isConnected}
             placeholder="IP address"
             className="bg-n2k-bg border border-gray-700 rounded px-2 py-1 text-sm text-white w-32"
@@ -150,8 +150,8 @@ export default function ConnectionBar() {
           <span className="text-gray-500 text-sm">:</span>
           <input
             type="number"
-            value={wifiPort}
-            onChange={(e) => setWifiPort(Number(e.target.value))}
+            value={tcpPort}
+            onChange={(e) => setTcpPort(Number(e.target.value))}
             disabled={isConnected}
             placeholder="Port"
             className="bg-n2k-bg border border-gray-700 rounded px-2 py-1 text-sm text-white w-20"

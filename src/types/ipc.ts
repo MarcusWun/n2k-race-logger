@@ -1,5 +1,5 @@
 export interface ConnectionStatus {
-  mode?: 'serial' | 'wifi';
+  mode?: 'serial' | 'tcp';
   port?: string;
   baud?: number;
   host?: string;

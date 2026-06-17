@@ -24,8 +24,8 @@ interface N2KStore extends MetricState {
 // Time constant for EMA dampening (milliseconds)
 const DAMPING_TAU_MS = 1000;
 
-// Metrics that get EMA smoothing (not GPS, not computed TWS/TWA/TWD)
-const DAMPED_KEYS = new Set(['stw', 'sog', 'aws', 'awa', 'heading', 'cog']);
+// Metrics that get EMA smoothing (TWA excluded — feeds polar performance)
+const DAMPED_KEYS = new Set(['stw', 'sog', 'aws', 'awa', 'heading', 'cog', 'tws', 'twd']);
 
 // Metrics that wrap around 0-360
 const ANGLE_KEYS = new Set(['awa', 'cog', 'heading', 'twa', 'twd']);

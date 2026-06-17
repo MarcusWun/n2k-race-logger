@@ -39,6 +39,19 @@ const api = {
   getSources: () => ipcRenderer.invoke('sources:get'),
   rescanSources: () => ipcRenderer.invoke('sources:rescan'),
 
+  // Phase 2: Races & Analysis
+  listRaces: () => ipcRenderer.invoke('races:list'),
+  openRace: (payload: { filePath: string }) => ipcRenderer.invoke('races:open', payload),
+  deleteRace: (payload: { filePath: string }) => ipcRenderer.invoke('races:delete', payload),
+  getAnalysisData: () => ipcRenderer.invoke('analysis:data'),
+  detectSegments: (payload: { thresholds: any }) => ipcRenderer.invoke('analysis:detect-segments', payload),
+  getSegments: () => ipcRenderer.invoke('analysis:segments'),
+  excludeSegment: (payload: { segmentId: number; excluded: boolean }) => ipcRenderer.invoke('analysis:exclude-segment', payload),
+  saveSailTags: (payload: { raceId: number; tags: Array<{ config: string; start: string; end: string }> }) =>
+    ipcRenderer.invoke('analysis:sail-tags', payload),
+  getSailTags: (payload: { raceId: number }) => ipcRenderer.invoke('analysis:get-sail-tags', payload),
+  getPerformanceSummary: () => ipcRenderer.invoke('analysis:performance-summary'),
+
   // Event listeners
   on: (channel: string, callback: (...args: any[]) => void) => {
     const validChannels = [
@@ -50,6 +63,9 @@ const api = {
       'polar:data',
       'polar:performance',
       'sources:discovered',
+      'analysis:data',
+      'analysis:segments',
+      'races:files',
     ];
     if (validChannels.includes(channel)) {
       const listener = (_event: any, ...args: any[]) => callback(...args);

@@ -258,6 +258,118 @@ export class RaceDatabase {
   getFilePath(): string {
     return (this.db as any).name;
   }
+
+  // --- Phase 2: Analysis Tables ---
+
+  /**
+   * Ensure Phase 2 tables exist (migration-style: create if not present).
+   */
+  ensureAnalysisTables(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS sail_tags (
+        id INTEGER PRIMARY KEY,
+        race_id INTEGER NOT NULL REFERENCES race_meta(id),
+        sail_config TEXT NOT NULL,
+        start_time TEXT NOT NULL,
+        end_time TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_sail_tags_race_time ON sail_tags(race_id, start_time);
+
+      CREATE TABLE IF NOT EXISTS detected_segments (
+        id INTEGER PRIMARY KEY,
+        race_id INTEGER NOT NULL REFERENCES race_meta(id),
+        start_time TEXT NOT NULL,
+        end_time TEXT NOT NULL,
+        duration_s REAL NOT NULL,
+        mean_tws REAL NOT NULL,
+        mean_twa REAL NOT NULL,
+        mean_stw REAL NOT NULL,
+        std_tws REAL NOT NULL,
+        std_twa REAL NOT NULL,
+        std_stw REAL NOT NULL,
+        percent_polar REAL,
+        sail_config TEXT,
+        excluded INTEGER NOT NULL DEFAULT 0,
+        thresholds TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_segments_race ON detected_segments(race_id);
+    `);
+  }
+
+  /**
+   * Save detected segments (replaces all existing for the race).
+   */
+  saveSegments(raceId: number, segments: Array<{
+    startTime: string; endTime: string; durationS: number;
+    meanTws: number; meanTwa: number; meanStw: number;
+    stdTws: number; stdTwa: number; stdStw: number;
+    percentPolar: number | null; sailConfig: string | null;
+    thresholds: string;
+  }>): void {
+    this.db.prepare('DELETE FROM detected_segments WHERE race_id = ?').run(raceId);
+    const insert = this.db.prepare(`
+      INSERT INTO detected_segments (
+        race_id, start_time, end_time, duration_s,
+        mean_tws, mean_twa, mean_stw,
+        std_tws, std_twa, std_stw,
+        percent_polar, sail_config, excluded, thresholds
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+    `);
+    const txn = this.db.transaction((segs: typeof segments) => {
+      for (const s of segs) {
+        insert.run(
+          raceId, s.startTime, s.endTime, s.durationS,
+          s.meanTws, s.meanTwa, s.meanStw,
+          s.stdTws, s.stdTwa, s.stdStw,
+          s.percentPolar, s.sailConfig, s.thresholds,
+        );
+      }
+    });
+    txn(segments);
+  }
+
+  /**
+   * Get all detected segments for a race.
+   */
+  getSegments(raceId: number): any[] {
+    return this.db.prepare(
+      'SELECT * FROM detected_segments WHERE race_id = ? ORDER BY start_time',
+    ).all(raceId) as any[];
+  }
+
+  /**
+   * Toggle segment exclusion.
+   */
+  setSegmentExcluded(segmentId: number, excluded: boolean): void {
+    this.db.prepare('UPDATE detected_segments SET excluded = ? WHERE id = ?').run(excluded ? 1 : 0, segmentId);
+  }
+
+  /**
+   * Save sail tags (replaces all existing for the race).
+   */
+  saveSailTags(raceId: number, tags: Array<{ sailConfig: string; startTime: string; endTime: string }>): void {
+    this.db.prepare('DELETE FROM sail_tags WHERE race_id = ?').run(raceId);
+    const insert = this.db.prepare(
+      'INSERT INTO sail_tags (race_id, sail_config, start_time, end_time) VALUES (?, ?, ?, ?)',
+    );
+    const txn = this.db.transaction((ts: typeof tags) => {
+      for (const t of ts) {
+        insert.run(raceId, t.sailConfig, t.startTime, t.endTime);
+      }
+    });
+    txn(tags);
+  }
+
+  /**
+   * Get sail tags for a race.
+   */
+  getSailTags(raceId: number): any[] {
+    return this.db.prepare(
+      'SELECT * FROM sail_tags WHERE race_id = ? ORDER BY start_time',
+    ).all(raceId) as any[];
+  }
 }
 
 /**

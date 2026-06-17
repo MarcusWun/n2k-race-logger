@@ -2,12 +2,16 @@ import React, { useState } from 'react';
 import Dashboard from './components/Dashboard/Dashboard';
 import PolarView from './components/PolarView/PolarView';
 import Settings from './components/Settings/Settings';
+import RaceBrowser from './components/Races/RaceBrowser';
+import AnalysisView from './components/Analysis/AnalysisView';
+import { useAnalysisStore } from './store/useAnalysisStore';
 import { getIPC } from './ipc';
 
-type Tab = 'dashboard' | 'polar' | 'settings';
+type Tab = 'dashboard' | 'races' | 'polar' | 'settings';
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'dashboard', label: 'Dashboard' },
+  { id: 'races', label: 'Races' },
   { id: 'polar', label: 'Polar' },
   { id: 'settings', label: 'Settings' },
 ];
@@ -43,6 +47,24 @@ function WindowControls() {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('dashboard');
+  const [analysisOpen, setAnalysisOpen] = useState(false);
+  const setLoadedRace = useAnalysisStore((s) => s.setLoadedRace);
+  const clearLoadedRace = useAnalysisStore((s) => s.clearLoadedRace);
+
+  const handleOpenRace = async (filePath: string) => {
+    const ipc = getIPC();
+    if (!ipc) return;
+    const result = await ipc.openRace({ filePath });
+    if (result?.success) {
+      setLoadedRace(filePath, result.raceMeta, result.metrics, result.timeRange);
+      setAnalysisOpen(true);
+    }
+  };
+
+  const handleBackFromAnalysis = () => {
+    setAnalysisOpen(false);
+    clearLoadedRace();
+  };
 
   return (
     <div className="h-screen bg-n2k-bg text-white flex flex-col">
@@ -53,9 +75,9 @@ export default function App() {
           {TABS.map((tab) => (
             <button
               key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => { setActiveTab(tab.id); setAnalysisOpen(false); }}
               className={`px-4 py-2 text-sm font-medium rounded-t transition-colors ${
-                activeTab === tab.id
+                activeTab === tab.id && !analysisOpen
                   ? 'bg-n2k-bg text-white'
                   : 'text-gray-500 hover:text-gray-300'
               }`}
@@ -63,15 +85,27 @@ export default function App() {
               {tab.label}
             </button>
           ))}
+          {analysisOpen && (
+            <span className="px-4 py-2 text-sm font-medium bg-n2k-bg text-n2k-accent rounded-t">
+              Analysis
+            </span>
+          )}
         </nav>
         <WindowControls />
       </header>
 
       {/* Content */}
       <main className="flex-1 p-4 overflow-y-auto">
-        {activeTab === 'dashboard' && <Dashboard />}
-        {activeTab === 'polar' && <PolarView />}
-        {activeTab === 'settings' && <Settings />}
+        {analysisOpen ? (
+          <AnalysisView onBack={handleBackFromAnalysis} />
+        ) : (
+          <>
+            {activeTab === 'dashboard' && <Dashboard />}
+            {activeTab === 'races' && <RaceBrowser onOpenRace={handleOpenRace} />}
+            {activeTab === 'polar' && <PolarView />}
+            {activeTab === 'settings' && <Settings />}
+          </>
+        )}
       </main>
     </div>
   );

@@ -4,6 +4,15 @@ import { N2KParser, PGNMessage } from './n2k-parser';
 import { PolarEngine } from './polar-engine';
 import { RaceDatabase, createRaceDatabase } from './database';
 import { SourceDiscovery } from './source-discovery';
+import {
+  reconstructTimeSeries,
+  resampleToGrid,
+  detectSegments,
+  assignSailTags,
+  computeSegmentPerformance,
+  aggregatePerformance,
+} from './analysis-engine';
+import type { SegmentThresholds, SailTagData } from './analysis-engine';
 import { sendDebugData } from './main';
 import * as path from 'path';
 import * as os from 'os';
@@ -425,6 +434,272 @@ export function registerIPCHandlers(): void {
       getWebContents()?.send('sources:discovered', {});
     }
     return { success: true };
+  });
+
+  // ========== Phase 2: Analysis IPC Handlers ==========
+
+  let analysisDb: RaceDatabase | null = null;
+  let analysisRaceId: number | null = null;
+  let analysisTimeSeries: ReturnType<typeof reconstructTimeSeries> | null = null;
+
+  // --- races:list ---
+  ipcMain.handle('races:list', async () => {
+    const settings = loadAppSettings();
+    const dataDir = settings.dataDirectory || path.join(os.homedir(), 'n2k-race-logger', 'races');
+    if (!fs.existsSync(dataDir)) return [];
+
+    const files = fs.readdirSync(dataDir).filter((f) => f.endsWith('.db'));
+    const result: any[] = [];
+
+    for (const file of files) {
+      const fullPath = path.join(dataDir, file);
+      try {
+        const stat = fs.statSync(fullPath);
+        // Open the db briefly to read metadata
+        const tempDb = new RaceDatabase(fullPath, dataDir);
+        const races = tempDb.getAllRaces();
+        const race = races[0]; // Each file has one race
+        tempDb.close();
+
+        result.push({
+          path: fullPath,
+          label: race?.label || null,
+          date: race?.created_at || stat.mtime.toISOString(),
+          duration: race?.start_time && race?.end_time
+            ? (new Date(race.end_time).getTime() - new Date(race.start_time).getTime()) / 1000
+            : 0,
+          points: race?.total_points || 0,
+          size: stat.size,
+        });
+      } catch {
+        // Skip files that can't be read
+      }
+    }
+
+    // Sort newest first
+    result.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    return result;
+  });
+
+  // --- races:open ---
+  ipcMain.handle('races:open', async (_event, payload: { filePath: string }) => {
+    try {
+      if (analysisDb) {
+        analysisDb.close();
+        analysisDb = null;
+      }
+      analysisTimeSeries = null;
+
+      const settings = loadAppSettings();
+      const dataDir = settings.dataDirectory || path.join(os.homedir(), 'n2k-race-logger', 'races');
+      analysisDb = new RaceDatabase(payload.filePath, dataDir);
+      analysisDb.ensureAnalysisTables();
+
+      const races = analysisDb.getAllRaces();
+      const race = races[0];
+      if (!race) {
+        return { success: false, error: 'No race metadata found in file' };
+      }
+      analysisRaceId = race.id;
+
+      // Reconstruct time series
+      const rows = analysisDb.getRacePoints(race.id);
+      const rawRows = rows.map((r: any) => ({
+        timestamp: r.timestamp,
+        pgn: r.pgn,
+        data: r.data,
+      }));
+      const ts = reconstructTimeSeries(rawRows);
+
+      // Determine time range and resample
+      const allTimes = ts.tws
+        .filter((p) => p.value != null)
+        .map((p) => p.time);
+      if (allTimes.length === 0) {
+        analysisTimeSeries = ts;
+        return {
+          success: true,
+          metrics: ts,
+          timeRange: { start: 0, end: 0 },
+          raceMeta: race,
+        };
+      }
+
+      const startMs = Math.min(...allTimes);
+      const endMs = Math.max(...allTimes);
+
+      // Resample each metric
+      const resampled = {
+        tws: resampleToGrid(ts.tws, startMs, endMs),
+        twa: resampleToGrid(ts.twa, startMs, endMs),
+        twd: resampleToGrid(ts.twd, startMs, endMs),
+        stw: resampleToGrid(ts.stw, startMs, endMs),
+        aws: resampleToGrid(ts.aws, startMs, endMs),
+        awa: resampleToGrid(ts.awa, startMs, endMs),
+        heading: resampleToGrid(ts.heading, startMs, endMs),
+        sog: resampleToGrid(ts.sog, startMs, endMs),
+        cog: resampleToGrid(ts.cog, startMs, endMs),
+      };
+
+      analysisTimeSeries = resampled;
+
+      return {
+        success: true,
+        metrics: resampled,
+        timeRange: { start: startMs, end: endMs },
+        raceMeta: race,
+      };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to open race file' };
+    }
+  });
+
+  // --- races:delete ---
+  ipcMain.handle('races:delete', async (_event, payload: { filePath: string }) => {
+    try {
+      // Close if it's the currently loaded analysis file
+      if (analysisDb && analysisDb.getFilePath() === payload.filePath) {
+        analysisDb.close();
+        analysisDb = null;
+        analysisTimeSeries = null;
+        analysisRaceId = null;
+      }
+      if (fs.existsSync(payload.filePath)) {
+        fs.unlinkSync(payload.filePath);
+        // Also remove WAL/SHM files if they exist
+        const walPath = payload.filePath + '-wal';
+        const shmPath = payload.filePath + '-shm';
+        if (fs.existsSync(walPath)) fs.unlinkSync(walPath);
+        if (fs.existsSync(shmPath)) fs.unlinkSync(shmPath);
+      }
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message };
+    }
+  });
+
+  // --- analysis:detect-segments ---
+  ipcMain.handle('analysis:detect-segments', async (_event, payload: { thresholds: SegmentThresholds }) => {
+    if (!analysisDb || !analysisTimeSeries || analysisRaceId == null) {
+      return { success: false, error: 'No race loaded for analysis' };
+    }
+
+    const thresholds = payload.thresholds;
+    const segments = detectSegments(
+      analysisTimeSeries.tws,
+      analysisTimeSeries.twa,
+      analysisTimeSeries.stw,
+      thresholds,
+    );
+
+    // Assign sail tags from DB
+    const sailTagRows = analysisDb.getSailTags(analysisRaceId);
+    const sailTags: SailTagData[] = sailTagRows.map((r: any) => ({
+      sailConfig: r.sail_config,
+      startTime: new Date(r.start_time).getTime(),
+      endTime: new Date(r.end_time).getTime(),
+    }));
+
+    let withSails = assignSailTags(segments, sailTags);
+
+    // Compute % of polar
+    const profiles = polarEngine!.listProfiles();
+    const settings = loadAppSettings();
+    const activeProfile = settings.activePolarProfile
+      ? polarEngine!.getProfile(settings.activePolarProfile)
+      : profiles[0];
+    const polarTable = activeProfile?.polarData || null;
+    withSails = computeSegmentPerformance(withSails, polarTable);
+
+    // Save to DB
+    const thresholdsJson = JSON.stringify(thresholds);
+    analysisDb.saveSegments(
+      analysisRaceId,
+      withSails.map((s) => ({
+        startTime: new Date(s.startTime).toISOString(),
+        endTime: new Date(s.endTime).toISOString(),
+        durationS: s.durationS,
+        meanTws: s.meanTws,
+        meanTwa: s.meanTwa,
+        meanStw: s.meanStw,
+        stdTws: s.stdTws,
+        stdTwa: s.stdTwa,
+        stdStw: s.stdStw,
+        percentPolar: s.percentPolar,
+        sailConfig: s.sailConfig,
+        thresholds: thresholdsJson,
+      })),
+    );
+
+    // Return segments from DB (with IDs)
+    const saved = analysisDb.getSegments(analysisRaceId);
+    return { success: true, segments: saved };
+  });
+
+  // --- analysis:segments (get current) ---
+  ipcMain.handle('analysis:segments', async () => {
+    if (!analysisDb || analysisRaceId == null) {
+      return { success: false, segments: [] };
+    }
+    const segments = analysisDb.getSegments(analysisRaceId);
+    return { success: true, segments };
+  });
+
+  // --- analysis:exclude-segment ---
+  ipcMain.handle('analysis:exclude-segment', async (_event, payload: { segmentId: number; excluded: boolean }) => {
+    if (!analysisDb) return { success: false };
+    analysisDb.setSegmentExcluded(payload.segmentId, payload.excluded);
+    return { success: true };
+  });
+
+  // --- analysis:sail-tags (save) ---
+  ipcMain.handle('analysis:sail-tags', async (_event, payload: { raceId: number; tags: Array<{ config: string; start: string; end: string }> }) => {
+    if (!analysisDb) return { success: false };
+    analysisDb.saveSailTags(
+      payload.raceId,
+      payload.tags.map((t) => ({
+        sailConfig: t.config,
+        startTime: t.start,
+        endTime: t.end,
+      })),
+    );
+    return { success: true };
+  });
+
+  // --- analysis:get-sail-tags ---
+  ipcMain.handle('analysis:get-sail-tags', async (_event, payload: { raceId: number }) => {
+    if (!analysisDb) return { success: false, tags: [] };
+    const tags = analysisDb.getSailTags(payload.raceId);
+    return { success: true, tags };
+  });
+
+  // --- analysis:data (get reconstructed time series) ---
+  ipcMain.handle('analysis:data', async () => {
+    if (!analysisTimeSeries) return { success: false };
+    return { success: true, metrics: analysisTimeSeries };
+  });
+
+  // --- analysis:performance-summary ---
+  ipcMain.handle('analysis:performance-summary', async () => {
+    if (!analysisDb || analysisRaceId == null) return { success: false, rows: [] };
+    const segments = analysisDb.getSegments(analysisRaceId);
+    const nonExcluded = segments
+      .filter((s: any) => !s.excluded)
+      .map((s: any) => ({
+        startTime: new Date(s.start_time).getTime(),
+        endTime: new Date(s.end_time).getTime(),
+        durationS: s.duration_s,
+        meanTws: s.mean_tws,
+        meanTwa: s.mean_twa,
+        meanStw: s.mean_stw,
+        stdTws: s.std_tws,
+        stdTwa: s.std_twa,
+        stdStw: s.std_stw,
+        percentPolar: s.percent_polar,
+        sailConfig: s.sail_config,
+      }));
+    const rows = aggregatePerformance(nonExcluded);
+    return { success: true, rows };
   });
 
   console.log('[IPC] All handlers registered.');

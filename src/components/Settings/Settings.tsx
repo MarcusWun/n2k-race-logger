@@ -177,6 +177,48 @@ export default function Settings() {
         </select>
       </section>
 
+      {/* Sail Inventory (Phase 2) */}
+      <section>
+        <h2 className="text-lg font-semibold text-n2k-accent mb-3">Sail Inventory</h2>
+        <div className="flex flex-col gap-2">
+          {((draft as any).sailInventory || DEFAULT_SAIL_INVENTORY).map((sail: any, i: number) => (
+            <div key={sail.id || i} className="flex items-center gap-2">
+              <input
+                type="text"
+                value={sail.label}
+                onChange={(e) => {
+                  const inv = [...((draft as any).sailInventory || DEFAULT_SAIL_INVENTORY)];
+                  inv[i] = { ...inv[i], label: e.target.value };
+                  setDraft({ ...draft, sailInventory: inv } as any);
+                }}
+                className="flex-1 bg-n2k-bg border border-gray-700 rounded px-2 py-1 text-sm text-white"
+              />
+              <button
+                onClick={() => {
+                  const inv = [...((draft as any).sailInventory || DEFAULT_SAIL_INVENTORY)];
+                  inv.splice(i, 1);
+                  setDraft({ ...draft, sailInventory: inv } as any);
+                }}
+                className="px-2 py-1 rounded text-xs bg-red-900/50 hover:bg-red-700 text-red-300"
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+          <button
+            onClick={() => {
+              const inv = [...((draft as any).sailInventory || DEFAULT_SAIL_INVENTORY)];
+              const id = `sail-${Date.now()}`;
+              inv.push({ id, label: 'New Sail' });
+              setDraft({ ...draft, sailInventory: inv } as any);
+            }}
+            className="px-3 py-1.5 rounded text-xs bg-gray-700 hover:bg-gray-600 text-white self-start"
+          >
+            + Add Sail Configuration
+          </button>
+        </div>
+      </section>
+
       {/* Actions */}
       <div className="flex gap-3">
         <button
@@ -195,3 +237,13 @@ export default function Settings() {
     </div>
   );
 }
+
+const DEFAULT_SAIL_INVENTORY = [
+  { id: 'j1-main', label: 'J1 + Main' },
+  { id: 'j2-main', label: 'J2 + Main' },
+  { id: 'j3-main', label: 'J3 + Main' },
+  { id: 'a2-main', label: 'A2 + Main' },
+  { id: 'a3-main', label: 'A3 + Main' },
+  { id: 'j2-reef1', label: 'J2 + Main + 1 reef' },
+  { id: 'j3-reef1', label: 'J3 + Main + 1 reef' },
+];

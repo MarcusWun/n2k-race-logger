@@ -45,7 +45,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('dashboard');
 
   return (
-    <div className="min-h-screen bg-n2k-bg text-white flex flex-col">
+    <div className="h-screen bg-n2k-bg text-white flex flex-col">
       {/* Header / Nav */}
       <header className="flex items-center bg-n2k-surface border-b border-gray-800 px-4 py-0 shrink-0 app-drag">
         <span className="text-sm font-bold text-n2k-accent mr-6 py-2">N2K Race Logger</span>

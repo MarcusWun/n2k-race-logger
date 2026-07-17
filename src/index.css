@@ -2,13 +2,42 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Night mode (default) */
+:root {
+  --n2k-bg: #0a0a0a;
+  --n2k-surface: #1a1a2e;
+  --n2k-accent: #00d4ff;
+  --n2k-success: #00ff88;
+  --n2k-warning: #ffaa00;
+  --n2k-danger: #ff4444;
+}
+
+/* Day mode — applied via html.day class */
+html.day {
+  --n2k-bg: #e8ecf0;
+  --n2k-surface: #ffffff;
+  --n2k-accent: #0060bb;
+  --n2k-success: #1a7a40;
+  --n2k-warning: #b86800;
+  --n2k-danger: #cc2200;
+}
+
+/* In day mode, white text becomes near-black for readability */
+html.day .text-white {
+  color: #111827;
+}
+
 body {
   margin: 0;
   padding: 0;
-  background-color: #0a0a0a;
+  background-color: var(--n2k-bg);
   color: #e0e0e0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   overflow: hidden;
+}
+
+html.day body {
+  color: #111827;
 }
 
 .app-drag {

@@ -1,10 +1,11 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import Dashboard from './components/Dashboard/Dashboard';
 import PolarView from './components/PolarView/PolarView';
 import Settings from './components/Settings/Settings';
 import RaceBrowser from './components/Races/RaceBrowser';
 import AnalysisView from './components/Analysis/AnalysisView';
 import { useAnalysisStore } from './store/useAnalysisStore';
+import { useThemeStore } from './store/useThemeStore';
 import { getIPC } from './ipc';
 
 type Tab = 'dashboard' | 'races' | 'polar' | 'settings';
@@ -50,6 +51,15 @@ export default function App() {
   const [analysisOpen, setAnalysisOpen] = useState(false);
   const setLoadedRace = useAnalysisStore((s) => s.setLoadedRace);
   const clearLoadedRace = useAnalysisStore((s) => s.clearLoadedRace);
+  const { theme, toggleTheme } = useThemeStore();
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.key === 'd') { e.preventDefault(); toggleTheme(); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [toggleTheme]);
 
   const handleOpenRace = async (filePath: string) => {
     const ipc = getIPC();
@@ -91,6 +101,13 @@ export default function App() {
             </span>
           )}
         </nav>
+        <button
+          onClick={toggleTheme}
+          className="app-no-drag ml-4 px-3 py-1 text-xs text-gray-400 hover:text-n2k-accent transition-colors"
+          title={`Switch to ${theme === 'night' ? 'day' : 'night'} mode (Ctrl+D)`}
+        >
+          {theme === 'night' ? '☀ Day' : '☾ Night'}
+        </button>
         <WindowControls />
       </header>
 

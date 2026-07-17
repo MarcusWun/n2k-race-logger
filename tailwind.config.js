@@ -8,12 +8,12 @@ module.exports = {
     extend: {
       colors: {
         n2k: {
-          bg: '#0a0a0a',
-          surface: '#1a1a2e',
-          accent: '#00d4ff',
-          success: '#00ff88',
-          warning: '#ffaa00',
-          danger: '#ff4444',
+          bg: 'var(--n2k-bg)',
+          surface: 'var(--n2k-surface)',
+          accent: 'var(--n2k-accent)',
+          success: 'var(--n2k-success)',
+          warning: 'var(--n2k-warning)',
+          danger: 'var(--n2k-danger)',
         },
       },
     },

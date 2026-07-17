@@ -129,7 +129,7 @@ export default function Dashboard() {
         <InstrumentTile label="STW" metricKey="stw" unit="kts" large />
         <InstrumentTile label="SOG" metricKey="sog" unit="kts" large />
         <InstrumentTile label="TWS" metricKey="tws" unit="kts" large />
-        <InstrumentTile label="TWA" metricKey="twa" unit="°" format={(v) => `${Math.round(v)}°`} large />
+        <InstrumentTile label="TWA" metricKey="twa" unit="°" format={(v) => { const n = v > 180 ? 360 - v : v; const side = v > 180 ? 'P' : 'S'; return `${Math.round(n)}°${side}`; }} large />
         <InstrumentTile label="Heading" metricKey="heading" unit="°M" format={(v) => `${Math.round(v)}°M`} large />
       </div>
 

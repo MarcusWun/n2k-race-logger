@@ -1,6 +1,7 @@
 import React from 'react';
 import { useAnalysisStore } from '../../store/useAnalysisStore';
 import { TWS_BANDS, TWA_BANDS } from '../../types/analysis';
+import { downloadCsv } from '../../utils/download';
 
 function cellColor(percent: number): string {
   if (percent >= 100) return 'bg-green-900/40 text-green-300';
@@ -10,6 +11,36 @@ function cellColor(percent: number): string {
 
 function bandKey(twsBand: [number, number], twaBand: [number, number]): string {
   return `${twsBand[0]}-${twsBand[1]}:${twaBand[0]}-${twaBand[1]}`;
+}
+
+function exportCsv(performanceSummary: import('../../types/analysis').PerformanceSummaryRow[]): void {
+  // Header row
+  const bandHeaders = TWS_BANDS.flatMap(([twsLo, twsHi]) =>
+    TWA_BANDS.map(([twaLo, twaHi]) => `TWS ${twsLo}-${twsHi} / TWA ${twaLo}-${twaHi}°`),
+  );
+  const headers = ['Sail', ...bandHeaders, 'Avg %', 'Segments', 'Coverage'];
+  const rows: string[][] = [headers];
+
+  for (const row of performanceSummary) {
+    const cells = TWS_BANDS.flatMap(([twsLo, twsHi]) =>
+      TWA_BANDS.map(([twaLo, twaHi]) => {
+        const key = `${twsLo}-${twsHi}:${twaLo}-${twaHi}`;
+        const cell = row.cells[key];
+        return cell ? `${cell.avgPercentPolar}%` : '';
+      }),
+    );
+    rows.push([
+      row.sailConfig,
+      ...cells,
+      row.overallAvgPercent > 0 ? `${row.overallAvgPercent}%` : '',
+      String(row.totalSegments),
+      `${row.coverage.filled}/${row.coverage.total}`,
+    ]);
+  }
+
+  const csv = rows.map((r) => r.map((v) => `"${v.replace(/"/g, '""')}"`).join(',')).join('\n');
+  const date = new Date().toISOString().slice(0, 10);
+  downloadCsv(`n2k-performance-summary-${date}.csv`, csv);
 }
 
 export default function PerformanceSummary() {
@@ -24,6 +55,15 @@ export default function PerformanceSummary() {
   }
 
   return (
+    <div>
+      <div className="flex justify-end mb-2">
+        <button
+          onClick={() => exportCsv(performanceSummary)}
+          className="px-3 py-1 rounded text-xs bg-gray-700 hover:bg-gray-600 text-white"
+        >
+          Export CSV
+        </button>
+      </div>
     <div className="overflow-x-auto">
       <table className="w-full text-xs border-collapse">
         <thead>
@@ -83,6 +123,7 @@ export default function PerformanceSummary() {
           ))}
         </tbody>
       </table>
+    </div>
     </div>
   );
 }

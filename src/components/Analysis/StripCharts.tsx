@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { useAnalysisStore } from '../../store/useAnalysisStore';
 import type { TimeSeriesPoint, DetectedSegment, SailTag } from '../../types/analysis';
+import { jsPDF } from 'jspdf';
 
 const METRIC_CONFIGS: { key: string; label: string; unit: string; color: string }[] = [
   { key: 'tws', label: 'TWS', unit: 'kts', color: '#00d4ff' },
@@ -16,6 +17,7 @@ const METRIC_CONFIGS: { key: string; label: string; unit: string; color: string 
 const STRIP_HEIGHT = 80;
 const OVERVIEW_HEIGHT = 40;
 const SAIL_BAR_HEIGHT = 24;
+const RULER_HEIGHT = 28;
 const LEFT_MARGIN = 48;
 const RIGHT_MARGIN = 16;
 const SEGMENT_COLOR = 'rgba(0, 212, 255, 0.15)';
@@ -41,8 +43,10 @@ const SAIL_COLORS = ['#00d4ff', '#00ff88', '#ffaa00', '#ff4444', '#aa66ff', '#ff
 export default function StripCharts({ segments, sailTags, onCursorTime }: StripChartsProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overviewRef = useRef<HTMLCanvasElement>(null);
+  const rulerRef = useRef<HTMLCanvasElement>(null);
   const metrics = useAnalysisStore((s) => s.metrics);
   const timeRange = useAnalysisStore((s) => s.timeRange);
+  const raceMeta = useAnalysisStore((s) => s.raceMeta);
   const viewStart = useAnalysisStore((s) => s.viewStart);
   const viewEnd = useAnalysisStore((s) => s.viewEnd);
   const setViewRange = useAnalysisStore((s) => s.setViewRange);
@@ -61,6 +65,47 @@ export default function StripCharts({ segments, sailTags, onCursorTime }: StripC
       return next;
     });
   };
+
+  const handleExportPdf = useCallback(() => {
+    const mainCanvas = canvasRef.current;
+    const rulerCanvas = rulerRef.current;
+    if (!mainCanvas) return;
+
+    const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+    const pageWidth = doc.internal.pageSize.getWidth();
+
+    const label = raceMeta?.label || 'Unnamed Race';
+    const dateStr = raceMeta?.start_time
+      ? new Date(raceMeta.start_time).toLocaleDateString()
+      : new Date().toLocaleDateString();
+    const title = `N2K Race Logger — Strip Charts — ${label} — ${dateStr}`;
+
+    doc.setFontSize(12);
+    doc.setTextColor(40);
+    doc.text(title, 20, 24);
+
+    let yOffset = 36;
+    const margin = 20;
+    const imgWidth = pageWidth - margin * 2;
+
+    // Main strip charts canvas
+    const mainImg = mainCanvas.toDataURL('image/png');
+    const mainAspect = mainCanvas.height / mainCanvas.width;
+    const mainH = imgWidth * mainAspect;
+    doc.addImage(mainImg, 'PNG', margin, yOffset, imgWidth, mainH);
+    yOffset += mainH + 4;
+
+    // Ruler canvas
+    if (rulerCanvas) {
+      const rulerImg = rulerCanvas.toDataURL('image/png');
+      const rulerAspect = rulerCanvas.height / rulerCanvas.width;
+      const rulerH = Math.max(imgWidth * rulerAspect, 16);
+      doc.addImage(rulerImg, 'PNG', margin, yOffset, imgWidth, rulerH);
+    }
+
+    const filename = `n2k-strip-charts-${new Date().toISOString().slice(0, 10)}.pdf`;
+    doc.save(filename);
+  }, [raceMeta]);
 
   // Main chart rendering
   const draw = useCallback(() => {
@@ -191,22 +236,6 @@ export default function StripCharts({ segments, sailTags, onCursorTime }: StripC
       }
     }
 
-    // Time axis ticks
-    const timeSpan = viewEnd - viewStart;
-    let tickInterval = 60000; // 1 minute
-    if (timeSpan > 3600000) tickInterval = 600000; // 10 min
-    else if (timeSpan > 600000) tickInterval = 120000; // 2 min
-    else if (timeSpan < 60000) tickInterval = 10000; // 10 sec
-
-    const firstTick = Math.ceil(viewStart / tickInterval) * tickInterval;
-    ctx.fillStyle = '#444';
-    ctx.font = '9px sans-serif';
-    ctx.textAlign = 'center';
-    for (let t = firstTick; t <= viewEnd; t += tickInterval) {
-      const x = timeToX(t);
-      ctx.fillText(formatElapsed(t, timeRange.start), x, totalHeight + 12);
-    }
-
     // Cursor line
     if (cursorX != null && cursorX >= LEFT_MARGIN && cursorX <= w - RIGHT_MARGIN) {
       ctx.strokeStyle = '#ffffff40';
@@ -245,6 +274,80 @@ export default function StripCharts({ segments, sailTags, onCursorTime }: StripC
       });
     }
   }, [metrics, timeRange, viewStart, viewEnd, visibleConfigs, segments, sailTags, cursorX, totalHeight]);
+
+  // Elapsed time ruler rendering
+  const drawRuler = useCallback(() => {
+    const canvas = rulerRef.current;
+    if (!canvas || !timeRange || viewStart == null || viewEnd == null) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = RULER_HEIGHT * dpr;
+    ctx.scale(dpr, dpr);
+
+    const w = rect.width;
+    const chartWidth = w - LEFT_MARGIN - RIGHT_MARGIN;
+
+    ctx.clearRect(0, 0, w, RULER_HEIGHT);
+    ctx.fillStyle = '#0d0d0d';
+    ctx.fillRect(0, 0, w, RULER_HEIGHT);
+
+    const visibleMs = viewEnd - viewStart;
+
+    // Choose tick interval based on visible duration
+    let tickMs: number;
+    if (visibleMs > 30 * 60000) tickMs = 5 * 60000;       // > 30 min: every 5 min
+    else if (visibleMs > 10 * 60000) tickMs = 60000;       // 10–30 min: every 1 min
+    else if (visibleMs > 2 * 60000) tickMs = 30000;        // 2–10 min: every 30 sec
+    else tickMs = 10000;                                    // < 2 min: every 10 sec
+
+    const totalRecordingMs = timeRange.end - timeRange.start;
+    const useHMS = totalRecordingMs > 3600000;
+
+    const timeToX = (t: number) =>
+      LEFT_MARGIN + ((t - viewStart) / visibleMs) * chartWidth;
+
+    // Top border line
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(w, 0);
+    ctx.stroke();
+
+    const firstTick = Math.ceil(viewStart / tickMs) * tickMs;
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+
+    for (let t = firstTick; t <= viewEnd; t += tickMs) {
+      const x = timeToX(t);
+      if (x < LEFT_MARGIN || x > w - RIGHT_MARGIN) continue;
+
+      // Tick mark
+      ctx.strokeStyle = '#555';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, 8);
+      ctx.stroke();
+
+      // Label
+      const elapsed = Math.round((t - timeRange.start) / 1000);
+      const hh = Math.floor(elapsed / 3600);
+      const mm = Math.floor((elapsed % 3600) / 60);
+      const ss = elapsed % 60;
+      const label = useHMS
+        ? `${hh}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`
+        : `${mm}:${String(ss).padStart(2, '0')}`;
+
+      ctx.fillStyle = '#888';
+      ctx.fillText(label, x, 10);
+    }
+  }, [timeRange, viewStart, viewEnd]);
 
   // Overview bar rendering
   const drawOverview = useCallback(() => {
@@ -308,6 +411,7 @@ export default function StripCharts({ segments, sailTags, onCursorTime }: StripC
   }, [metrics, timeRange, viewStart, viewEnd]);
 
   useEffect(() => { draw(); }, [draw]);
+  useEffect(() => { drawRuler(); }, [drawRuler]);
   useEffect(() => { drawOverview(); }, [drawOverview]);
 
   // Mouse interaction: zoom, pan, cursor
@@ -405,8 +509,8 @@ export default function StripCharts({ segments, sailTags, onCursorTime }: StripC
 
   return (
     <div className="flex flex-col gap-1">
-      {/* Metric visibility toggles */}
-      <div className="flex gap-2 flex-wrap mb-1">
+      {/* Toolbar: metric toggles + Export PDF */}
+      <div className="flex gap-2 flex-wrap mb-1 items-center">
         {METRIC_CONFIGS.map((m) => (
           <label key={m.key} className="flex items-center gap-1 text-xs cursor-pointer">
             <input
@@ -418,18 +522,31 @@ export default function StripCharts({ segments, sailTags, onCursorTime }: StripC
             <span style={{ color: m.color }}>{m.label}</span>
           </label>
         ))}
+        <button
+          onClick={handleExportPdf}
+          className="ml-auto px-3 py-1 rounded text-xs bg-gray-700 hover:bg-gray-600 text-white"
+        >
+          Export PDF
+        </button>
       </div>
 
       {/* Main strip charts */}
       <canvas
         ref={canvasRef}
         className="w-full cursor-crosshair"
-        style={{ height: totalHeight + 16 }}
+        style={{ height: totalHeight }}
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseLeave}
+      />
+
+      {/* Elapsed time ruler */}
+      <canvas
+        ref={rulerRef}
+        className="w-full"
+        style={{ height: RULER_HEIGHT }}
       />
 
       {/* Overview bar */}

@@ -71,6 +71,7 @@ export interface RaceFileInfo {
   path: string;
   label: string | null;
   date: string;
+  startTime?: string | null; // ISO8601 wall-clock start time
   duration: number; // seconds
   points: number;
   size: number; // bytes

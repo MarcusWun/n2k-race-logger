@@ -12,17 +12,25 @@ export default function Settings() {
   const [draft, setDraft] = useState<AppSettings>({ ...settings });
   const [ports, setPorts] = useState<Array<{ path: string; manufacturer?: string }>>([]);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [loadWarning, setLoadWarning] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
   const [discoveredSources, setDiscoveredSources] = useState<Record<number, number[]>>({});
 
   useEffect(() => {
     const ipc = getIPC();
-    if (!ipc) return;
+    if (!ipc) { setLoaded(true); return; }
 
-    ipc.getSettings().then((s: AppSettings) => {
+    ipc.getSettings().then((s: AppSettings & { _loadError?: string }) => {
       if (s) {
-        setSettings(s);
-        setDraft({ ...s, sourcePreferences: s.sourcePreferences ?? {} });
+        if (s._loadError) {
+          setLoadWarning(s._loadError);
+        }
+        const { _loadError: _ignored, ...cleanSettings } = s as any;
+        setSettings(cleanSettings);
+        setDraft({ ...cleanSettings, sourcePreferences: cleanSettings.sourcePreferences ?? {} });
       }
+      setLoaded(true);
     });
     ipc.listPorts().then((p: any[]) => {
       if (Array.isArray(p)) setPorts(p);
@@ -42,8 +50,13 @@ export default function Settings() {
 
   const handleSave = async () => {
     const ipc = getIPC();
+    setSaveError(null);
     if (ipc) {
-      await ipc.setSettings(draft);
+      const result = await ipc.setSettings(draft);
+      if (result && result.success === false) {
+        setSaveError(result.error || 'Failed to save settings.');
+        return;
+      }
     }
     setSettings(draft);
     setSaved(true);
@@ -74,6 +87,16 @@ export default function Settings() {
 
   return (
     <div className="flex flex-col gap-6 max-w-2xl">
+      {loadWarning && (
+        <div className="bg-yellow-900/40 border border-yellow-700 rounded px-4 py-2 text-yellow-300 text-sm">
+          {loadWarning}
+        </div>
+      )}
+      {saveError && (
+        <div className="bg-red-900/40 border border-red-700 rounded px-4 py-2 text-red-300 text-sm">
+          Save failed: {saveError}
+        </div>
+      )}
       {/* Connection */}
       <section>
         <h2 className="text-lg font-semibold text-n2k-accent mb-3">Connection</h2>
@@ -223,7 +246,8 @@ export default function Settings() {
       <div className="flex gap-3">
         <button
           onClick={handleSave}
-          className="px-6 py-2 rounded text-sm font-medium bg-n2k-accent hover:bg-cyan-400 text-black"
+          disabled={!loaded}
+          className="px-6 py-2 rounded text-sm font-medium bg-n2k-accent hover:bg-cyan-400 text-black disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {saved ? '✓ Saved' : 'Save'}
         </button>

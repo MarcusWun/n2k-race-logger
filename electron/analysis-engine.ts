@@ -221,8 +221,11 @@ export function reconstructTimeSeries(rows: RawPGNRow[]): TimeSeries {
       }
     }
 
+    // Normalize TWA to 0–180° (port and starboard tacks treated as magnitude)
+    const normalizedTwa = twa != null ? (twa > 180 ? 360 - twa : twa) : null;
+
     result.tws.push({ time: ts, value: tws });
-    result.twa.push({ time: ts, value: twa });
+    result.twa.push({ time: ts, value: normalizedTwa });
     result.twd.push({ time: ts, value: twd });
   }
 

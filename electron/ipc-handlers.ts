@@ -122,44 +122,52 @@ function getSettingsPath(): string {
 
 const DEFAULT_SOURCE_PREFERENCES: Record<number, number> = { 130306: 16 };
 
+const DEFAULT_SETTINGS: Record<string, any> = {
+  serialPort: 'COM3',
+  serialBaud: 115200,
+  pgnFilter: [128259, 129025, 129026, 129029, 127250, 130306, 130310, 127257, 129284],
+  sourcePreferences: { ...DEFAULT_SOURCE_PREFERENCES },
+  dataDirectory: path.join(os.homedir(), 'n2k-race-logger', 'races'),
+  polarDirectory: path.join(os.homedir(), 'n2k-race-logger', 'polars'),
+  activePolarProfile: undefined,
+};
+
 // Load app settings
+// Returns settings object; sets _loadError on the returned object if settings file is corrupt.
 function loadAppSettings(): Record<string, any> {
   const sp = getSettingsPath();
   try {
-    if (fs.existsSync(sp)) {
-      const saved = JSON.parse(fs.readFileSync(sp, 'utf-8'));
-      // Migrate: apply default source preferences if field is missing
-      if (saved.sourcePreferences == null) {
-        saved.sourcePreferences = { ...DEFAULT_SOURCE_PREFERENCES };
-      }
-      return saved;
+    if (!fs.existsSync(sp)) {
+      // Expected on first run — silent fallback to defaults
+      return { ...DEFAULT_SETTINGS, sourcePreferences: { ...DEFAULT_SOURCE_PREFERENCES } };
     }
-  } catch {
-    // ignore
+    const raw = fs.readFileSync(sp, 'utf-8');
+    let saved: Record<string, any>;
+    try {
+      saved = JSON.parse(raw);
+    } catch (parseErr) {
+      console.error('[IPC] settings.json is corrupt (JSON parse failure):', parseErr);
+      return { ...DEFAULT_SETTINGS, sourcePreferences: { ...DEFAULT_SOURCE_PREFERENCES }, _loadError: 'Settings file is corrupt and could not be read. Defaults have been applied.' };
+    }
+    // Migrate: apply default source preferences if field is missing
+    if (saved.sourcePreferences == null) {
+      saved.sourcePreferences = { ...DEFAULT_SOURCE_PREFERENCES };
+    }
+    return saved;
+  } catch (err) {
+    console.error('[IPC] Failed to load settings:', err);
+    return { ...DEFAULT_SETTINGS, sourcePreferences: { ...DEFAULT_SOURCE_PREFERENCES }, _loadError: 'Failed to read settings file. Defaults have been applied.' };
   }
-  return {
-    serialPort: 'COM3',
-    serialBaud: 115200,
-    pgnFilter: [128259, 129025, 129026, 129029, 127250, 130306, 130310, 127257, 129284],
-    sourcePreferences: { ...DEFAULT_SOURCE_PREFERENCES },
-    dataDirectory: path.join(os.homedir(), 'n2k-race-logger', 'races'),
-    polarDirectory: path.join(os.homedir(), 'n2k-race-logger', 'polars'),
-    activePolarProfile: undefined,
-  };
 }
 
-// Save app settings
+// Save app settings — throws on failure so callers can report the error to the renderer.
 function saveAppSettings(settings: Record<string, any>): void {
   const sp = getSettingsPath();
-  try {
-    const dir = path.dirname(sp);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(sp, JSON.stringify(settings, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('[IPC] Failed to save settings:', err);
+  const dir = path.dirname(sp);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
+  fs.writeFileSync(sp, JSON.stringify(settings, null, 2), 'utf-8');
 }
 
 // Get the BrowserWindow's webContents to send IPC events to renderer
@@ -406,15 +414,21 @@ export function registerIPCHandlers(): void {
 
   // --- settings:get ---
   ipcMain.handle('settings:get', async () => {
-    const settings = loadAppSettings();
-    return settings;
+    return loadAppSettings();
   });
 
   // --- settings:set ---
   ipcMain.handle('settings:set', async (_event, payload: Record<string, any>) => {
     const settings = loadAppSettings();
-    const updated = { ...settings, ...payload };
-    saveAppSettings(updated);
+    // Strip internal error flag before merging
+    const { _loadError: _ignored, ...cleanSettings } = settings;
+    const updated = { ...cleanSettings, ...payload };
+    try {
+      saveAppSettings(updated);
+    } catch (err: any) {
+      console.error('[IPC] settings:set — write failed:', err);
+      return { success: false, error: err?.message || 'Failed to write settings file' };
+    }
 
     // Update cached source preferences immediately
     cachedSourcePreferences = updated.sourcePreferences || {};
@@ -465,6 +479,7 @@ export function registerIPCHandlers(): void {
           path: fullPath,
           label: race?.label || null,
           date: race?.created_at || stat.mtime.toISOString(),
+          startTime: race?.start_time || null,
           duration: race?.start_time && race?.end_time
             ? (new Date(race.end_time).getTime() - new Date(race.start_time).getTime()) / 1000
             : 0,

@@ -22,10 +22,29 @@ html.day {
   --n2k-danger: #cc2200;
 }
 
-/* In day mode, white text becomes near-black for readability */
+/* In day mode, white text becomes near-black for readability on light backgrounds */
 html.day .text-white {
   color: #111827;
 }
+
+/* Exception: elements with dark backgrounds must keep white text.
+   This covers buttons (bg-gray-700 text-white) and colored action buttons. */
+html.day .bg-gray-500.text-white,
+html.day .bg-gray-600.text-white,
+html.day .bg-gray-700.text-white,
+html.day .bg-gray-800.text-white,
+html.day .bg-n2k-accent.text-white,
+html.day .bg-n2k-danger.text-white,
+html.day .bg-n2k-success.text-white,
+html.day .bg-n2k-warning.text-white {
+  color: #ffffff;
+}
+
+/* In day mode, shift muted text classes darker so they read on light backgrounds.
+   Night-mode grays 300/400/500 are designed for dark backgrounds and are too pale on white. */
+html.day .text-gray-300 { color: #6b7280; } /* ~gray-500: still muted but visible */
+html.day .text-gray-400 { color: #4b5563; } /* ~gray-600 */
+html.day .text-gray-500 { color: #374151; } /* ~gray-700 */
 
 body {
   margin: 0;

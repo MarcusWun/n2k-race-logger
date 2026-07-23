@@ -396,7 +396,7 @@ export class SerialManager extends EventEmitter {
 
   private connectTcp(host?: string, tcpPort?: number): Promise<void> {
     this.activeMode = 'tcp';
-    const h = host || this.tcpSettings.host;
+    const h = (host || this.tcpSettings.host).trim().replace(/\.+$/, '');
     const p = tcpPort || this.tcpSettings.tcpPort;
 
     this.emit('status', { mode: 'tcp', host: h, tcpPort: p, status: 'connecting' });

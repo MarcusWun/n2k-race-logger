@@ -130,6 +130,18 @@ const DEFAULT_SETTINGS: Record<string, any> = {
   dataDirectory: path.join(os.homedir(), 'n2k-race-logger', 'races'),
   polarDirectory: path.join(os.homedir(), 'n2k-race-logger', 'polars'),
   activePolarProfile: undefined,
+  connectionMode: 'serial',
+  tcpHost: '192.168.1.1',
+  tcpPort: 2000,
+  sailInventory: [
+    { id: 'j1-main', label: 'J1 + Main' },
+    { id: 'j2-main', label: 'J2 + Main' },
+    { id: 'j3-main', label: 'J3 + Main' },
+    { id: 'a2-main', label: 'A2 + Main' },
+    { id: 'a3-main', label: 'A3 + Main' },
+    { id: 'j2-reef1', label: 'J2 + Main + 1 reef' },
+    { id: 'j3-reef1', label: 'J3 + Main + 1 reef' },
+  ],
 };
 
 // Load app settings
@@ -149,11 +161,13 @@ function loadAppSettings(): Record<string, any> {
       console.error('[IPC] settings.json is corrupt (JSON parse failure):', parseErr);
       return { ...DEFAULT_SETTINGS, sourcePreferences: { ...DEFAULT_SOURCE_PREFERENCES }, _loadError: 'Settings file is corrupt and could not be read. Defaults have been applied.' };
     }
-    // Migrate: apply default source preferences if field is missing
-    if (saved.sourcePreferences == null) {
-      saved.sourcePreferences = { ...DEFAULT_SOURCE_PREFERENCES };
-    }
-    return saved;
+    // Merge with defaults so newly-added fields get their defaults when an old
+    // settings.json (from a previous build) is loaded.
+    return {
+      ...DEFAULT_SETTINGS,
+      ...saved,
+      sourcePreferences: saved.sourcePreferences ?? { ...DEFAULT_SOURCE_PREFERENCES },
+    };
   } catch (err) {
     console.error('[IPC] Failed to load settings:', err);
     return { ...DEFAULT_SETTINGS, sourcePreferences: { ...DEFAULT_SOURCE_PREFERENCES }, _loadError: 'Failed to read settings file. Defaults have been applied.' };

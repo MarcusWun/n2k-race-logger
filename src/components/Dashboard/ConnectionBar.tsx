@@ -1,21 +1,20 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { getIPC } from '../../ipc';
+import { useConnectionStore } from '../../store/useConnectionStore';
 import type { ConnectionStatus, SerialPortInfo } from '../../types/ipc';
 
-type ConnectionMode = 'serial' | 'tcp';
-
 export default function ConnectionBar() {
-  const [mode, setMode] = useState<ConnectionMode>('serial');
+  const {
+    mode, setMode,
+    selectedPort, setSelectedPort,
+    baudRate, setBaudRate,
+    tcpHost, setTcpHost,
+    tcpPort, setTcpPort,
+    status, setStatus,
+  } = useConnectionStore();
+
+  // ports is transient OS state — local useState is fine
   const [ports, setPorts] = useState<SerialPortInfo[]>([]);
-  const [selectedPort, setSelectedPort] = useState('COM3');
-  const [baudRate, setBaudRate] = useState(115200);
-  const [tcpHost, setTcpHost] = useState('192.168.1.1');
-  const [tcpPort, setTcpPort] = useState(2000);
-  const [status, setStatus] = useState<ConnectionStatus>({
-    port: 'COM3',
-    baud: 115200,
-    status: 'disconnected',
-  });
 
   const refreshPorts = useCallback(async () => {
     const ipc = getIPC();
@@ -29,19 +28,22 @@ export default function ConnectionBar() {
     const ipc = getIPC();
     if (!ipc) return;
 
-    // Load saved settings for mode/tcp
+    // Load saved settings for mode/tcp — only when disconnected to avoid overriding active state
     ipc.getSettings().then((s: any) => {
-      if (s?.connectionMode) setMode(s.connectionMode);
-      if (s?.tcpHost) setTcpHost(s.tcpHost);
-      if (s?.tcpPort) setTcpPort(s.tcpPort);
-      if (s?.serialPort) setSelectedPort(s.serialPort);
-      if (s?.serialBaud) setBaudRate(s.serialBaud);
+      if (status.status === 'disconnected') {
+        if (s?.connectionMode) setMode(s.connectionMode);
+        if (s?.tcpHost) setTcpHost(s.tcpHost.trim().replace(/\.+$/, ''));
+        if (s?.tcpPort) setTcpPort(s.tcpPort);
+        if (s?.serialPort) setSelectedPort(s.serialPort);
+        if (s?.serialBaud) setBaudRate(s.serialBaud);
+      }
     });
 
     const unsub = ipc.on('connection:status', (s: ConnectionStatus) => {
       setStatus(s);
     });
     return () => { unsub(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshPorts]);
 
   const handleConnect = async () => {
@@ -53,7 +55,7 @@ export default function ConnectionBar() {
       await ipc.connect(
         mode === 'serial'
           ? { mode: 'serial', port: selectedPort, baud: baudRate }
-          : { mode: 'tcp', host: tcpHost, tcpPort: tcpPort },
+          : { mode: 'tcp', host: tcpHost.trim().replace(/\.+$/, ''), tcpPort: tcpPort },
       );
     }
   };

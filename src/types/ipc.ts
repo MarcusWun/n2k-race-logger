@@ -29,6 +29,10 @@ export interface AppSettings {
   dataDirectory: string;
   polarDirectory: string;
   activePolarProfile?: number;
+  connectionMode?: 'serial' | 'tcp';
+  tcpHost?: string;
+  tcpPort?: number;
+  sailInventory?: Array<{ id: string; label: string }>;
 }
 
 export interface SerialPortInfo {

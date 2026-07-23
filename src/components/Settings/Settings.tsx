@@ -204,23 +204,23 @@ export default function Settings() {
       <section>
         <h2 className="text-lg font-semibold text-n2k-accent mb-3">Sail Inventory</h2>
         <div className="flex flex-col gap-2">
-          {((draft as any).sailInventory || DEFAULT_SAIL_INVENTORY).map((sail: any, i: number) => (
+          {(draft.sailInventory || DEFAULT_SAIL_INVENTORY).map((sail, i) => (
             <div key={sail.id || i} className="flex items-center gap-2">
               <input
                 type="text"
                 value={sail.label}
                 onChange={(e) => {
-                  const inv = [...((draft as any).sailInventory || DEFAULT_SAIL_INVENTORY)];
+                  const inv = [...(draft.sailInventory || DEFAULT_SAIL_INVENTORY)];
                   inv[i] = { ...inv[i], label: e.target.value };
-                  setDraft({ ...draft, sailInventory: inv } as any);
+                  setDraft({ ...draft, sailInventory: inv });
                 }}
                 className="flex-1 bg-n2k-bg border border-gray-700 rounded px-2 py-1 text-sm text-white"
               />
               <button
                 onClick={() => {
-                  const inv = [...((draft as any).sailInventory || DEFAULT_SAIL_INVENTORY)];
+                  const inv = [...(draft.sailInventory || DEFAULT_SAIL_INVENTORY)];
                   inv.splice(i, 1);
-                  setDraft({ ...draft, sailInventory: inv } as any);
+                  setDraft({ ...draft, sailInventory: inv });
                 }}
                 className="px-2 py-1 rounded text-xs bg-red-900/50 hover:bg-red-700 text-red-300"
               >
@@ -230,10 +230,10 @@ export default function Settings() {
           ))}
           <button
             onClick={() => {
-              const inv = [...((draft as any).sailInventory || DEFAULT_SAIL_INVENTORY)];
+              const inv = [...(draft.sailInventory || DEFAULT_SAIL_INVENTORY)];
               const id = `sail-${Date.now()}`;
               inv.push({ id, label: 'New Sail' });
-              setDraft({ ...draft, sailInventory: inv } as any);
+              setDraft({ ...draft, sailInventory: inv });
             }}
             className="px-3 py-1.5 rounded text-xs bg-gray-700 hover:bg-gray-600 text-white self-start"
           >

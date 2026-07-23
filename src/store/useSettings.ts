@@ -8,6 +8,18 @@ const defaultSettings: AppSettings = {
   sourcePreferences: { 130306: 16 },
   dataDirectory: '~/n2k-race-logger/races/',
   polarDirectory: '~/n2k-race-logger/polars/',
+  connectionMode: 'serial',
+  tcpHost: '192.168.1.1',
+  tcpPort: 2000,
+  sailInventory: [
+    { id: 'j1-main', label: 'J1 + Main' },
+    { id: 'j2-main', label: 'J2 + Main' },
+    { id: 'j3-main', label: 'J3 + Main' },
+    { id: 'a2-main', label: 'A2 + Main' },
+    { id: 'a3-main', label: 'A3 + Main' },
+    { id: 'j2-reef1', label: 'J2 + Main + 1 reef' },
+    { id: 'j3-reef1', label: 'J3 + Main + 1 reef' },
+  ],
 };
 
 interface SettingsStore {

@@ -5,13 +5,17 @@ export interface TimeSeriesPoint {
   value: number | null;
 }
 
+export type WindSide = 'port' | 'starboard' | 'centerline';
+
 export interface TimeSeries {
   tws: TimeSeriesPoint[];
   twa: TimeSeriesPoint[];
+  twaSide?: Array<{ time: number; value: WindSide | null }>;
   twd: TimeSeriesPoint[];
   stw: TimeSeriesPoint[];
   aws: TimeSeriesPoint[];
   awa: TimeSeriesPoint[];
+  awaSide?: Array<{ time: number; value: WindSide | null }>;
   heading: TimeSeriesPoint[];
   sog: TimeSeriesPoint[];
   cog: TimeSeriesPoint[];

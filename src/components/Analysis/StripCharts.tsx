@@ -2,6 +2,7 @@ import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { useAnalysisStore } from '../../store/useAnalysisStore';
 import type { TimeSeriesPoint, DetectedSegment, SailTag } from '../../types/analysis';
 import { jsPDF } from 'jspdf';
+import { formatWindAngle, normalizedWindAngleValue } from '../../utils/angles';
 
 const METRIC_CONFIGS: { key: string; label: string; unit: string; color: string }[] = [
   { key: 'tws', label: 'TWS', unit: 'kts', color: '#00d4ff' },
@@ -39,6 +40,16 @@ interface StripChartsProps {
 }
 
 const SAIL_COLORS = ['#00d4ff', '#00ff88', '#ffaa00', '#ff4444', '#aa66ff', '#ff66aa', '#66aaff', '#ff8844'];
+const RELATIVE_WIND_KEYS = new Set(['twa', 'awa']);
+
+function displayValueForMetric(key: string, value: number, precision = 1): string {
+  if (RELATIVE_WIND_KEYS.has(key)) return formatWindAngle(value, precision);
+  return value.toFixed(precision);
+}
+
+function chartValueForMetric(key: string, value: number): number {
+  return RELATIVE_WIND_KEYS.has(key) ? normalizedWindAngleValue(value) : value;
+}
 
 export default function StripCharts({ segments, sailTags, onCursorTime }: StripChartsProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -159,8 +170,9 @@ export default function StripCharts({ segments, sailTags, onCursorTime }: StripC
       for (const p of series) {
         if (p.time < viewStart || p.time > viewEnd) continue;
         if (p.value != null) {
-          if (p.value < minVal) minVal = p.value;
-          if (p.value > maxVal) maxVal = p.value;
+          const chartValue = chartValueForMetric(config.key, p.value);
+          if (chartValue < minVal) minVal = chartValue;
+          if (chartValue > maxVal) maxVal = chartValue;
         }
       }
       if (minVal === Infinity) return;
@@ -185,7 +197,7 @@ export default function StripCharts({ segments, sailTags, onCursorTime }: StripC
           drawing = false;
           continue;
         }
-        const py = valToY(p.value);
+        const py = valToY(chartValueForMetric(config.key, p.value));
         if (!drawing) { ctx.moveTo(px, py); drawing = true; }
         else ctx.lineTo(px, py);
       }
@@ -269,7 +281,7 @@ export default function StripCharts({ segments, sailTags, onCursorTime }: StripC
           const y0 = stripIdx * STRIP_HEIGHT;
           ctx.fillStyle = config.color;
           ctx.textAlign = 'left';
-          ctx.fillText(nearest.value.toFixed(1), cursorX + 4, y0 + 14);
+          ctx.fillText(displayValueForMetric(config.key, nearest.value, 1), cursorX + 4, y0 + 14);
         }
       });
     }

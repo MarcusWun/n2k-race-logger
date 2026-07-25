@@ -60,6 +60,7 @@ export default function PerformanceSummary() {
         <button
           onClick={() => exportCsv(performanceSummary)}
           className="px-3 py-1 rounded text-xs bg-gray-700 hover:bg-gray-600 text-white"
+          title="Exports normalized 0–180° relative wind bands."
         >
           Export CSV
         </button>

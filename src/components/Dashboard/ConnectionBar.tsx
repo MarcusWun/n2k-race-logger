@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { getIPC } from '../../ipc';
 import { useConnectionStore } from '../../store/useConnectionStore';
 import type { ConnectionStatus, SerialPortInfo } from '../../types/ipc';
+import { sanitizeTcpHost, validateTcpTarget } from '../../utils/tcp';
 
 export default function ConnectionBar() {
   const {
@@ -15,6 +16,7 @@ export default function ConnectionBar() {
 
   // ports is transient OS state — local useState is fine
   const [ports, setPorts] = useState<SerialPortInfo[]>([]);
+  const [localError, setLocalError] = useState<string | null>(null);
 
   const refreshPorts = useCallback(async () => {
     const ipc = getIPC();
@@ -32,7 +34,7 @@ export default function ConnectionBar() {
     ipc.getSettings().then((s: any) => {
       if (status.status === 'disconnected') {
         if (s?.connectionMode) setMode(s.connectionMode);
-        if (s?.tcpHost) setTcpHost(s.tcpHost.trim().replace(/\.+$/, ''));
+        setTcpHost(sanitizeTcpHost(s?.tcpHost || '192.168.1.1') || '192.168.1.1');
         if (s?.tcpPort) setTcpPort(s.tcpPort);
         if (s?.serialPort) setSelectedPort(s.serialPort);
         if (s?.serialBaud) setBaudRate(s.serialBaud);
@@ -52,11 +54,20 @@ export default function ConnectionBar() {
     if (status.status === 'connected') {
       await ipc.disconnect();
     } else {
-      await ipc.connect(
-        mode === 'serial'
-          ? { mode: 'serial', port: selectedPort, baud: baudRate }
-          : { mode: 'tcp', host: tcpHost.trim().replace(/\.+$/, ''), tcpPort: tcpPort },
-      );
+      setLocalError(null);
+      if (mode === 'tcp') {
+        const target = validateTcpTarget(tcpHost, tcpPort);
+        if (!target.ok) {
+          setTcpHost(target.host || '192.168.1.1');
+          setLocalError(target.error);
+          return;
+        }
+        setTcpHost(target.host);
+        setTcpPort(target.tcpPort);
+        await ipc.connect({ mode: 'tcp', host: target.host, tcpPort: target.tcpPort });
+      } else {
+        await ipc.connect({ mode: 'serial', port: selectedPort, baud: baudRate });
+      }
     }
   };
 
@@ -180,8 +191,14 @@ export default function ConnectionBar() {
         Debug
       </button>
 
-      {status.error && (
-        <span className="text-n2k-danger text-xs ml-2">{status.error}</span>
+      {mode === 'tcp' && (
+        <span className="text-gray-500 text-xs">
+          Target: {status.mode === 'tcp' && status.host ? status.host : (sanitizeTcpHost(tcpHost) || '192.168.1.1')}:{status.mode === 'tcp' && status.tcpPort ? status.tcpPort : (tcpPort || 2000)}
+        </span>
+      )}
+
+      {(localError || status.error) && (
+        <span className="text-n2k-danger text-xs ml-2">{localError || status.error}</span>
       )}
     </div>
   );

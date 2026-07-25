@@ -7,6 +7,7 @@
  */
 
 import type { PolarTable } from './polar-engine';
+import { normalizeWindAngle, normalizeWindAngleValue, type WindSide } from './wind-utils';
 
 // Unit conversion constants (same as Dashboard.tsx)
 const MS_TO_KTS = 1.94384;
@@ -22,10 +23,14 @@ export interface TimeSeriesPoint {
 export interface TimeSeries {
   tws: TimeSeriesPoint[];
   twa: TimeSeriesPoint[];
+  /** Port/starboard context for normalized TWA. */
+  twaSide: Array<{ time: number; value: WindSide | null }>;
   twd: TimeSeriesPoint[];
   stw: TimeSeriesPoint[];
   aws: TimeSeriesPoint[];
   awa: TimeSeriesPoint[];
+  /** Port/starboard context for normalized AWA. */
+  awaSide: Array<{ time: number; value: WindSide | null }>;
   heading: TimeSeriesPoint[];
   sog: TimeSeriesPoint[];
   cog: TimeSeriesPoint[];
@@ -137,6 +142,8 @@ export function reconstructTimeSeries(rows: RawPGNRow[]): TimeSeries {
 
         if (ref === 'Apparent') {
           if (speedKts != null) point.aws = speedKts;
+          // Keep raw PGN JSON untouched in SQLite, but normalize reconstructed
+          // display/analysis values to match TWA semantics.
           if (angleDeg != null) point.awa = angleDeg;
         } else if (ref === 'True (boat referenced)' || ref === 'True (water referenced)') {
           if (speedKts != null) point.tws_direct = speedKts;
@@ -168,8 +175,8 @@ export function reconstructTimeSeries(rows: RawPGNRow[]): TimeSeries {
 
   // Build per-metric arrays, computing true wind where needed
   const result: TimeSeries = {
-    tws: [], twa: [], twd: [], stw: [],
-    aws: [], awa: [], heading: [], sog: [], cog: [],
+    tws: [], twa: [], twaSide: [], twd: [], stw: [],
+    aws: [], awa: [], awaSide: [], heading: [], sog: [], cog: [],
   };
 
   // Track last known values for interpolation of computed fields
@@ -195,7 +202,11 @@ export function reconstructTimeSeries(rows: RawPGNRow[]): TimeSeries {
     result.cog.push({ time: ts, value: p.cog ?? null });
     result.heading.push({ time: ts, value: p.heading ?? lastHeading });
     result.aws.push({ time: ts, value: p.aws ?? lastAws });
-    result.awa.push({ time: ts, value: p.awa ?? lastAwa });
+
+    const rawAwa = p.awa ?? lastAwa;
+    const normalizedAwa = normalizeWindAngleValue(rawAwa);
+    result.awa.push({ time: ts, value: normalizedAwa });
+    result.awaSide.push({ time: ts, value: rawAwa != null ? normalizeWindAngle(rawAwa).side : null });
 
     // True wind: prefer direct PGN values, fall back to computed
     let tws: number | null = p.tws_direct ?? null;
@@ -208,6 +219,8 @@ export function reconstructTimeSeries(rows: RawPGNRow[]): TimeSeries {
       const awa = p.awa ?? lastAwa;
       const stw = p.stw ?? lastStw ?? lastSog ?? 0;
       if (aws != null && awa != null) {
+        // computeTrueWind needs the raw 0..360 angle to preserve side before
+        // final normalization.
         const tw = computeTrueWind(aws, awa, stw);
         if (tws == null) tws = tw.tws;
         if (twa == null) twa = tw.twa;
@@ -221,11 +234,12 @@ export function reconstructTimeSeries(rows: RawPGNRow[]): TimeSeries {
       }
     }
 
-    // Normalize TWA to 0–180° (port and starboard tacks treated as magnitude)
-    const normalizedTwa = twa != null ? (twa > 180 ? 360 - twa : twa) : null;
+    // Normalize TWA to 0–180° (port/starboard side tracked separately).
+    const normalizedTwa = normalizeWindAngleValue(twa);
 
     result.tws.push({ time: ts, value: tws });
     result.twa.push({ time: ts, value: normalizedTwa });
+    result.twaSide.push({ time: ts, value: twa != null ? normalizeWindAngle(twa).side : null });
     result.twd.push({ time: ts, value: twd });
   }
 

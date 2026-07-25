@@ -37,14 +37,53 @@ PRD updated with these requirements. Implementation status:
 | Keepalive every 20s | §4.1 | ✅ Done (38aa665) |
 | Baud rate auto-detection (115200→230400 fallback) | §4.1 | ❌ Not implemented |
 
-### Current Task
-Implement baud rate auto-detection per PRD §4.1:
-- Default 115200 baud
-- If no data received within 5 seconds of init, retry at 230400
-- Persist working baud rate in settings
+### Incremental Update — 2026-07-20
+Shipped time ruler, TWA normalization, CSV/PDF exports, settings error handling (build #37).
+
+### Incremental Update — 2026-07-17
+Shipped day/night toggle (CSS vars + Zustand), TWA normalized to 0-180° P/S, CI branch fix master→main.
+
+### Current Task — 2026-07-23: Three Bug Fixes
+Three issues reported by Marcus from boat use. Implement all three, QA, then commit and push to trigger build.
+
+#### Fix 1 (CRITICAL): Settings not persisting across new builds
+**Symptoms:** Data directory shows empty, active polar profile shows None, sail inventory resets — after installing a new build.
+
+**Root cause investigation needed:**
+- `AppSettings` type (`src/types/ipc.ts`) is missing `sailInventory`, `connectionMode`, `tcpHost`, `tcpPort`
+- `useSettings.ts` `defaultSettings` also missing these fields
+- `Settings.tsx` reads/writes `sailInventory` via `(draft as any).sailInventory` cast — fragile
+- `loadAppSettings()` in `ipc-handlers.ts` returns saved file as-is (no default merge for missing fields, except `sourcePreferences`)
+- Settings file lives at `%APPDATA%\n2k-race-logger\settings.json` — survives reinstalls normally
+
+**Fixes to make:**
+1. Add `sailInventory`, `connectionMode`, `tcpHost`, `tcpPort` to `AppSettings` interface in `src/types/ipc.ts`
+2. Add `sailInventory` (with DEFAULT_SAIL_INVENTORY values), `connectionMode: 'serial'`, `tcpHost: '192.168.1.1'`, `tcpPort: 2000` to `DEFAULT_SETTINGS` in `electron/ipc-handlers.ts`
+3. Update `loadAppSettings()` to merge loaded settings with `DEFAULT_SETTINGS` so new fields added in a new build get their defaults when the user's settings.json is from an older build: `return { ...DEFAULT_SETTINGS, ...saved, sourcePreferences: saved.sourcePreferences ?? ... }`
+4. Remove `(draft as any)` casts in `Settings.tsx` now that `sailInventory` is properly typed
+5. Update `useSettings.ts` `defaultSettings` to include all fields (or just have it match the type)
+
+#### Fix 2 (minor): Dashboard connection state resets on tab switch
+**Symptoms:** When switching away from the Dashboard tab and back, connection status indicator resets to "disconnected" even though N2K is still connected.
+
+**Root cause:** `ConnectionBar.tsx` keeps `status`, `mode`, `tcpHost`, `tcpPort`, `selectedPort`, `baudRate` in local component state. Dashboard unmounts on tab switch → ConnectionBar unmounts → state is lost.
+
+**Fix:** Create `src/store/useConnectionStore.ts` using the existing Zustand pattern (see `useThemeStore.ts`, `useSettings.ts`). Move all persisted state there: `mode`, `tcpHost`, `tcpPort`, `selectedPort`, `baudRate`, `status`. `ConnectionBar.tsx` reads/writes from the store instead of useState. The `connection:status` IPC event still updates the store.
+
+Note: The store only needs to persist the UI-side fields across tab navigation — NOT across app restarts (no localStorage persistence needed for status).
+
+#### Fix 3 (minor): TCP error shows `192.168.1.1.:2000` with extra dot
+**Symptoms:** Error message reads `ECONNREFUSED 192.168.1.1.:2000` — a dot appears between the host and the `:port`.
+
+**Root cause:** Either the saved `tcpHost` value in settings.json has a trailing dot, OR the error message in `serial-manager.ts` formats `${host}:${port}` when `host` already ends in `.`. Node.js itself does not add a dot.
+
+**Fix:**
+1. In `ConnectionBar.tsx` `handleConnect`, trim and strip trailing dots from `tcpHost` before passing to `ipc.connect()`: `host: tcpHost.trim().replace(/\.+$/, '')`
+2. Also strip on load in the `ipc.getSettings()` callback: apply the same trim when setting `setTcpHost()`
+3. In `electron/ipc-handlers.ts` / `serial-manager.ts`, defensively strip trailing dot from host before calling `socket.connect()`
 
 ### Last Completed Step
-2026-06-13 — Orchestrator state updated to reflect Phase 1 completion and incremental PRD changes.
+2026-07-23 — CTO updated orchestrator with three bug fix tasks. Spawning implementation agent.
 
 ### Agent Status Log
 | Timestamp (UTC) | Agent | Action | Result | Notes |
@@ -62,3 +101,4 @@ Implement baud rate auto-detection per PRD §4.1:
 | 2026-06-06 | Windows x64 | ecee113 | ✅ Shipped | Phase 1 initial build |
 | 2026-06-08 | Windows x64 | 5d8798b | ✅ Shipped | Black screen fix + features |
 | 2026-06-12 | Windows x64 | 38aa665 | ✅ Shipped | NGT-1 init + keepalive |
+| 2026-07-23 | Windows x64 | 88f7dbc | ✅ Pushed | Fix: settings persistence (sailInventory/connectionMode/tcpHost/tcpPort added to AppSettings + DEFAULT_SETTINGS with merge-on-load); ConnectionBar state moved to useConnectionStore so status survives tab switch; tcpHost trailing dot stripped before connect |

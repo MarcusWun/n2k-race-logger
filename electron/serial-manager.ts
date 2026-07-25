@@ -1,8 +1,6 @@
 import { EventEmitter } from 'events';
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import * as net from 'net';
+import { loadAppSettings, saveAppSettings } from './settings-store';
 
 // Dynamic import of native serial modules
 let SerialPort: any = null;
@@ -97,6 +95,62 @@ export interface ParsedPGN {
   timestamp?: string;
 }
 
+export interface SanitizedTcpTarget {
+  host: string;
+  tcpPort: number;
+  corrected: boolean;
+  warning?: string;
+}
+
+const DEFAULT_TCP_HOST = '192.168.1.1';
+const DEFAULT_TCP_PORT = 2000;
+
+export function sanitizeTcpHost(input?: string): SanitizedTcpTarget {
+  const raw = input ?? DEFAULT_TCP_HOST;
+  const original = String(raw);
+  let host = original.trim().replace(/\.+$/, '');
+  let corrected = host !== original;
+  let warning: string | undefined;
+
+  if (!host) {
+    host = DEFAULT_TCP_HOST;
+    corrected = true;
+    warning = `Blank TCP host corrected to default ${DEFAULT_TCP_HOST}`;
+  }
+
+  const ipv4Like = /^\d{1,3}(?:\.\d{1,3})*$/.test(host);
+  if (ipv4Like) {
+    const parts = host.split('.');
+    const validOctets = parts.every((part) => {
+      if (!/^\d{1,3}$/.test(part)) return false;
+      const n = Number(part);
+      return n >= 0 && n <= 255;
+    });
+    if (!validOctets) {
+      throw new Error(`Invalid TCP host "${original}"; IPv4 octets must be 0-255`);
+    }
+    if (parts.length !== 4) {
+      if (host === '192.168.1') {
+        host = DEFAULT_TCP_HOST;
+        corrected = true;
+        warning = `Malformed TCP host "${original}" corrected to default ${DEFAULT_TCP_HOST}`;
+      } else {
+        throw new Error(`Invalid TCP host "${original}"; expected a full IPv4 address such as ${DEFAULT_TCP_HOST}`);
+      }
+    }
+  }
+
+  return { host, tcpPort: DEFAULT_TCP_PORT, corrected, warning };
+}
+
+export function sanitizeTcpPort(input?: number): number {
+  const port = Number(input ?? DEFAULT_TCP_PORT);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid TCP port "${input}"; expected 1-65535`);
+  }
+  return port;
+}
+
 export class SerialManager extends EventEmitter {
   private port: any = null;
   private pgnParser: any = null;
@@ -104,63 +158,44 @@ export class SerialManager extends EventEmitter {
   private tcpSocket: net.Socket | null = null;
   private keepaliveInterval: ReturnType<typeof setInterval> | null = null;
   private activeMode: ConnectionMode = 'serial';
-  private settingsPath: string;
   private settings: SerialSettings = {
     port: 'COM3',
     baud: 115200,
   };
   private tcpSettings = {
-    host: '192.168.1.1',
-    tcpPort: 2000,
+    host: DEFAULT_TCP_HOST,
+    tcpPort: DEFAULT_TCP_PORT,
   };
 
   constructor() {
     super();
-    this.settingsPath = path.join(
-      process.env.APPDATA || path.join(os.homedir(), '.config'),
-      'n2k-race-logger',
-      'settings.json',
-    );
     this.loadSettings();
   }
 
   private loadSettings(): void {
-    try {
-      const configDir = path.dirname(this.settingsPath);
-      if (!fs.existsSync(configDir)) {
-        fs.mkdirSync(configDir, { recursive: true });
-      }
-      if (fs.existsSync(this.settingsPath)) {
-        const raw = fs.readFileSync(this.settingsPath, 'utf-8');
-        const parsed = JSON.parse(raw);
-        if (parsed.port) this.settings.port = parsed.port;
-        if (parsed.baud) this.settings.baud = parsed.baud;
-        if (parsed.tcpHost) this.tcpSettings.host = parsed.tcpHost;
-        if (parsed.tcpPort) this.tcpSettings.tcpPort = parsed.tcpPort;
-      }
-    } catch {
-      // If loading fails, use defaults
-    }
+    const parsed = loadAppSettings();
+    if (parsed.serialPort || parsed.port) this.settings.port = parsed.serialPort || parsed.port;
+    if (parsed.serialBaud || parsed.baud) this.settings.baud = parsed.serialBaud || parsed.baud;
+    if (parsed.tcpHost) this.tcpSettings.host = sanitizeTcpHost(parsed.tcpHost).host;
+    if (parsed.tcpPort) this.tcpSettings.tcpPort = parsed.tcpPort;
   }
 
   saveSettings(): void {
     try {
-      const configDir = path.dirname(this.settingsPath);
-      if (!fs.existsSync(configDir)) {
-        fs.mkdirSync(configDir, { recursive: true });
-      }
-      fs.writeFileSync(
-        this.settingsPath,
-        JSON.stringify({
-          port: this.settings.port,
-          baud: this.settings.baud,
-          tcpHost: this.tcpSettings.host,
-          tcpPort: this.tcpSettings.tcpPort,
-        }, null, 2),
-        'utf-8',
-      );
+      const current = loadAppSettings();
+      saveAppSettings({
+        ...current,
+        serialPort: this.settings.port,
+        serialBaud: this.settings.baud,
+        // Legacy aliases preserved for compatibility with older code/tests.
+        port: this.settings.port,
+        baud: this.settings.baud,
+        tcpHost: this.tcpSettings.host,
+        tcpPort: this.tcpSettings.tcpPort,
+      });
     } catch (err) {
       console.error('[SerialManager] Failed to save settings:', err);
+      throw err;
     }
   }
 
@@ -396,30 +431,45 @@ export class SerialManager extends EventEmitter {
 
   private connectTcp(host?: string, tcpPort?: number): Promise<void> {
     this.activeMode = 'tcp';
-    const h = (host || this.tcpSettings.host).trim().replace(/\.+$/, '');
-    const p = tcpPort || this.tcpSettings.tcpPort;
+    const sanitized = sanitizeTcpHost(host || this.tcpSettings.host);
+    const h = sanitized.host;
+    const p = sanitizeTcpPort(tcpPort || this.tcpSettings.tcpPort);
+    const startedAt = Date.now();
 
-    this.emit('status', { mode: 'tcp', host: h, tcpPort: p, status: 'connecting' });
+    if (sanitized.corrected) this.tcpSettings.host = h;
+    if (sanitized.warning) console.warn(`[SerialManager] ${sanitized.warning}`);
+    this.emit('status', { mode: 'tcp', host: h, tcpPort: p, status: 'connecting', error: sanitized.warning });
+    console.log(`[SerialManager] TCP connecting to ${h}:${p}`);
 
     return new Promise<void>((resolve, reject) => {
       this.tcpSocket = new net.Socket();
+      this.tcpSocket.setTimeout(10000);
 
-      const onError = (err: Error) => {
+      const fail = (err: Error) => {
+        const elapsedMs = Date.now() - startedAt;
+        const error = `TCP connect failed to ${h}:${p} after ${elapsedMs}ms: ${err.message}`;
         this.emit('status', {
           mode: 'tcp',
           host: h,
           tcpPort: p,
           status: 'error',
-          error: err.message,
+          error,
         });
         this.cleanupTcp();
-        reject(err);
+        reject(new Error(error));
       };
 
+      const onError = (err: Error) => fail(err);
+      const onTimeout = () => fail(new Error('connection timed out'));
+
       this.tcpSocket.once('error', onError);
+      this.tcpSocket.once('timeout', onTimeout);
 
       this.tcpSocket.connect(p, h, () => {
         this.tcpSocket!.removeListener('error', onError);
+        this.tcpSocket!.removeListener('timeout', onTimeout);
+        const actual = `${this.tcpSocket!.remoteAddress || h}:${this.tcpSocket!.remotePort || p}`;
+        console.log(`[SerialManager] TCP connected to ${actual} in ${Date.now() - startedAt}ms`);
 
         // Pipe TCP data through canboatjs — handles both binary and text formats
         this.pgnParser = this.createPgnParser();
@@ -434,7 +484,7 @@ export class SerialManager extends EventEmitter {
             host: h,
             tcpPort: p,
             status: 'error',
-            error: err.message,
+            error: `TCP error from ${h}:${p}: ${err.message}`,
           });
           this.cleanupTcp();
         });

@@ -5,6 +5,7 @@ import { getIPC } from '../../ipc';
 import { DEFAULT_PGN_FILTER, PGN_NAMES } from '../../types/n2k-pgns';
 import type { AppSettings } from '../../types/ipc';
 import type { BoatProfile } from '../../types/polar';
+import { sanitizeTcpHost, validateTcpTarget } from '../../utils/tcp';
 
 export default function Settings() {
   const { settings, setSettings } = useSettingsStore();
@@ -45,20 +46,31 @@ export default function Settings() {
     const unsub = ipc.on('sources:discovered', (sources: Record<number, number[]>) => {
       setDiscoveredSources(sources);
     });
-    return () => { if (unsub) unsub(); };
+    const unsubSettingsError = ipc.on('settings:error', (msg: { error?: string }) => {
+      setSaveError(msg?.error || 'Settings persistence error.');
+    });
+    return () => { if (unsub) unsub(); if (unsubSettingsError) unsubSettingsError(); };
   }, [setSettings, setProfiles]);
 
   const handleSave = async () => {
     const ipc = getIPC();
     setSaveError(null);
+    const target = validateTcpTarget(draft.tcpHost || '192.168.1.1', draft.tcpPort ?? 2000);
+    if (!target.ok) {
+      setDraft({ ...draft, tcpHost: target.host || '192.168.1.1', tcpPort: target.tcpPort ?? 2000 });
+      setSaveError(target.error);
+      return;
+    }
+    const settingsToSave = { ...draft, tcpHost: target.host, tcpPort: target.tcpPort };
     if (ipc) {
-      const result = await ipc.setSettings(draft);
+      const result = await ipc.setSettings(settingsToSave);
       if (result && result.success === false) {
         setSaveError(result.error || 'Failed to save settings.');
         return;
       }
     }
-    setSettings(draft);
+    setSettings(settingsToSave);
+    setDraft(settingsToSave);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
@@ -172,6 +184,41 @@ export default function Settings() {
             );
           })}
         </div>
+      </section>
+
+      {/* TCP Settings */}
+      <section>
+        <h2 className="text-lg font-semibold text-n2k-accent mb-3">TCP Gateway</h2>
+        <div className="grid grid-cols-[1fr_auto_7rem] gap-2 items-end">
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">Host</label>
+            <input
+              type="text"
+              value={draft.tcpHost || '192.168.1.1'}
+              onChange={(e) => setDraft({ ...draft, tcpHost: e.target.value })}
+              onBlur={(e) => setDraft({ ...draft, tcpHost: sanitizeTcpHost(e.target.value) || '192.168.1.1' })}
+              className="w-full bg-n2k-bg border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+              placeholder="192.168.1.1"
+            />
+          </div>
+          <span className="text-gray-500 pb-1.5">:</span>
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">Port</label>
+            <input
+              type="number"
+              min={1}
+              max={65535}
+              step={1}
+              value={draft.tcpPort ?? 2000}
+              onChange={(e) => setDraft({ ...draft, tcpPort: Number(e.target.value) })}
+              className="w-full bg-n2k-bg border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+              placeholder="2000"
+            />
+          </div>
+        </div>
+        <p className="text-xs text-gray-500 mt-2">
+          Connection target shown and saved as {sanitizeTcpHost(draft.tcpHost || '192.168.1.1') || '192.168.1.1'}:{draft.tcpPort ?? 2000}. Default is 192.168.1.1:2000.
+        </p>
       </section>
 
       {/* Data Directory */}

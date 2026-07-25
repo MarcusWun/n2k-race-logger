@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { loadAppSettings, saveAppSettings, resetSettingsCacheForTests } from './settings-store';
 
 // ===================================================================
 // Test: Settings load/save round-trip
@@ -20,10 +21,15 @@ describe('Settings load/save round-trip', () => {
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'n2k-settings-'));
-    settingsPath = path.join(tmpDir, 'settings.json');
+    settingsPath = path.join(tmpDir, 'n2k-race-logger', 'settings.json');
+    process.env.APPDATA = tmpDir;
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    resetSettingsCacheForTests();
   });
 
   afterEach(() => {
+    delete process.env.APPDATA;
+    resetSettingsCacheForTests();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -99,16 +105,60 @@ describe('Settings load/save round-trip', () => {
   });
 
   it('returns defaults when file does not exist', () => {
-    // Simulate reading from non-existent file
-    const defaults = {
-      serialPort: 'COM3',
-      serialBaud: 115200,
-      pgnFilter: [128259, 129025, 129026, 129029, 127250, 130306, 130310, 127257, 129284],
-      dataDirectory: '~/n2k-race-logger/races/',
-      polarDirectory: '~/n2k-race-logger/polars/',
-    };
-    expect(defaults.serialPort).toBe('COM3');
-    expect(defaults.serialBaud).toBe(115200);
+    const loaded = loadAppSettings();
+    expect(loaded.serialPort).toBe('COM3');
+    expect(loaded.serialBaud).toBe(115200);
+    expect(loaded.tcpHost).toBe('192.168.1.1');
+    expect(loaded.tcpPort).toBe(2000);
+  });
+
+  it('preserves saved critical fields when migrating older settings', () => {
+    writeSettings({
+      serialPort: 'COM9',
+      dataDirectory: '/custom/races',
+      activePolarProfile: 42,
+      sailInventory: [{ id: 'custom', label: 'Custom sail' }],
+    });
+
+    const loaded = loadAppSettings();
+    expect(loaded.dataDirectory).toBe('/custom/races');
+    expect(loaded.activePolarProfile).toBe(42);
+    expect(loaded.sailInventory).toEqual([{ id: 'custom', label: 'Custom sail' }]);
+    expect(loaded.tcpHost).toBe('192.168.1.1'); // defaults fill truly missing new field
+  });
+
+  it('returns last known critical fields and does not rewrite defaults after parse failure', () => {
+    writeSettings({
+      dataDirectory: '/persist/races',
+      activePolarProfile: 7,
+      sailInventory: [{ id: 'j0', label: 'J0' }],
+      tcpHost: '10.0.0.50',
+    });
+    expect(loadAppSettings().dataDirectory).toBe('/persist/races');
+
+    fs.writeFileSync(settingsPath, '{ corrupt json', 'utf-8');
+    const loaded = loadAppSettings();
+
+    expect(loaded._loadError).toMatch(/Failed to load settings/);
+    expect(loaded.dataDirectory).toBe('/persist/races');
+    expect(loaded.activePolarProfile).toBe(7);
+    expect(loaded.sailInventory).toEqual([{ id: 'j0', label: 'J0' }]);
+    expect(fs.readFileSync(settingsPath, 'utf-8')).toBe('{ corrupt json');
+  });
+
+  it('durable save reports failure without updating disk or last-known settings', () => {
+    saveAppSettings({ dataDirectory: '/good/races', sailInventory: [{ id: 'j2', label: 'J2' }] });
+    const before = fs.readFileSync(settingsPath, 'utf-8');
+
+    // Force write/open failure by replacing the settings directory with a file.
+    fs.rmSync(path.dirname(settingsPath), { recursive: true, force: true });
+    fs.writeFileSync(path.dirname(settingsPath), 'not a directory', 'utf-8');
+
+    expect(() => saveAppSettings({ dataDirectory: '/bad/default', sailInventory: [] })).toThrow();
+    fs.rmSync(path.dirname(settingsPath), { force: true });
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(settingsPath, before, 'utf-8');
+    expect(loadAppSettings().dataDirectory).toBe('/good/races');
   });
 });
 

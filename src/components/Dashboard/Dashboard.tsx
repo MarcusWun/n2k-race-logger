@@ -6,6 +6,7 @@ import ConnectionBar from './ConnectionBar';
 import InstrumentTile from './InstrumentTile';
 import GPSTile from './GPSTile';
 import RecordingControls from '../Controls/RecordingControls';
+import { formatWindAngle } from '../../utils/angles';
 
 // Unit conversion constants
 const MS_TO_KTS = 1.94384;
@@ -129,14 +130,14 @@ export default function Dashboard() {
         <InstrumentTile label="STW" metricKey="stw" unit="kts" large />
         <InstrumentTile label="SOG" metricKey="sog" unit="kts" large />
         <InstrumentTile label="TWS" metricKey="tws" unit="kts" large />
-        <InstrumentTile label="TWA" metricKey="twa" unit="°" format={(v) => { const n = v > 180 ? 360 - v : v; const side = v > 180 ? 'P' : 'S'; return `${Math.round(n)}°${side}`; }} large />
+        <InstrumentTile label="TWA" metricKey="twa" unit="°" format={(v) => formatWindAngle(v)} large />
         <InstrumentTile label="Heading" metricKey="heading" unit="°M" format={(v) => `${Math.round(v)}°M`} large />
       </div>
 
       {/* Secondary instruments */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <InstrumentTile label="AWS" metricKey="aws" unit="kts" />
-        <InstrumentTile label="AWA" metricKey="awa" unit="°" format={(v) => `${Math.round(v)}°`} />
+        <InstrumentTile label="AWA" metricKey="awa" unit="°" format={(v) => formatWindAngle(v)} />
         <InstrumentTile label="COG" metricKey="cog" unit="°M" format={(v) => `${Math.round(v)}°M`} />
         <InstrumentTile label="TWD" metricKey="twd" unit="°M" format={(v) => `${Math.round(v)}°M`} />
         <PolarTile />

@@ -3,6 +3,7 @@ import { useAnalysisStore } from '../../store/useAnalysisStore';
 import { getIPC } from '../../ipc';
 import type { DetectedSegment } from '../../types/analysis';
 import { downloadCsv } from '../../utils/download';
+import { formatWindAngle } from '../../utils/angles';
 
 type SortKey = 'startTime' | 'durationS' | 'meanTws' | 'meanTwa' | 'meanStw' | 'percentPolar' | 'sailConfig';
 
@@ -37,7 +38,7 @@ function exportSegmentsCsv(segments: DetectedSegment[], startMs: number): void {
       String(Math.round(seg.durationS)),
       seg.sailConfig || '',
       seg.meanTws.toFixed(1),
-      seg.meanTwa.toFixed(0),
+      formatWindAngle(seg.meanTwa),
       seg.meanStw.toFixed(1),
       seg.percentPolar != null ? `${seg.percentPolar}%` : '',
       seg.stdTws.toFixed(2),
@@ -143,7 +144,7 @@ export default function SegmentList() {
                 <td className="px-2 py-1.5 text-gray-300">{Math.round(seg.durationS)}s</td>
                 <td className="px-2 py-1.5 text-gray-300">{seg.sailConfig || '—'}</td>
                 <td className="px-2 py-1.5 text-gray-300">{seg.meanTws.toFixed(1)}</td>
-                <td className="px-2 py-1.5 text-gray-300">{seg.meanTwa.toFixed(0)}°</td>
+                <td className="px-2 py-1.5 text-gray-300">{formatWindAngle(seg.meanTwa)}</td>
                 <td className="px-2 py-1.5 text-gray-300">{seg.meanStw.toFixed(1)}</td>
                 <td className={`px-2 py-1.5 font-medium ${percentColor(seg.percentPolar)}`}>
                   {seg.percentPolar != null ? `${seg.percentPolar}%` : '—'}

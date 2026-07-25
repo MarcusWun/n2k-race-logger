@@ -17,6 +17,7 @@ import { sendDebugData } from './main';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
+import { loadAppSettings, saveAppSettings, DEFAULT_SOURCE_PREFERENCES } from './settings-store';
 
 // PGN names for debug display (extended set — includes PGNs beyond the default filter)
 const PGN_DISPLAY_NAMES: Record<number, string> = {
@@ -110,79 +111,6 @@ let recordingRecordCount = 0;
 // Cached source preferences — loaded at startup and updated on settings:set.
 // Avoids disk reads in the hot PGN event path.
 let cachedSourcePreferences: Record<number, number> = {};
-
-// Settings file path
-function getSettingsPath(): string {
-  return path.join(
-    process.env.APPDATA || path.join(os.homedir(), '.config'),
-    'n2k-race-logger',
-    'settings.json',
-  );
-}
-
-const DEFAULT_SOURCE_PREFERENCES: Record<number, number> = { 130306: 16 };
-
-const DEFAULT_SETTINGS: Record<string, any> = {
-  serialPort: 'COM3',
-  serialBaud: 115200,
-  pgnFilter: [128259, 129025, 129026, 129029, 127250, 130306, 130310, 127257, 129284],
-  sourcePreferences: { ...DEFAULT_SOURCE_PREFERENCES },
-  dataDirectory: path.join(os.homedir(), 'n2k-race-logger', 'races'),
-  polarDirectory: path.join(os.homedir(), 'n2k-race-logger', 'polars'),
-  activePolarProfile: undefined,
-  connectionMode: 'serial',
-  tcpHost: '192.168.1.1',
-  tcpPort: 2000,
-  sailInventory: [
-    { id: 'j1-main', label: 'J1 + Main' },
-    { id: 'j2-main', label: 'J2 + Main' },
-    { id: 'j3-main', label: 'J3 + Main' },
-    { id: 'a2-main', label: 'A2 + Main' },
-    { id: 'a3-main', label: 'A3 + Main' },
-    { id: 'j2-reef1', label: 'J2 + Main + 1 reef' },
-    { id: 'j3-reef1', label: 'J3 + Main + 1 reef' },
-  ],
-};
-
-// Load app settings
-// Returns settings object; sets _loadError on the returned object if settings file is corrupt.
-function loadAppSettings(): Record<string, any> {
-  const sp = getSettingsPath();
-  try {
-    if (!fs.existsSync(sp)) {
-      // Expected on first run — silent fallback to defaults
-      return { ...DEFAULT_SETTINGS, sourcePreferences: { ...DEFAULT_SOURCE_PREFERENCES } };
-    }
-    const raw = fs.readFileSync(sp, 'utf-8');
-    let saved: Record<string, any>;
-    try {
-      saved = JSON.parse(raw);
-    } catch (parseErr) {
-      console.error('[IPC] settings.json is corrupt (JSON parse failure):', parseErr);
-      return { ...DEFAULT_SETTINGS, sourcePreferences: { ...DEFAULT_SOURCE_PREFERENCES }, _loadError: 'Settings file is corrupt and could not be read. Defaults have been applied.' };
-    }
-    // Merge with defaults so newly-added fields get their defaults when an old
-    // settings.json (from a previous build) is loaded.
-    return {
-      ...DEFAULT_SETTINGS,
-      ...saved,
-      sourcePreferences: saved.sourcePreferences ?? { ...DEFAULT_SOURCE_PREFERENCES },
-    };
-  } catch (err) {
-    console.error('[IPC] Failed to load settings:', err);
-    return { ...DEFAULT_SETTINGS, sourcePreferences: { ...DEFAULT_SOURCE_PREFERENCES }, _loadError: 'Failed to read settings file. Defaults have been applied.' };
-  }
-}
-
-// Save app settings — throws on failure so callers can report the error to the renderer.
-function saveAppSettings(settings: Record<string, any>): void {
-  const sp = getSettingsPath();
-  const dir = path.dirname(sp);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-  fs.writeFileSync(sp, JSON.stringify(settings, null, 2), 'utf-8');
-}
 
 // Get the BrowserWindow's webContents to send IPC events to renderer
 import { BrowserWindow } from 'electron';
@@ -278,7 +206,8 @@ export function registerIPCHandlers(): void {
       await serialManager!.connect(payload as any);
       return { success: true };
     } catch (err: any) {
-      return { success: false, error: err?.message || 'Connection failed' };
+      const status = serialManager!.getStatus();
+      return { success: false, error: err?.message || 'Connection failed', status };
     }
   });
 
@@ -434,6 +363,11 @@ export function registerIPCHandlers(): void {
   // --- settings:set ---
   ipcMain.handle('settings:set', async (_event, payload: Record<string, any>) => {
     const settings = loadAppSettings();
+    if (settings._loadError) {
+      const error = settings._loadError;
+      getWebContents()?.send('settings:error', { error });
+      return { success: false, error, settings };
+    }
     // Strip internal error flag before merging
     const { _loadError: _ignored, ...cleanSettings } = settings;
     const updated = { ...cleanSettings, ...payload };
@@ -441,7 +375,9 @@ export function registerIPCHandlers(): void {
       saveAppSettings(updated);
     } catch (err: any) {
       console.error('[IPC] settings:set — write failed:', err);
-      return { success: false, error: err?.message || 'Failed to write settings file' };
+      const error = err?.message || 'Failed to write settings file';
+      getWebContents()?.send('settings:error', { error });
+      return { success: false, error, settings };
     }
 
     // Update cached source preferences immediately
@@ -561,10 +497,12 @@ export function registerIPCHandlers(): void {
       const resampled = {
         tws: resampleToGrid(ts.tws, startMs, endMs),
         twa: resampleToGrid(ts.twa, startMs, endMs),
+        twaSide: ts.twaSide,
         twd: resampleToGrid(ts.twd, startMs, endMs),
         stw: resampleToGrid(ts.stw, startMs, endMs),
         aws: resampleToGrid(ts.aws, startMs, endMs),
         awa: resampleToGrid(ts.awa, startMs, endMs),
+        awaSide: ts.awaSide,
         heading: resampleToGrid(ts.heading, startMs, endMs),
         sog: resampleToGrid(ts.sog, startMs, endMs),
         cog: resampleToGrid(ts.cog, startMs, endMs),

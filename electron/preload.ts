@@ -63,6 +63,7 @@ const api = {
       'polar:data',
       'polar:performance',
       'sources:discovered',
+      'settings:error',
       'analysis:data',
       'analysis:segments',
       'races:files',

@@ -43,6 +43,22 @@ Shipped time ruler, TWA normalization, CSV/PDF exports, settings error handling 
 ### Incremental Update — 2026-07-17
 Shipped day/night toggle (CSS vars + Zustand), TWA normalized to 0-180° P/S, CI branch fix master→main.
 
+### Current Task — 2026-07-29: Dashboard Polar Performance Bugfix
+Marcus reported that while connected to the B&G system under sail, all dashboard values look correct except `% Polar`, which always shows `0%`.
+
+Approved scope:
+1. Load/confirm the active polar profile for dashboard live calculations.
+2. Recompute live polar performance when STW/TWS/TWA updates by invoking `polar:performance` with current values and active profile ID.
+3. Normalize live dashboard TWA to the polar table's 0-180 degree range before lookup and live polar dot rendering.
+4. Render `--` when required inputs/profile are missing instead of misleading `0%`.
+5. Add/adjust regression tests for dashboard polar calculation wiring and TWA normalization.
+
+Initial CTO investigation:
+- `Dashboard.tsx` subscribes to `polar:performance` events and renders `usePolarStore().performance`, but there is no visible live dashboard request to `ipc.getPerformance(...)`.
+- `ipc-handlers.ts` computes performance only when `polar:performance` is invoked, then emits the result back to the renderer.
+- Dashboard `computeTrueWind()` can store TWA as 0-360 degrees, while the polar table and renderer expect normalized 0-180 degrees.
+- Relevant files: `src/components/Dashboard/Dashboard.tsx`, `src/components/PolarView/PolarDiagram.tsx`, `src/store/usePolarStore.ts`, `electron/ipc-handlers.ts`, `electron/polar-engine.ts`, `src/utils/angles.ts`.
+
 ### Current Task — 2026-07-23: Three Bug Fixes
 Three issues reported by Marcus from boat use. Implement all three, QA, then commit and push to trigger build.
 
@@ -83,13 +99,14 @@ Note: The store only needs to persist the UI-side fields across tab navigation �
 3. In `electron/ipc-handlers.ts` / `serial-manager.ts`, defensively strip trailing dot from host before calling `socket.connect()`
 
 ### Last Completed Step
-2026-07-23 — CTO updated orchestrator with three bug fix tasks. Spawning implementation agent.
+2026-07-29 12:48 EDT — Dashboard `% Polar` bugfix implemented. Dashboard now loads the active polar profile, requests live `polar:performance` when STW/TWS/TWA/profile changes, normalizes live TWA before lookup/dot rendering, shows `--` for missing inputs/profile, and has regression coverage. Verification passed: `npm exec vitest run electron/phase-2-3-frontend.test.ts`, `npm run test:run`, `npm exec tsc -- --noEmit`, `npm run build`.
 
 ### Agent Status Log
 | Timestamp (UTC) | Agent | Action | Result | Notes |
 |-----------------|-------|--------|--------|-------|
 | 2026-06-01 21:03 | — | PRD parsed, tasks broken down | — | Electron desktop app, not web app |
 | 2026-06-13 15:25 | CTO | Reset orchestrator state | — | Phase 1 complete, incremental update mode |
+| 2026-07-29 16:48 | Orchestrator | Dashboard polar performance bugfix | ✅ Complete | Active profile loaded, live calculation wired, TWA normalized, missing inputs render `--`, tests/build passed |
 
 ### QA Failure Log
 | Timestamp (UTC) | Gate | Failure Summary | Returned To | Resolved |

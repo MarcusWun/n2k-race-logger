@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { formatWindAngle, normalizedWindAngleValue } from '../src/utils/angles';
+import { EMPTY_POLAR_PERFORMANCE, prepareLivePolarPerformancePayload, requestLivePolarPerformance } from '../src/utils/livePolarPerformance';
 import { sanitizeTcpHost, validateTcpTarget } from '../src/utils/tcp';
 
 describe('Phase 2.3 frontend AWA/TWA normalization', () => {
@@ -14,6 +15,48 @@ describe('Phase 2.3 frontend AWA/TWA normalization', () => {
     expect(normalizedWindAngleValue(315)).toBe(45);
     expect(normalizedWindAngleValue(270)).toBe(90);
     expect(normalizedWindAngleValue(181)).toBe(179);
+  });
+
+  it('normalizes dashboard live polar requests before lookup', () => {
+    expect(prepareLivePolarPerformancePayload(
+      { stw: 6, tws: 12, twa: 315 },
+      7,
+    )).toEqual({ stw: 6, tws: 12, twa: 45, profileId: 7 });
+  });
+
+  it('does not request dashboard live polar performance without required inputs or profile', async () => {
+    const calls: unknown[] = [];
+    const updates: unknown[] = [];
+
+    const payload = await requestLivePolarPerformance(
+      { getPerformance: async (request) => { calls.push(request); return { percentPolar: 100, targetSpeed: 6, actualSpeed: 6 }; } },
+      { stw: 6, tws: null, twa: 90 },
+      7,
+      (performance) => updates.push(performance),
+    );
+
+    expect(payload).toBeNull();
+    expect(calls).toHaveLength(0);
+    expect(updates).toEqual([EMPTY_POLAR_PERFORMANCE]);
+  });
+
+  it('invokes dashboard live polar performance when STW/TWS/TWA and active profile are present', async () => {
+    const calls: unknown[] = [];
+    const updates: unknown[] = [];
+
+    const payload = await requestLivePolarPerformance(
+      { getPerformance: async (request) => {
+        calls.push(request);
+        return { percentPolar: 94, targetSpeed: 6.4, actualSpeed: 6 };
+      } },
+      { stw: 6, tws: 12, twa: 90 },
+      7,
+      (performance) => updates.push(performance),
+    );
+
+    expect(payload).toEqual({ stw: 6, tws: 12, twa: 90, profileId: 7 });
+    expect(calls).toEqual([payload]);
+    expect(updates).toEqual([{ percentPolar: 94, targetSpeed: 6.4, actualSpeed: 6 }]);
   });
 });
 

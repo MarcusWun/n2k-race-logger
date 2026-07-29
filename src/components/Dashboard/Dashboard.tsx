@@ -7,6 +7,9 @@ import InstrumentTile from './InstrumentTile';
 import GPSTile from './GPSTile';
 import RecordingControls from '../Controls/RecordingControls';
 import { formatWindAngle } from '../../utils/angles';
+import { EMPTY_POLAR_PERFORMANCE, requestLivePolarPerformance } from '../../utils/livePolarPerformance';
+import type { AppSettings } from '../../types/ipc';
+import type { BoatProfile } from '../../types/polar';
 
 // Unit conversion constants
 const MS_TO_KTS = 1.94384;
@@ -27,6 +30,92 @@ export default function Dashboard() {
   const setMetric = useN2KStore((s) => s.setMetric);
   const updateLastUpdated = useN2KStore((s) => s.updateLastUpdated);
   const setPerformance = usePolarStore((s) => s.setPerformance);
+  const activeProfileId = usePolarStore((s) => s.activeProfileId);
+  const setProfiles = usePolarStore((s) => s.setProfiles);
+  const setActiveProfile = usePolarStore((s) => s.setActiveProfile);
+  const setPolarData = usePolarStore((s) => s.setPolarData);
+
+  useEffect(() => {
+    const ipc = getIPC();
+    if (!ipc) return;
+    const bridge = ipc;
+
+    let cancelled = false;
+    async function loadActivePolarProfile() {
+      const [settings, profiles] = await Promise.all([
+        bridge.getSettings() as Promise<AppSettings>,
+        bridge.listPolars() as Promise<BoatProfile[]>,
+      ]);
+      if (cancelled || !Array.isArray(profiles)) return;
+
+      setProfiles(profiles);
+      const settingsProfileId = settings?.activePolarProfile ?? null;
+      const requestedProfileId = activeProfileId ?? settingsProfileId;
+      const activeProfile = profiles.find((profile) => profile.id === requestedProfileId) ?? profiles[0] ?? null;
+
+      if (!activeProfile) {
+        setActiveProfile(null);
+        setPerformance(EMPTY_POLAR_PERFORMANCE);
+        return;
+      }
+
+      setActiveProfile(activeProfile.id);
+      const result = await bridge.getPolar({ id: activeProfile.id });
+      if (!cancelled && result?.success && result.polarData) {
+        setPolarData(result.polarData);
+      }
+    }
+
+    loadActivePolarProfile().catch(() => {
+      if (!cancelled) setPerformance(EMPTY_POLAR_PERFORMANCE);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProfileId, setActiveProfile, setPerformance, setPolarData, setProfiles]);
+
+  useEffect(() => {
+    const ipc = getIPC();
+    if (!ipc) return;
+
+    let requestId = 0;
+    const recompute = () => {
+      const n2kState = useN2KStore.getState();
+      const profileId = usePolarStore.getState().activeProfileId;
+      const currentRequestId = ++requestId;
+      void requestLivePolarPerformance(
+        ipc,
+        { stw: n2kState.stw, tws: n2kState.tws, twa: n2kState.twa },
+        profileId,
+        (performance) => {
+          if (currentRequestId === requestId) setPerformance(performance);
+        },
+      );
+    };
+
+    recompute();
+    const unsubN2K = useN2KStore.subscribe((state, previousState) => {
+      if (
+        state.stw !== previousState.stw ||
+        state.tws !== previousState.tws ||
+        state.twa !== previousState.twa
+      ) {
+        recompute();
+      }
+    });
+    const unsubPolar = usePolarStore.subscribe((state, previousState) => {
+      if (state.activeProfileId !== previousState.activeProfileId) {
+        recompute();
+      }
+    });
+
+    return () => {
+      requestId++;
+      unsubN2K();
+      unsubPolar();
+    };
+  }, [setPerformance]);
 
   useEffect(() => {
     const ipc = getIPC();
@@ -169,7 +258,7 @@ function PolarTile() {
     <div className="bg-n2k-surface rounded-lg p-4 flex flex-col items-center justify-center">
       <span className="text-xs text-gray-500 uppercase tracking-wider mb-1">% Polar</span>
       <span className={`text-2xl font-mono font-bold ${colorClass}`}>
-        {val !== null ? `${val}%` : '—'}
+        {val !== null ? `${val}%` : '--'}
       </span>
       <span className="text-xs text-gray-600 mt-1">performance</span>
     </div>

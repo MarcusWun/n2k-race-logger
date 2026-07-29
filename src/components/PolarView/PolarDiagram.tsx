@@ -2,6 +2,7 @@ import React, { useRef, useEffect } from 'react';
 import type { PolarData } from '../../types/polar';
 import { usePolarStore } from '../../store/usePolarStore';
 import { useN2KStore } from '../../store/useN2KStore';
+import { normalizedWindAngleValue } from '../../utils/angles';
 
 interface PolarDiagramProps {
   polarData: PolarData | null;
@@ -36,6 +37,7 @@ export default function PolarDiagram({ polarData }: PolarDiagramProps) {
   const performance = usePolarStore((s) => s.performance);
   const twa = useN2KStore((s) => s.twa);
   const stw = useN2KStore((s) => s.stw);
+  const normalizedTwa = twa !== null ? normalizedWindAngleValue(twa) : null;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -158,8 +160,8 @@ export default function PolarDiagram({ polarData }: PolarDiagramProps) {
     });
 
     // Draw live performance dot
-    if (twa !== null && stw !== null && twa > 0) {
-      const pt = polarToCanvas(cx, cy, twa, stw, scale);
+    if (normalizedTwa !== null && stw !== null && normalizedTwa > 0) {
+      const pt = polarToCanvas(cx, cy, normalizedTwa, stw, scale);
 
       let dotColor = '#ffffff';
       if (performance.percentPolar !== null) {
@@ -176,7 +178,7 @@ export default function PolarDiagram({ polarData }: PolarDiagramProps) {
       ctx.lineWidth = 2;
       ctx.stroke();
     }
-  }, [polarData, twa, stw, performance]);
+  }, [polarData, normalizedTwa, stw, performance]);
 
   return (
     <canvas

@@ -2,6 +2,14 @@
 
 Track recurring defects, root causes, regression coverage, and verification evidence.
 
+## Dashboard polar performance stuck at 0% (2026-07-29)
+
+- Reproduction: while connected to the B&G N2K system, STW/TWS/TWA dashboard values updated correctly but `% Polar` stayed at `0%`.
+- Root cause: Dashboard only listened for `polar:performance` events; it did not load the active profile or invoke `polar:performance` when live STW/TWS/TWA changed. Live port-side TWA could also remain in raw 0-360 degree form, outside the polar table's 0-180 degree lookup range.
+- Fix: Dashboard now loads the saved active polar profile, recomputes live performance when STW/TWS/TWA/profile changes, normalizes TWA before lookup and live polar dot rendering, and clears the tile to `--` when inputs/profile are missing.
+- Regression coverage: frontend utility tests cover missing-input suppression, live IPC payload generation, and port-side TWA normalization before dashboard polar lookup.
+- Verification: `npm exec vitest run electron/phase-2-3-frontend.test.ts`, `npm run test:run`, `npm exec tsc -- --noEmit`, and `npm run build` passed.
+
 ## Phase 2.3 — Reliability fixes (2026-07-25)
 
 ### AWA displayed/analyzed as raw 0–360°

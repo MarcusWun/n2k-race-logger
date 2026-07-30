@@ -2,7 +2,7 @@
 
 **App name:** `n2k-race-logger`
 **Author:** CTO Agent
-**Status:** Approved 2026-06-01
+**Status:** Approved 2026-06-01 | Updated 2026-07-29
 **Date:** 2026-06-01
 
 ---
@@ -11,8 +11,12 @@
 
 A Windows desktop application that logs racing sailboat performance data from NMEA 2000 instrument networks via an Actisense NGT-1 serial gateway, stores it locally in SQLite, displays live instrument readings in a real-time dashboard, and provides post-race analysis tools for sail performance assessment against imported polar diagrams.
 
-- **Phase 1 (shipped):** Live connection, dashboard, recording, polar diagram, debug window.
-- **Phase 2:** Post-race analysis — race browser, strip charts, steady-state segment detection, sail tagging, and measured polar overlay for sail performance assessment.
+- **Phase 1 (shipped 2026-06-01):** Live connection, dashboard, recording, polar diagram, debug window.
+- **Phase 2 (shipped 2026-06-17, build #35):** Post-race analysis — race browser, strip charts, steady-state segment detection, sail tagging, and measured polar overlay for sail performance assessment.
+- **Phase 2.1 (shipped 2026-07-17, build #36):** Day/night theme toggle; TWA display normalization (0–180° with port/starboard indicator).
+- **Phase 2.2 (shipped 2026-07-23, build #38):** Settings persistence fix (field migration on load); connection state persisted across tab navigation; TCP host trailing-dot sanitization.
+- **Phase 2.3 (approved 2026-07-25):** Reliability fixes — normalize AWA everywhere, make settings persistence fail-safe for data directory / active polar profile / sail inventory, and diagnose/fix TCP connection failure including malformed/truncated host handling for reported `192.168.1:2000`.
+- **Phase 2.4 (approved 2026-07-29):** Formatted Excel race-analysis export for performance summary and segment tables, while preserving existing CSV export.
 
 **Target user:** Marcus — competitive harbor/offshore racer with an NMEA 2000 instrument network on board.
 
@@ -372,6 +376,51 @@ The payoff — aggregate detected segments into a clear picture of how each sail
 - Click a segment to jump to that time range in the strip charts
 - Segments can be manually excluded (e.g., if the user knows conditions were unusual) — excluded segments are dimmed and omitted from the polar overlay and summary table
 - Sort by any column
+
+### 4.12 Formatted Excel Export (Phase 2.4)
+
+Add a formatted `.xlsx` export option for post-race analysis tables while keeping the existing CSV exports unchanged.
+
+**Rationale:**
+- CSV remains useful for raw data exchange, but it cannot preserve table formatting, column widths, frozen headers, filters, color coding, number formats, or multiple worksheets.
+- Excel export should reduce manual cleanup when Marcus opens race-analysis output for review.
+
+**Export surfaces:**
+- Add an `Export Excel` button next to the existing `Export CSV` button in the Performance Summary view.
+- Add an `Export Excel` button next to the existing `Export CSV` button in the Segment List view.
+- Existing CSV export behavior must not change.
+
+**Performance Summary workbook:**
+- Generate a single `.xlsx` workbook containing the current performance summary table.
+- Preserve the current rows by sail configuration and the current TWS/TWA band layout.
+- Use readable grouped headers for TWS bands and TWA sub-bands.
+- Include overall average %, segment count, and coverage columns.
+- Apply the same green/yellow/red `% Polar` thresholds used in the app:
+  - Green: ≥100%
+  - Yellow: 90–99%
+  - Red: <90%
+- Empty cells remain blank or display `—` consistently.
+
+**Segment List workbook:**
+- Generate a single `.xlsx` workbook containing the currently sorted segment list.
+- Include: start time, duration, sail configuration, TWS, TWA, STW, `% Polar`, standard deviation values, and excluded status.
+- TWA values must use the already-normalized 0–180° port/starboard convention where applicable.
+- Excluded rows should be visually distinguishable without removing them from the export.
+
+**Workbook formatting requirements:**
+- Frozen header row.
+- Auto-filter enabled.
+- Bold header styling.
+- Sensible column widths.
+- Numeric formats for knots, degrees, seconds, and percentages.
+- Timestamp / elapsed-time values formatted for human review.
+- Offline generation inside the Electron desktop app; no cloud dependency.
+- Use an open-source Excel writer library such as `exceljs` or an equivalent library appropriate for Electron + Vite.
+
+**Testing requirements:**
+- Add tests for workbook generation from representative performance-summary and segment-list data.
+- Tests must verify sheet names, headers, key column order, numeric value preservation, number formats, and `% Polar` threshold styling behavior.
+- Existing CSV export tests/behavior must continue to pass.
 
 ---
 
@@ -775,7 +824,7 @@ n2k-race-logger/
 ### Out of scope for Phase 2
 - **Track visualization on map** (Phase 3 — requires GPS track rendering on OpenStreetMap tiles)
 - **Color-coded track segments by % of polar** (Phase 3 — requires track visualization)
-- **CSV/data export** (Phase 3)
+- ~~CSV/data export~~ → delivered as CSV/PDF export in build #37; Phase 2.4 adds formatted Excel export for race-analysis tables
 - **VMG computation** (Phase 3)
 - **Auto-derived polar from logged data** (Phase 3 — generate a complete measured polar table from accumulated segments across multiple recordings)
 - **Race comparison / overlay** (Phase 4 — compare strip charts or polars from two different recordings side by side)
@@ -823,3 +872,4 @@ All resolved — see §17.
 24. **Custom Canvas strip charts** — HTML5 Canvas is used for strip charts rather than a charting library (Chart.js, D3, etc.). Recordings may contain 10,000+ data points per metric; Canvas handles this without DOM bloat. The charts are simple line plots with zoom/pan — no need for a heavy library. Added 2026-06-16.
 25. **Analysis runs in main process** — Segment detection, data reconstruction, and performance aggregation run in the Electron main process (not renderer). SQLite reads are synchronous via better-sqlite3, and the computation is CPU-bound. Results are sent to the renderer via IPC. For very large recordings, consider a worker thread in the future. Added 2026-06-16.
 26. **Live dashboard polar performance wiring fix** — Marcus reported that the dashboard shows correct live N2K numbers while sailing, except `% Polar` always shows `0%`. The approved bugfix is to wire the dashboard live data path to request `polar:performance` calculations from the Electron main process whenever valid STW/TWS/TWA and an active polar profile are available. The fix must normalize live TWA to the polar table's 0-180 degree range before lookup, load/confirm the active polar profile for dashboard use, render `--` when required inputs/profile are missing rather than a misleading `0%`, and add regression coverage for dashboard polar calculation wiring and TWA normalization. Approved 2026-07-29.
+27. **Formatted Excel export approved** — Marcus approved adding `.xlsx` export alongside existing CSV export for race-analysis tables because CSV cannot preserve readable table formatting. Scope is limited to Performance Summary and Segment List exports with frozen headers, filters, widths, numeric formats, `% Polar` color thresholds, and offline generation inside the Electron app. CSV export remains unchanged. Added 2026-07-29.

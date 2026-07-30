@@ -2,6 +2,14 @@
 
 Track recurring defects, root causes, regression coverage, and verification evidence.
 
+## Phase 2.4 Excel export production audit failure (2026-07-30)
+
+- Reproduction: `npm audit --omit=dev` failed during QA Gate 2 after adding formatted Excel export support, initially attributed to the Excel writer dependency and vulnerable production transitive packages.
+- Root cause: The first Excel implementation used a large workbook writer dependency surface. The corrected implementation replaces that with a local offline XLSX package writer backed only by `fflate`; after removing `exceljs`, the remaining production audit finding was an unused legacy MQTT helper chain pulled in by `@canboat/canboatjs`.
+- Fix: Keep the approved Excel export UI and workbook behavior, remove the Excel writer dependency surface, use the focused local workbook serializer in `src/utils/excelExport.ts`, and add an npm `mqtt` override so `@canboat/canboatjs` stays current while `npm audit --omit=dev` reports no production vulnerabilities.
+- Regression coverage: `electron/phase-2-4-excel-export.test.ts` covers workbook sheet names, grouped headers, key column order, numeric preservation, number formats, `% Polar` threshold styling, XLSX package serialization, visually distinct excluded rows, and CSV regression safety.
+- Prevention: New production dependencies used for renderer exports must pass `npm audit --omit=dev`; prefer narrow, auditable utilities over broad file-format libraries when the required workbook behavior is small and covered by tests.
+
 ## Dashboard polar performance stuck at 0% (2026-07-29)
 
 - Reproduction: while connected to the B&G N2K system, STW/TWS/TWA dashboard values updated correctly but `% Polar` stayed at `0%`.

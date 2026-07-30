@@ -4,6 +4,7 @@ import { getIPC } from '../../ipc';
 import type { DetectedSegment } from '../../types/analysis';
 import { downloadCsv } from '../../utils/download';
 import { formatWindAngle } from '../../utils/angles';
+import { buildSegmentsCsv } from '../../utils/csvExport';
 
 type SortKey = 'startTime' | 'durationS' | 'meanTws' | 'meanTwa' | 'meanStw' | 'percentPolar' | 'sailConfig';
 
@@ -23,34 +24,8 @@ function percentColor(val: number | null): string {
 }
 
 function exportSegmentsCsv(segments: DetectedSegment[], startMs: number): void {
-  const headers = ['Start Time', 'Duration (s)', 'Sail Config', 'TWS (kts)', 'TWA (°)', 'STW (kts)', '% Polar', 'σ TWS', 'σ TWA', 'σ STW', 'Excluded'];
-  const rows: string[][] = [headers];
-
-  for (const seg of segments) {
-    const ms = new Date(seg.startTime).getTime();
-    const elapsed = Math.floor((ms - startMs) / 1000);
-    const m = Math.floor(elapsed / 60);
-    const s = elapsed % 60;
-    const startLabel = `${m}:${String(s).padStart(2, '0')}`;
-
-    rows.push([
-      startLabel,
-      String(Math.round(seg.durationS)),
-      seg.sailConfig || '',
-      seg.meanTws.toFixed(1),
-      formatWindAngle(seg.meanTwa),
-      seg.meanStw.toFixed(1),
-      seg.percentPolar != null ? `${seg.percentPolar}%` : '',
-      seg.stdTws.toFixed(2),
-      seg.stdTwa.toFixed(1),
-      seg.stdStw.toFixed(2),
-      seg.excluded ? 'Yes' : 'No',
-    ]);
-  }
-
-  const csv = rows.map((r) => r.map((v) => `"${v.replace(/"/g, '""')}"`).join(',')).join('\n');
   const date = new Date().toISOString().slice(0, 10);
-  downloadCsv(`n2k-segments-${date}.csv`, csv);
+  downloadCsv(`n2k-segments-${date}.csv`, buildSegmentsCsv(segments, startMs));
 }
 
 export default function SegmentList() {
@@ -104,12 +79,22 @@ export default function SegmentList() {
   return (
     <div>
       {sorted.length > 0 && (
-        <div className="flex justify-end mb-1">
+        <div className="flex justify-end gap-2 mb-1">
           <button
             onClick={() => exportSegmentsCsv(sorted, startMs)}
             className="px-3 py-1 rounded text-xs bg-gray-700 hover:bg-gray-600 text-white"
           >
             Export CSV
+          </button>
+          <button
+            onClick={() => {
+              void import('../../utils/excelExport').then(({ exportSegmentListExcel }) =>
+                exportSegmentListExcel(sorted, startMs),
+              );
+            }}
+            className="px-3 py-1 rounded text-xs bg-gray-700 hover:bg-gray-600 text-white"
+          >
+            Export Excel
           </button>
         </div>
       )}

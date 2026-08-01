@@ -35,27 +35,19 @@ export default function PolarView() {
   }, [activeProfileId, setPolarData]);
 
   const handleImport = async () => {
+    const ipc = getIPC();
+    if (!ipc) return;
     setImporting(true);
     try {
-      // In Electron we'd use dialog.showOpenDialog via IPC
-      // For now, trigger via a hidden file input
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = '.pol,.csv,.txt';
-      input.onchange = async (e) => {
-        const file = (e.target as HTMLInputElement).files?.[0];
-        if (!file) return;
-        const ipc = getIPC();
-        if (!ipc) return;
-        const result = await ipc.importPolar({ filePath: (file as any).path || file.name });
-        if (result?.success && result.profile) {
-          const list = await ipc.listPolars();
-          if (Array.isArray(list)) setProfiles(list);
-          setActiveProfile(result.profile.id);
-          await ipc.setSettings({ activePolarProfile: result.profile.id });
-        }
-      };
-      input.click();
+      const dialogResult = await ipc.openPolarDialog();
+      if (dialogResult?.canceled) return;
+      const result = await ipc.importPolar({ filePath: dialogResult.filePath });
+      if (result?.success && result.profile) {
+        const list = await ipc.listPolars();
+        if (Array.isArray(list)) setProfiles(list);
+        setActiveProfile(result.profile.id);
+        await ipc.setSettings({ activePolarProfile: result.profile.id });
+      }
     } finally {
       setImporting(false);
     }

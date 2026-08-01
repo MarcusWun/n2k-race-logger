@@ -22,6 +22,7 @@ const api = {
   getRecordingStatus: () => ipcRenderer.invoke('recording:status'),
 
   // Polar
+  openPolarDialog: () => ipcRenderer.invoke('polar:open-dialog'),
   importPolar: (payload: { filePath: string }) =>
     ipcRenderer.invoke('polar:import', payload),
   listPolars: () => ipcRenderer.invoke('polar:list'),

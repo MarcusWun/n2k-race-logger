@@ -296,6 +296,23 @@ export function registerIPCHandlers(): void {
     };
   });
 
+  // --- polar:open-dialog ---
+  ipcMain.handle('polar:open-dialog', async () => {
+    const result = await dialog.showOpenDialog({
+      title: 'Import Polar File',
+      filters: [
+        { name: 'Polar Files', extensions: ['pol', 'csv', 'txt'] },
+        { name: 'POL Polar', extensions: ['pol'] },
+        { name: 'CSV Polar', extensions: ['csv'] },
+        { name: 'Expedition Polar', extensions: ['txt'] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+      properties: ['openFile'],
+    });
+    if (result.canceled || result.filePaths.length === 0) return { canceled: true };
+    return { canceled: false, filePath: result.filePaths[0] };
+  });
+
   // --- polar:import ---
   ipcMain.handle('polar:import', async (_event, payload: { filePath: string }) => {
     if (!payload?.filePath) return { success: false, error: 'No file path provided' };

@@ -39,7 +39,7 @@ export default function PolarView() {
       // For now, trigger via a hidden file input
       const input = document.createElement('input');
       input.type = 'file';
-      input.accept = '.pol,.csv';
+      input.accept = '.pol,.csv,.txt';
       input.onchange = async (e) => {
         const file = (e.target as HTMLInputElement).files?.[0];
         if (!file) return;
@@ -81,7 +81,7 @@ export default function PolarView() {
           disabled={importing}
           className="ml-auto px-4 py-1 rounded text-sm font-medium bg-n2k-accent hover:bg-cyan-400 text-black"
         >
-          {importing ? 'Importing...' : 'Import .pol / .csv'}
+          {importing ? 'Importing...' : 'Import .pol / .csv / .txt'}
         </button>
       </div>
 

@@ -212,6 +212,29 @@ export class PolarEngine {
   }
 
   /**
+   * Import an Expedition .txt polar file.
+   * Expedition format: comment lines start with '!'; each data line has
+   * TWS as the first token, followed by interleaved [TWA, BSP] pairs.
+   */
+  importExpeditionFile(filePath: string, name: string, hullType = 'monohull'): BoatProfile | null {
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const table = this.parseExpeditionContent(content);
+      if (!table) return null;
+
+      // Copy file to polar directory
+      const ext = path.extname(filePath) || '.txt';
+      const destPath = path.join(this.polarDirectory, `${name.replace(/[^a-zA-Z0-9_-]/g, '_')}${ext}`);
+      fs.copyFileSync(filePath, destPath);
+
+      return this.addProfile({ name, hullType, polarData: table });
+    } catch (err) {
+      console.error('[PolarEngine] Failed to import Expedition file:', err);
+      return null;
+    }
+  }
+
+  /**
    * Parse .pol file content into a PolarTable.
    * Format: First line: TWS values separated by whitespace.
    * Subsequent lines: TWA value followed by speed values.
@@ -288,6 +311,115 @@ export class PolarEngine {
     if (twaValues.length === 0) return null;
 
     return { tws: twsValues, twa: twaValues, speeds };
+  }
+
+  /**
+   * Parse Expedition .txt polar content into a PolarTable.
+   *
+   * Expedition format:
+   *   !comment                    ← skip
+   *   4 0 0 46.11 3.67 52 3.99    ← TWS=4, then [TWA BSP] pairs
+   *   6 0 0 43.118 4.95 52 5.49   ← TWS=6
+   *
+   * The (TWA=0, BSP=0) pair is a sentinel meaning "cannot sail dead
+   * upwind" and is discarded. TWA values vary per row (the VMG angle
+   * shifts with wind speed), so we take the union of all TWA values
+   * across rows as the canonical TWA axis and linearly interpolate
+   * each row onto it. Where a row does not cover a given TWA (outside
+   * that row's min/max known TWA), we clamp BSP to 0.
+   */
+  parseExpeditionContent(content: string): PolarTable | null {
+    const lines = content.split(/\r?\n/);
+
+    interface RawRow {
+      tws: number;
+      points: Array<{ twa: number; bsp: number }>;
+    }
+    const rows: RawRow[] = [];
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      if (line.startsWith('!')) continue;
+
+      const tokens = line.split(/\s+/).map(Number);
+      if (tokens.length < 1 || isNaN(tokens[0])) continue;
+
+      const tws = tokens[0];
+      const rest = tokens.slice(1);
+
+      // Remaining tokens must come in [TWA, BSP] pairs
+      if (rest.length % 2 !== 0) {
+        throw new Error(
+          `Malformed Expedition polar line for TWS=${tws}: expected TWA/BSP pairs, got ${rest.length} tokens after TWS`,
+        );
+      }
+
+      const points: Array<{ twa: number; bsp: number }> = [];
+      for (let i = 0; i < rest.length; i += 2) {
+        const twa = rest[i];
+        const bsp = rest[i + 1];
+        if (isNaN(twa) || isNaN(bsp)) continue;
+        // Sentinel: (TWA=0, BSP=0) means "cannot sail dead upwind" — discard
+        if (twa === 0 && bsp === 0) continue;
+        points.push({ twa, bsp });
+      }
+
+      if (points.length === 0) continue;
+      // Ensure per-row points are sorted by TWA for interpolation
+      points.sort((a, b) => a.twa - b.twa);
+      rows.push({ tws, points });
+    }
+
+    if (rows.length === 0) return null;
+
+    // Sort rows by TWS ascending
+    rows.sort((a, b) => a.tws - b.tws);
+
+    // Collect unique TWA values across all rows
+    const twaSet = new Set<number>();
+    for (const row of rows) {
+      for (const p of row.points) {
+        twaSet.add(p.twa);
+      }
+    }
+    const twaAxis = Array.from(twaSet).sort((a, b) => a - b);
+    if (twaAxis.length === 0) return null;
+
+    // For each row, interpolate BSP at every TWA on the canonical axis
+    const speeds: number[][] = rows.map((row) => {
+      const rowMinTwa = row.points[0].twa;
+      const rowMaxTwa = row.points[row.points.length - 1].twa;
+      return twaAxis.map((targetTwa) => {
+        // Clamp to 0 outside this row's known TWA range
+        if (targetTwa < rowMinTwa || targetTwa > rowMaxTwa) return 0;
+
+        // Exact match?
+        for (const p of row.points) {
+          if (p.twa === targetTwa) return p.bsp;
+        }
+
+        // Linear interpolation between bracketing points
+        let lo = row.points[0];
+        let hi = row.points[row.points.length - 1];
+        for (let i = 0; i < row.points.length - 1; i++) {
+          if (row.points[i].twa <= targetTwa && row.points[i + 1].twa >= targetTwa) {
+            lo = row.points[i];
+            hi = row.points[i + 1];
+            break;
+          }
+        }
+        if (hi.twa === lo.twa) return lo.bsp;
+        const t = (targetTwa - lo.twa) / (hi.twa - lo.twa);
+        return lo.bsp * (1 - t) + hi.bsp * t;
+      });
+    });
+
+    return {
+      tws: rows.map((r) => r.tws),
+      twa: twaAxis,
+      speeds,
+    };
   }
 
   /**

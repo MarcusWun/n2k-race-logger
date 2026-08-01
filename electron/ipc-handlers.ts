@@ -308,6 +308,21 @@ export function registerIPCHandlers(): void {
       profile = polarEngine!.importPolFile(payload.filePath, baseName);
     } else if (ext === '.csv') {
       profile = polarEngine!.importCsvFile(payload.filePath, baseName);
+    } else if (ext === '.txt') {
+      try {
+        profile = polarEngine!.importExpeditionFile(payload.filePath, baseName);
+      } catch (err) {
+        return {
+          success: false,
+          error: `Not a valid Expedition polar file: ${(err as Error).message}`,
+        };
+      }
+      if (!profile) {
+        return {
+          success: false,
+          error: 'Not a valid Expedition polar file (no valid TWS rows found)',
+        };
+      }
     } else {
       return { success: false, error: `Unsupported file type: ${ext}` };
     }

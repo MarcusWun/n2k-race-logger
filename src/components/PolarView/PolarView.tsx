@@ -11,15 +11,17 @@ export default function PolarView() {
   useEffect(() => {
     const ipc = getIPC();
     if (!ipc) return;
-    ipc.listPolars().then((result: BoatProfile[]) => {
-      if (Array.isArray(result)) {
-        setProfiles(result);
-        if (result.length > 0 && activeProfileId === null) {
-          setActiveProfile(result[0].id);
+    Promise.all([ipc.listPolars(), ipc.getSettings()]).then(([profiles, settings]) => {
+      if (Array.isArray(profiles)) {
+        setProfiles(profiles);
+        if (profiles.length > 0) {
+          const savedId = settings?.activePolarProfile ?? null;
+          const savedExists = savedId !== null && profiles.some((p: BoatProfile) => p.id === savedId);
+          setActiveProfile(savedExists ? savedId : profiles[0].id);
         }
       }
     });
-  }, [setProfiles, setActiveProfile, activeProfileId]);
+  }, [setProfiles, setActiveProfile]);
 
   useEffect(() => {
     if (activeProfileId === null) return;
@@ -46,9 +48,11 @@ export default function PolarView() {
         const ipc = getIPC();
         if (!ipc) return;
         const result = await ipc.importPolar({ filePath: (file as any).path || file.name });
-        if (result?.success) {
+        if (result?.success && result.profile) {
           const list = await ipc.listPolars();
           if (Array.isArray(list)) setProfiles(list);
+          setActiveProfile(result.profile.id);
+          await ipc.setSettings({ activePolarProfile: result.profile.id });
         }
       };
       input.click();
@@ -59,6 +63,8 @@ export default function PolarView() {
 
   const handleProfileChange = (id: number) => {
     setActiveProfile(id);
+    const ipc = getIPC();
+    if (ipc) ipc.setSettings({ activePolarProfile: id });
   };
 
   return (

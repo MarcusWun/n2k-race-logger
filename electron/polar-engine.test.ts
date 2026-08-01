@@ -206,14 +206,16 @@ describe('Polar edge cases', () => {
     expect(result.percentPolar).toBeNull();
   });
 
-  it('returns null when TWA is outside polar range (too low)', () => {
+  it('clamps to boundary speed when TWA is below polar min (sailing tighter than VMG)', () => {
+    // TEST_POLAR minTWA=40 — TWA=20 clamps to 40 → returns BSP at TWS=10, TWA=40 = 3.5
     const speed = engine.interpolateSpeed(TEST_POLAR, 10, 20);
-    expect(speed).toBeNull();
+    expect(speed).toBeCloseTo(3.5, 2);
   });
 
-  it('returns null when TWA is outside polar range (too high)', () => {
+  it('clamps to boundary speed when TWA is above polar max', () => {
+    // TEST_POLAR maxTWA=80 — TWA=200 clamps to 80 → returns BSP at TWS=10, TWA=80 = 5.5
     const speed = engine.interpolateSpeed(TEST_POLAR, 10, 200);
-    expect(speed).toBeNull();
+    expect(speed).toBeCloseTo(5.5, 2);
   });
 
   it('returns null when TWS is outside polar range (too low)', () => {
@@ -293,13 +295,13 @@ describe('Expedition polar parsing', () => {
     expect(table.speeds[1][idx90]).toBeCloseTo(6.10, 3);
   });
 
-  it('linearly interpolates BSP at TWA values known in the other row', () => {
+  it('holds at boundary BSP (not zero) for TWA outside a row\'s range', () => {
     const table = engine.parseExpeditionContent(EXPEDITION_SAMPLE)!;
-    // Row TWS=4 has no explicit point at TWA=142.85; it lies between
-    // known points (139.7, 3.30) and its row max 139.7 — actually 142.85
-    // is *outside* the TWS=4 row's range (max=139.7), so it must clamp to 0.
+    // TWA=142.85 is beyond TWS=4 row's max (139.7). Old behavior clamped to 0,
+    // which corrupted bilinear interpolation. New behavior holds at the boundary
+    // BSP (the speed at 139.7° = 3.30) so neighbouring-row interpolation is sane.
     const idx14285 = table.twa.indexOf(142.85);
-    expect(table.speeds[0][idx14285]).toBe(0);
+    expect(table.speeds[0][idx14285]).toBeCloseTo(3.30, 2);
 
     // Row TWS=6 has no explicit point at TWA=139.7. TWS=6 known TWAs are
     // 52, 60, 75, 90, 142.85. 139.7 lies between 90 (6.10) and 142.85 (4.85).
@@ -377,6 +379,50 @@ describe('Expedition polar parsing', () => {
     for (const row of table.speeds) {
       expect(row.length).toBe(table.twa.length);
     }
+  });
+});
+
+// ===================================================================
+// Test: Expedition interpolation correctness near VMG angles (bug regression)
+// ===================================================================
+describe('Expedition polar: no inflated % polar near VMG angles', () => {
+  let engine: PolarEngine;
+
+  beforeEach(() => {
+    engine = new PolarEngine();
+  });
+
+  // Two-row polar with different VMG minima. TWS=6 min=43°, TWS=10 min=39°.
+  // At TWA values between 39° and 43°, TWS=6 previously clamped to BSP=0,
+  // causing bilinear interpolation to produce near-zero target speeds and
+  // inflated percentages (e.g. 309% instead of ~94%).
+  const VMG_POLAR = `!test
+6  0 0  43 5.50  60 6.00  90 6.00  180 3.00
+10 0 0  39 6.50  60 7.00  90 7.00  180 4.00
+`;
+
+  it('holds boundary BSP for TWS=6 at TWA below its VMG min (39°)', () => {
+    const table = engine.parseExpeditionContent(VMG_POLAR)!;
+    // Canonical axis includes TWA=39 (from TWS=10 row).
+    // TWS=6 has min TWA=43, so at TWA=39 it must hold BSP=5.50 (not 0).
+    const idx39 = table.twa.indexOf(39);
+    expect(idx39).toBeGreaterThanOrEqual(0);
+    // TWS=6 is speeds[0]
+    expect(table.speeds[0][idx39]).toBeCloseTo(5.50, 2);
+  });
+
+  it('produces a sane polar % (not 300%+) for a segment at TWA near VMG angle', () => {
+    const table = engine.parseExpeditionContent(VMG_POLAR)!;
+    // TWS=8 (between 6 and 10), TWA=41 (between canonical 39° and 43°)
+    // With boundary-hold: both rows have real BSP near their VMG speed (~5.5–6.5)
+    // so target speed at TWS=8, TWA=41 ≈ ~6.0 kts. Actual STW=5.8 → ~97%.
+    const targetSpeed = engine.interpolateSpeed(table, 8, 41);
+    expect(targetSpeed).not.toBeNull();
+    expect(targetSpeed!).toBeGreaterThan(4.0);  // Not near-zero
+    const result = engine.computePerformance(table, 8, 41, 5.8);
+    expect(result.percentPolar).not.toBeNull();
+    expect(result.percentPolar!).toBeLessThan(130);  // Not 300%+
+    expect(result.percentPolar!).toBeGreaterThan(70);  // Plausible range
   });
 });
 

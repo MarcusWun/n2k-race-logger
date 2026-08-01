@@ -391,8 +391,11 @@ export class PolarEngine {
       const rowMinTwa = row.points[0].twa;
       const rowMaxTwa = row.points[row.points.length - 1].twa;
       return twaAxis.map((targetTwa) => {
-        // Clamp to 0 outside this row's known TWA range
-        if (targetTwa < rowMinTwa || targetTwa > rowMaxTwa) return 0;
+        // Hold at the boundary VMG speed for angles tighter than the row's VMG
+        // angle (or beyond its max). Clamping to 0 would corrupt bilinear
+        // interpolation across neighbouring rows that have different VMG minima.
+        if (targetTwa < rowMinTwa) return row.points[0].bsp;
+        if (targetTwa > rowMaxTwa) return row.points[row.points.length - 1].bsp;
 
         // Exact match?
         for (const p of row.points) {
@@ -436,10 +439,12 @@ export class PolarEngine {
     const maxTWS = table.tws[table.tws.length - 1];
     if (tws < minTWS || tws > maxTWS) return null;
 
-    // Check TWA bounds
+    // Clamp TWA to grid range — angles slightly outside the polar's VMG min
+    // (e.g. sailing tighter than the recorded VMG angle) should return the
+    // boundary speed rather than null.
     const minTWA = table.twa[0];
     const maxTWA = table.twa[table.twa.length - 1];
-    if (twa < minTWA || twa > maxTWA) return null;
+    twa = Math.max(minTWA, Math.min(maxTWA, twa));
 
     // Find surrounding TWS indices
     let twsLow = 0;

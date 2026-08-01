@@ -473,7 +473,7 @@ export function interpolateSpeed(table: PolarTable, tws: number, twa: number): n
 
   const minTWA = table.twa[0];
   const maxTWA = table.twa[table.twa.length - 1];
-  if (twa < minTWA || twa > maxTWA) return null;
+  twa = Math.max(minTWA, Math.min(maxTWA, twa));
 
   let twsLow = 0;
   while (twsLow < table.tws.length - 1 && table.tws[twsLow + 1] <= tws) twsLow++;

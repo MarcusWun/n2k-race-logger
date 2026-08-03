@@ -368,6 +368,12 @@ export class PolarEngine {
       if (points.length === 0) continue;
       // Ensure per-row points are sorted by TWA for interpolation
       points.sort((a, b) => a.twa - b.twa);
+      // Anchor every row at (0°, 0 BSP). This enables smooth linear
+      // interpolation from dead upwind (BSP=0) through each row's VMG
+      // angle — matching how Expedition models the sub-VMG polar curve.
+      // The file's (0,0) sentinel was discarded above; we add this
+      // canonical anchor explicitly so all rows share the same origin.
+      points.unshift({ twa: 0, bsp: 0 });
       rows.push({ tws, points });
     }
 

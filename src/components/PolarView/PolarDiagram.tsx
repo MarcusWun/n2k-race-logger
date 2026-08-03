@@ -33,31 +33,24 @@ function polarToCanvas(
 }
 
 /**
- * Draw a smooth curve through an array of Cartesian points using
- * Catmull-Rom splines converted to cubic Bézier segments.
- * Produces C1-continuous curves with no kinks at data points.
+ * 1-D linear interpolation within a single TWS row.
+ * twaAxis and speedRow are parallel arrays from polarData.
  */
-function drawSmooth(
-  ctx: CanvasRenderingContext2D,
-  pts: { x: number; y: number }[],
-): void {
-  if (pts.length < 2) return;
-  ctx.moveTo(pts[0].x, pts[0].y);
-  if (pts.length === 2) {
-    ctx.lineTo(pts[1].x, pts[1].y);
-    return;
+function interpolateRowSpeed(
+  twaAxis: number[],
+  speedRow: number[],
+  targetTwa: number,
+): number {
+  if (twaAxis.length === 0) return 0;
+  if (targetTwa <= twaAxis[0]) return speedRow[0] ?? 0;
+  if (targetTwa >= twaAxis[twaAxis.length - 1]) return speedRow[twaAxis.length - 1] ?? 0;
+  for (let i = 0; i < twaAxis.length - 1; i++) {
+    if (twaAxis[i] <= targetTwa && twaAxis[i + 1] >= targetTwa) {
+      const t = (targetTwa - twaAxis[i]) / (twaAxis[i + 1] - twaAxis[i]);
+      return speedRow[i] * (1 - t) + speedRow[i + 1] * t;
+    }
   }
-  for (let i = 0; i < pts.length - 1; i++) {
-    const p0 = pts[Math.max(0, i - 1)];
-    const p1 = pts[i];
-    const p2 = pts[i + 1];
-    const p3 = pts[Math.min(pts.length - 1, i + 2)];
-    const cp1x = p1.x + (p2.x - p0.x) / 6;
-    const cp1y = p1.y + (p2.y - p0.y) / 6;
-    const cp2x = p2.x - (p3.x - p1.x) / 6;
-    const cp2y = p2.y - (p3.y - p1.y) / 6;
-    ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
-  }
+  return 0;
 }
 
 export default function PolarDiagram({ polarData }: PolarDiagramProps) {
@@ -160,34 +153,45 @@ export default function PolarDiagram({ polarData }: PolarDiagramProps) {
     ctx.fillStyle = '#444';
     ctx.fill();
 
-    // Draw polar curves for each TWS using Catmull-Rom smooth splines.
-    // Skip the (0°, 0 BSP) math anchor — it exists for interpolation only
-    // and would otherwise create a straight line from the origin to the VMG point.
+    // Draw polar curves for each TWS.
+    // Render at uniform 1° increments rather than at raw data TWA values.
+    // This decouples rendering resolution from data density — the source data
+    // may have clustered VMG angles and sparse standard angles, which causes
+    // kinks when connected directly. Uniform 1° spacing + lineTo is visually
+    // smooth without needing splines.
     polarData.tws.forEach((twsVal, twsIdx) => {
       const color = COLORS[twsIdx % COLORS.length];
+      const twaAxis = polarData.twa;
+      const speedRow = polarData.speeds[twsIdx] ?? [];
 
-      const pts = polarData.twa
-        .map((twaAngle, twaIdx) => {
-          const speed = polarData.speeds[twsIdx]?.[twaIdx] ?? 0;
-          return { twaAngle, speed, ...polarToCanvas(cx, cy, twaAngle, speed, scale) };
-        })
-        .filter((p) => !(p.twaAngle === 0 && p.speed === 0)); // drop dead-upwind anchor
-
-      if (pts.length === 0) return;
+      // Find the VMG angle: first TWA in the axis where the row has BSP > 0
+      const vmgIdx = speedRow.findIndex((s) => s > 0);
+      const startTwa = vmgIdx >= 0 ? Math.ceil(twaAxis[vmgIdx] ?? 0) : 1;
 
       ctx.beginPath();
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
-      drawSmooth(ctx, pts);
-      ctx.stroke();
 
-      // Label at the end of each curve
-      const last = pts[pts.length - 1];
-      ctx.fillStyle = color;
-      ctx.font = '10px sans-serif';
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(`${twsVal}kt`, last.x + 4, last.y);
+      let started = false;
+      for (let deg = startTwa; deg <= 180; deg++) {
+        const speed = interpolateRowSpeed(twaAxis, speedRow, deg);
+        if (speed <= 0) continue;
+        const pt = polarToCanvas(cx, cy, deg, speed, scale);
+        if (!started) { ctx.moveTo(pt.x, pt.y); started = true; }
+        else ctx.lineTo(pt.x, pt.y);
+      }
+      if (started) ctx.stroke();
+
+      // Label at 180°
+      const endSpeed = interpolateRowSpeed(twaAxis, speedRow, 180);
+      if (endSpeed > 0) {
+        const lp = polarToCanvas(cx, cy, 180, endSpeed, scale);
+        ctx.fillStyle = color;
+        ctx.font = '10px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`${twsVal}kt`, lp.x + 4, lp.y);
+      }
     });
 
     // Draw live performance dot

@@ -32,6 +32,34 @@ function polarToCanvas(
   };
 }
 
+/**
+ * Draw a smooth curve through an array of Cartesian points using
+ * Catmull-Rom splines converted to cubic Bézier segments.
+ * Produces C1-continuous curves with no kinks at data points.
+ */
+function drawSmooth(
+  ctx: CanvasRenderingContext2D,
+  pts: { x: number; y: number }[],
+): void {
+  if (pts.length < 2) return;
+  ctx.moveTo(pts[0].x, pts[0].y);
+  if (pts.length === 2) {
+    ctx.lineTo(pts[1].x, pts[1].y);
+    return;
+  }
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[Math.min(pts.length - 1, i + 2)];
+    const cp1x = p1.x + (p2.x - p0.x) / 6;
+    const cp1y = p1.y + (p2.y - p0.y) / 6;
+    const cp2x = p2.x - (p3.x - p1.x) / 6;
+    const cp2y = p2.y - (p3.y - p1.y) / 6;
+    ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
+  }
+}
+
 export default function PolarDiagram({ polarData }: PolarDiagramProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const performance = usePolarStore((s) => s.performance);
@@ -132,31 +160,34 @@ export default function PolarDiagram({ polarData }: PolarDiagramProps) {
     ctx.fillStyle = '#444';
     ctx.fill();
 
-    // Draw polar curves for each TWS
+    // Draw polar curves for each TWS using Catmull-Rom smooth splines.
+    // Skip the (0°, 0 BSP) math anchor — it exists for interpolation only
+    // and would otherwise create a straight line from the origin to the VMG point.
     polarData.tws.forEach((twsVal, twsIdx) => {
       const color = COLORS[twsIdx % COLORS.length];
+
+      const pts = polarData.twa
+        .map((twaAngle, twaIdx) => {
+          const speed = polarData.speeds[twsIdx]?.[twaIdx] ?? 0;
+          return { twaAngle, speed, ...polarToCanvas(cx, cy, twaAngle, speed, scale) };
+        })
+        .filter((p) => !(p.twaAngle === 0 && p.speed === 0)); // drop dead-upwind anchor
+
+      if (pts.length === 0) return;
+
       ctx.beginPath();
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
-
-      for (let twaIdx = 0; twaIdx < polarData.twa.length; twaIdx++) {
-        const speed = polarData.speeds[twsIdx]?.[twaIdx] ?? 0;
-        const pt = polarToCanvas(cx, cy, polarData.twa[twaIdx], speed, scale);
-
-        if (twaIdx === 0) ctx.moveTo(pt.x, pt.y);
-        else ctx.lineTo(pt.x, pt.y);
-      }
+      drawSmooth(ctx, pts);
       ctx.stroke();
 
       // Label at the end of each curve
-      const lastIdx = polarData.twa.length - 1;
-      const lastSpeed = polarData.speeds[twsIdx]?.[lastIdx] ?? 0;
-      const lp = polarToCanvas(cx, cy, polarData.twa[lastIdx], lastSpeed, scale);
+      const last = pts[pts.length - 1];
       ctx.fillStyle = color;
       ctx.font = '10px sans-serif';
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
-      ctx.fillText(`${twsVal}kt`, lp.x + 4, lp.y);
+      ctx.fillText(`${twsVal}kt`, last.x + 4, last.y);
     });
 
     // Draw live performance dot

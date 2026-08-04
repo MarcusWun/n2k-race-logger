@@ -1,5 +1,6 @@
 import { ipcMain, dialog } from 'electron';
 import { SerialManager, ParsedPGN } from './serial-manager';
+import { GoFreeManager, GoFreeStatusEvent } from './gofree-manager';
 import { N2KParser, PGNMessage } from './n2k-parser';
 import { PolarEngine } from './polar-engine';
 import { RaceDatabase, createRaceDatabase } from './database';
@@ -100,6 +101,7 @@ function formatDebugLine(msg: ParsedPGN): string {
 
 // App-wide state
 let serialManager: SerialManager | null = null;
+let goFreeManager: GoFreeManager | null = null;
 let n2kParser: N2KParser | null = null;
 let polarEngine: PolarEngine | null = null;
 let sourceDiscovery: SourceDiscovery | null = null;
@@ -107,6 +109,10 @@ let raceDb: RaceDatabase | null = null;
 let isRecording = false;
 let recordingStartTime: number | null = null;
 let recordingRecordCount = 0;
+
+// Active data source — tracks which manager handles connect/disconnect.
+// Initialized from settings at startup; updated via 'connection:source' IPC.
+let currentDataSource: 'ngt1' | 'gofree' = 'ngt1';
 
 // Cached source preferences — loaded at startup and updated on settings:set.
 // Avoids disk reads in the hot PGN event path.
@@ -137,17 +143,22 @@ function scheduleSourceUpdate(): void {
 
 export function registerIPCHandlers(): void {
   serialManager = new SerialManager();
+  goFreeManager = new GoFreeManager();
   n2kParser = new N2KParser();
   polarEngine = new PolarEngine();
   sourceDiscovery = new SourceDiscovery();
 
-  // Load cached source preferences at startup (avoids disk I/O in the hot PGN path)
+  // Load cached source preferences and initial data source at startup
   const startupSettings = loadAppSettings();
   cachedSourcePreferences = startupSettings.sourcePreferences || {};
+  currentDataSource = startupSettings.dataSource === 'gofree' ? 'gofree' : 'ngt1';
 
-  // Wire up serial → parser pipeline
-  // SerialManager now emits pre-parsed 'pgn' events (binary protocol handled by FromPgn stream)
-  serialManager.on('pgn', (parsed: ParsedPGN) => {
+  /**
+   * Shared PGN event handler — processes parsed PGN objects from either
+   * SerialManager (NGT-1) or GoFreeManager (Ethernet) through the same pipeline.
+   * Both managers emit 'pgn' events with the same ParsedPGN shape.
+   */
+  function handleParsedPgn(parsed: ParsedPGN): void {
     if (!n2kParser) return;
 
     // Send ALL parsed PGNs to debug window (unfiltered)
@@ -164,7 +175,7 @@ export function registerIPCHandlers(): void {
       return;
     }
 
-    // Apply PGN filter for dashboard
+    // Forward to renderer and (if recording) the recording pipeline
     const message = n2kParser.filter(parsed);
     if (message) {
       getWebContents()?.send('pgn:data', message);
@@ -173,11 +184,22 @@ export function registerIPCHandlers(): void {
         n2kParser.enqueue(message);
       }
     }
-  });
+  }
+
+  // Wire up serial → parser pipeline (NGT-1 path)
+  serialManager.on('pgn', handleParsedPgn);
+
+  // Wire up GoFree → parser pipeline (GoFree Ethernet path)
+  goFreeManager.on('pgn', handleParsedPgn);
 
   // Unknown/unparseable data from serial manager
   serialManager.on('pgn-unknown', (msg: any) => {
     sendDebugData(`Unknown N2K data: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`);
+  });
+
+  // Forward GoFree connection state to renderer
+  goFreeManager.on('gofree:status', (status: GoFreeStatusEvent) => {
+    getWebContents()?.send('gofree:status', status);
   });
 
   // Batch write from parser
@@ -201,21 +223,62 @@ export function registerIPCHandlers(): void {
   });
 
   // --- connection:connect ---
+  // Routes to serialManager (NGT-1) or goFreeManager (GoFree) based on active source.
   ipcMain.handle('connection:connect', async (_event, payload: { mode?: string; port?: string; baud?: number; host?: string; tcpPort?: number }) => {
     try {
-      await serialManager!.connect(payload as any);
+      if (currentDataSource === 'gofree') {
+        const settings = loadAppSettings();
+        const gofreeHost = settings.gofreeHost || '192.168.0.1';
+        const gofreePort = settings.gofreePort || 10110;
+        await goFreeManager!.connect(gofreeHost, gofreePort);
+      } else {
+        await serialManager!.connect(payload as any);
+      }
       return { success: true };
     } catch (err: any) {
-      const status = serialManager!.getStatus();
-      return { success: false, error: err?.message || 'Connection failed', status };
+      const error = err?.message || 'Connection failed';
+      return { success: false, error };
     }
   });
 
   // --- connection:disconnect ---
   ipcMain.handle('connection:disconnect', async () => {
     try {
-      await serialManager!.disconnect();
+      if (currentDataSource === 'gofree') {
+        await goFreeManager!.disconnect();
+      } else {
+        await serialManager!.disconnect();
+      }
       return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message };
+    }
+  });
+
+  // --- connection:source ---
+  // Switches active data source. Stops the currently active manager cleanly.
+  // Does NOT auto-connect the new source — renderer triggers connection:connect explicitly.
+  ipcMain.handle('connection:source', async (_event, payload: { dataSource: 'ngt1' | 'gofree' }) => {
+    try {
+      const newSource = payload?.dataSource;
+      if (newSource !== 'ngt1' && newSource !== 'gofree') {
+        return { success: false, error: `Invalid dataSource: ${newSource}` };
+      }
+
+      // Stop the currently active manager
+      if (currentDataSource === 'gofree') {
+        await goFreeManager!.disconnect();
+      } else {
+        await serialManager!.disconnect();
+      }
+
+      // Update active source and persist to settings
+      currentDataSource = newSource;
+      const settings = loadAppSettings();
+      const { _loadError: _ignored, ...cleanSettings } = settings;
+      saveAppSettings({ ...cleanSettings, dataSource: newSource });
+
+      return { success: true, dataSource: newSource };
     } catch (err: any) {
       return { success: false, error: err?.message };
     }
@@ -732,6 +795,9 @@ export async function cleanup(): Promise<void> {
   }
   if (serialManager) {
     await serialManager.disconnect();
+  }
+  if (goFreeManager) {
+    await goFreeManager.disconnect();
   }
   n2kParser?.stopBatching();
 }

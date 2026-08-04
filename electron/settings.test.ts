@@ -163,6 +163,99 @@ describe('Settings load/save round-trip', () => {
 });
 
 // ===================================================================
+// Test: Phase 2.7 GoFree settings fields
+// ===================================================================
+describe('GoFree settings — Phase 2.7', () => {
+  let tmpDir: string;
+  let settingsPath: string;
+
+  function writeSettings(settings: Record<string, any>): void {
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf-8');
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'n2k-gofree-'));
+    settingsPath = path.join(tmpDir, 'n2k-race-logger', 'settings.json');
+    process.env.APPDATA = tmpDir;
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    resetSettingsCacheForTests();
+  });
+
+  afterEach(() => {
+    delete process.env.APPDATA;
+    resetSettingsCacheForTests();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('new settings fields have correct defaults when file is absent', () => {
+    const loaded = loadAppSettings();
+    expect(loaded.dataSource).toBe('ngt1');
+    expect(loaded.gofreeHost).toBe('192.168.0.1');
+    expect(loaded.gofreePort).toBe(10110);
+  });
+
+  it('dataSource persists and reloads via spread-merge', () => {
+    writeSettings({ serialPort: 'COM3', dataSource: 'gofree', gofreeHost: '10.0.0.1', gofreePort: 9999 });
+    const loaded = loadAppSettings();
+    expect(loaded.dataSource).toBe('gofree');
+    expect(loaded.gofreeHost).toBe('10.0.0.1');
+    expect(loaded.gofreePort).toBe(9999);
+  });
+
+  it('old settings.json without GoFree keys loads without error and gets defaults', () => {
+    // Simulate pre-2.7 settings file that has no GoFree fields
+    writeSettings({
+      serialPort: 'COM5',
+      serialBaud: 115200,
+      dataDirectory: '/custom/races',
+      activePolarProfile: 3,
+    });
+    const loaded = loadAppSettings();
+    // GoFree defaults are filled in
+    expect(loaded.dataSource).toBe('ngt1');
+    expect(loaded.gofreeHost).toBe('192.168.0.1');
+    expect(loaded.gofreePort).toBe(10110);
+    // Existing fields are preserved
+    expect(loaded.serialPort).toBe('COM5');
+    expect(loaded.dataDirectory).toBe('/custom/races');
+    expect(loaded.activePolarProfile).toBe(3);
+  });
+
+  it('saveAppSettings round-trips GoFree settings without data loss', () => {
+    const settings = loadAppSettings();
+    saveAppSettings({
+      ...settings,
+      dataSource: 'gofree',
+      gofreeHost: '192.168.1.50',
+      gofreePort: 5678,
+    });
+    resetSettingsCacheForTests();
+    const reloaded = loadAppSettings();
+    expect(reloaded.dataSource).toBe('gofree');
+    expect(reloaded.gofreeHost).toBe('192.168.1.50');
+    expect(reloaded.gofreePort).toBe(5678);
+  });
+
+  it('switching dataSource ngt1 → gofree preserves other settings', () => {
+    writeSettings({
+      serialPort: 'COM7',
+      serialBaud: 115200,
+      dataSource: 'ngt1',
+      gofreeHost: '192.168.0.1',
+      gofreePort: 10110,
+      activePolarProfile: 5,
+    });
+    const before = loadAppSettings();
+    saveAppSettings({ ...before, dataSource: 'gofree' });
+    resetSettingsCacheForTests();
+    const after = loadAppSettings();
+    expect(after.dataSource).toBe('gofree');
+    expect(after.serialPort).toBe('COM7');
+    expect(after.activePolarProfile).toBe(5);
+  });
+});
+
+// ===================================================================
 // Test: Derived fields — timestamp source selection
 // ===================================================================
 describe('Derived fields — timestamp source', () => {

@@ -68,6 +68,59 @@ Default is `'pchip'` in both `PolarEngine.interpolateSpeed()` and the standalone
 
 Splines are memoised per `(PolarTable, rowIndex, method)` via a `WeakMap` so they are built once per table object and reused on subsequent calls.
 
+## GoFree Ethernet Data Source Contract (Phase 2.7)
+
+### New Settings Keys
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `dataSource` | `'ngt1' \| 'gofree'` | `'ngt1'` | Active data source |
+| `gofreeHost` | `string` | `'192.168.0.1'` | GoFree router IP (fallback when multicast discovery fails) |
+| `gofreePort` | `number` | `10110` | GoFree TCP port |
+
+Loaded via spread-merge on startup (per decision #29). Missing fields in old settings.json files silently get defaults.
+
+### New IPC Channels
+
+| Channel | Direction | Payload | Purpose |
+|---|---|---|---|
+| `connection:source` | Renderer → Main | `{ dataSource: 'ngt1' \| 'gofree' }` | Switch active data source; stops current manager, does NOT auto-connect |
+| `gofree:status` | Main → Renderer | `{ state, ip?, port?, error? }` | GoFree connection state updates |
+
+`connection:connect` and `connection:disconnect` continue to work for both sources. Routing is determined by `currentDataSource` in `ipc-handlers.ts`.
+
+GoFree status states: `'searching'` | `'connecting'` | `'connected'` | `'reconnecting'` | `'error'` | `'disconnected'`
+
+### NMEA 0183 Sentence → Store Field Mapping
+
+All values converted to N2K-compatible units (m/s, radians) so the downstream pipeline is source-agnostic.
+
+| Sentence | Fields | PGN emitted | Store target |
+|---|---|---|---|
+| `$WIMWV` (ref=R) | AWS (kts→m/s), AWA (°→rad, 0–2π) | 130306, ref=`'Apparent'` | AWS, AWA |
+| `$WIMWV` (ref=T) | TWS (kts→m/s), TWA (°→rad, 0–2π) | 130306, ref=`'True (boat referenced)'` | TWS, TWA |
+| `$IIVHW` | STW (kts→m/s), HDG magnetic (°→rad) | 128259 + 127250 | STW, Heading |
+| `$GPGLL` | LAT, LON (decimal °, no conversion) | 129025 | LAT, LON |
+| `$GPRMC` | LAT, LON, SOG (kts→m/s), COG (°→rad) | 129025 + 129026 | LAT, LON, SOG, COG |
+| `$GPVTG` | SOG (kts→m/s), COG true (°→rad) | 129026 | SOG, COG |
+| `$HCHDG` | HDG magnetic (°→rad) → `heading` field | 127250 | Heading |
+| `$HCHDT` | HDG true (°→rad) → `headingTrue` field | 127250 | Heading fallback |
+
+NMEA port-side AWA values (NMEA signed negative or 0–360° reflex angles) map to 0–2π radians matching N2K convention. The renderer's `normalizeWindAngle()` and analysis-engine handle side labeling identically for both sources.
+
+True wind fallback: when only `$WIMWV` ref=R (apparent) is present in a session, `GoFreeManager` computes TWS/TWA from AWA + STW using the same vector formula as the renderer Dashboard and `analysis-engine.ts`, and emits an additional PGN 130306 with `reference='True (boat referenced)'`.
+
+### NGT-1 BST Init — NEVER Sent on GoFree Connections
+
+The BST initialization command `[0x11, 0x02, 0x00]` is Actisense NGT-1 specific. It is implemented only in `serial-manager.ts` and is **never** sent by `GoFreeManager`. GoFree connections require no handshake — NMEA sentences stream immediately on TCP connect.
+
+### Architecture
+
+- `electron/gofree-manager.ts` — new file mirroring `serial-manager.ts` structure
+- `electron/ipc-handlers.ts` — `currentDataSource` routes `connection:connect`/`disconnect`; new `connection:source` handler
+- `electron/preload.ts` — exposes `setDataSource()` and `'gofree:status'` event channel
+- Only one manager emits data at a time (enforced by `connect()`/`disconnect()` lifecycle)
+
 ## TCP Connection Contract
 
 Default TCP target remains:

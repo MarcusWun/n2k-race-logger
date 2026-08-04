@@ -14,6 +14,8 @@ const api = {
     ipcRenderer.invoke('connection:connect', payload),
   disconnect: () => ipcRenderer.invoke('connection:disconnect'),
   listPorts: () => ipcRenderer.invoke('serial:list-ports'),
+  setDataSource: (payload: { dataSource: 'ngt1' | 'gofree' }) =>
+    ipcRenderer.invoke('connection:source', payload),
 
   // Recording
   startRecording: (payload: { label?: string }) =>
@@ -68,6 +70,7 @@ const api = {
       'analysis:data',
       'analysis:segments',
       'races:files',
+      'gofree:status',
     ];
     if (validChannels.includes(channel)) {
       const listener = (_event: any, ...args: any[]) => callback(...args);

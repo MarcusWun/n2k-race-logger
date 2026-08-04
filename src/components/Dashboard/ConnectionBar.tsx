@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { getIPC } from '../../ipc';
 import { useConnectionStore } from '../../store/useConnectionStore';
-import type { ConnectionStatus, SerialPortInfo } from '../../types/ipc';
+import type { ConnectionStatus, GofreeStatusPayload, SerialPortInfo } from '../../types/ipc';
 import { sanitizeTcpHost, validateTcpTarget } from '../../utils/tcp';
+import { getGofreeStatusLabel, getGofreeStatusColor } from '../../utils/gofree';
 
 export default function ConnectionBar() {
   const {
@@ -12,7 +13,12 @@ export default function ConnectionBar() {
     tcpHost, setTcpHost,
     tcpPort, setTcpPort,
     status, setStatus,
+    dataSource, setDataSource,
+    setGofreeStatus,
   } = useConnectionStore();
+
+  // FE4: gofreeStatus is read from store for rendering
+  const gofreeStatus = useConnectionStore((s) => s.gofreeStatus);
 
   // ports is transient OS state — local useState is fine
   const [ports, setPorts] = useState<SerialPortInfo[]>([]);
@@ -30,7 +36,7 @@ export default function ConnectionBar() {
     const ipc = getIPC();
     if (!ipc) return;
 
-    // Load saved settings for mode/tcp — only when disconnected to avoid overriding active state
+    // Load saved settings for mode/tcp and dataSource — only when disconnected
     ipc.getSettings().then((s: any) => {
       if (status.status === 'disconnected') {
         if (s?.connectionMode) setMode(s.connectionMode);
@@ -38,13 +44,24 @@ export default function ConnectionBar() {
         if (s?.tcpPort) setTcpPort(s.tcpPort);
         if (s?.serialPort) setSelectedPort(s.serialPort);
         if (s?.serialBaud) setBaudRate(s.serialBaud);
+        // FE4: hydrate dataSource from persisted settings
+        if (s?.dataSource) setDataSource(s.dataSource);
       }
     });
 
     const unsub = ipc.on('connection:status', (s: ConnectionStatus) => {
       setStatus(s);
     });
-    return () => { unsub(); };
+
+    // FE4: Subscribe to GoFree status events
+    const unsubGofree = ipc.on('gofree:status', (payload: GofreeStatusPayload) => {
+      setGofreeStatus(payload);
+    });
+
+    return () => {
+      unsub();
+      unsubGofree();
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshPorts]);
 
@@ -78,43 +95,57 @@ export default function ConnectionBar() {
 
   const isConnected = status.status === 'connected';
 
-  const statusColor = {
+  // FE3: Status chip adapts to active data source
+  const isGoFree = dataSource === 'gofree';
+
+  const ngt1StatusColor = {
     disconnected: 'bg-gray-500',
     connecting: 'bg-n2k-warning animate-pulse',
     connected: 'bg-n2k-success',
     error: 'bg-n2k-danger',
   }[status.status];
 
+  const statusDotColor = isGoFree
+    ? getGofreeStatusColor(gofreeStatus?.state)
+    : ngt1StatusColor;
+
+  const statusLabel = isGoFree
+    ? getGofreeStatusLabel(gofreeStatus)
+    : status.status;
+
   return (
     <div className="flex items-center gap-3 bg-n2k-surface rounded-lg px-4 py-2 flex-wrap">
-      <div className={`w-3 h-3 rounded-full ${statusColor}`} />
-      <span className="text-xs text-gray-400 uppercase tracking-wider">
-        {status.status}
+      <div className={`w-3 h-3 rounded-full ${statusDotColor}`} />
+      <span className="text-xs text-gray-400 uppercase tracking-wider" data-testid="status-label">
+        {statusLabel}
       </span>
 
-      {/* Mode toggle */}
-      <div className="flex rounded overflow-hidden border border-gray-700">
-        <button
-          onClick={() => setMode('serial')}
-          disabled={isConnected}
-          className={`px-3 py-1 text-xs font-medium ${
-            mode === 'serial' ? 'bg-n2k-accent text-black' : 'bg-n2k-bg text-gray-400'
-          }`}
-        >
-          Serial
-        </button>
-        <button
-          onClick={() => setMode('tcp')}
-          disabled={isConnected}
-          className={`px-3 py-1 text-xs font-medium ${
-            mode === 'tcp' ? 'bg-n2k-accent text-black' : 'bg-n2k-bg text-gray-400'
-          }`}
-        >
-          TCP
-        </button>
-      </div>
+      {/* Mode toggle — only shown for NGT-1; GoFree has its own connection path */}
+      {!isGoFree && (
+        <div className="flex rounded overflow-hidden border border-gray-700">
+          <button
+            onClick={() => setMode('serial')}
+            disabled={isConnected}
+            className={`px-3 py-1 text-xs font-medium ${
+              mode === 'serial' ? 'bg-n2k-accent text-black' : 'bg-n2k-bg text-gray-400'
+            }`}
+          >
+            Serial
+          </button>
+          <button
+            onClick={() => setMode('tcp')}
+            disabled={isConnected}
+            className={`px-3 py-1 text-xs font-medium ${
+              mode === 'tcp' ? 'bg-n2k-accent text-black' : 'bg-n2k-bg text-gray-400'
+            }`}
+          >
+            TCP
+          </button>
+        </div>
+      )}
 
-      {mode === 'serial' ? (
+      {/* NGT-1: Serial / TCP fields */}
+      {!isGoFree && mode === 'serial' && (
         <>
           <select
             value={selectedPort}
@@ -150,7 +181,9 @@ export default function ConnectionBar() {
             ))}
           </select>
         </>
-      ) : (
+      )}
+
+      {!isGoFree && mode === 'tcp' && (
         <>
           <input
             type="text"
@@ -191,7 +224,7 @@ export default function ConnectionBar() {
         Debug
       </button>
 
-      {mode === 'tcp' && (
+      {!isGoFree && mode === 'tcp' && (
         <span className="text-gray-500 text-xs">
           Target: {status.mode === 'tcp' && status.host ? status.host : (sanitizeTcpHost(tcpHost) || '192.168.1.1')}:{status.mode === 'tcp' && status.tcpPort ? status.tcpPort : (tcpPort || 2000)}
         </span>

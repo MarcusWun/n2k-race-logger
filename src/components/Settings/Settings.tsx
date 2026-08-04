@@ -1,15 +1,18 @@
 import React, { useEffect, useState } from 'react';
 import { useSettingsStore } from '../../store/useSettings';
 import { usePolarStore } from '../../store/usePolarStore';
+import { useConnectionStore } from '../../store/useConnectionStore';
 import { getIPC } from '../../ipc';
 import { DEFAULT_PGN_FILTER, PGN_NAMES } from '../../types/n2k-pgns';
-import type { AppSettings } from '../../types/ipc';
+import type { AppSettings, DataSource } from '../../types/ipc';
 import type { BoatProfile } from '../../types/polar';
 import { sanitizeTcpHost, validateTcpTarget } from '../../utils/tcp';
+import { sanitizeGofreeHost, validateGofreeTarget } from '../../utils/gofree';
 
 export default function Settings() {
   const { settings, setSettings } = useSettingsStore();
   const { profiles, setProfiles } = usePolarStore();
+  const setStoreDataSource = useConnectionStore((s) => s.setDataSource);
   const [draft, setDraft] = useState<AppSettings>({ ...settings });
   const [ports, setPorts] = useState<Array<{ path: string; manufacturer?: string }>>([]);
   const [saved, setSaved] = useState(false);
@@ -52,6 +55,19 @@ export default function Settings() {
     return () => { if (unsub) unsub(); if (unsubSettingsError) unsubSettingsError(); };
   }, [setSettings, setProfiles]);
 
+  /** Immediately switch data source: persist to settings AND notify backend manager. */
+  const handleDataSourceChange = async (newSource: DataSource) => {
+    const ipc = getIPC();
+    setDraft((prev) => ({ ...prev, dataSource: newSource }));
+    const merged = { ...settings, ...draft, dataSource: newSource };
+    if (ipc) {
+      await ipc.setSettings(merged);
+      await ipc.setDataSource({ dataSource: newSource });
+    }
+    setSettings(merged);
+    setStoreDataSource(newSource);
+  };
+
   const handleSave = async () => {
     const ipc = getIPC();
     setSaveError(null);
@@ -61,7 +77,18 @@ export default function Settings() {
       setSaveError(target.error);
       return;
     }
-    const settingsToSave = { ...draft, tcpHost: target.host, tcpPort: target.tcpPort };
+    // Validate GoFree IP/port if GoFree is selected
+    let gofreeCorrections: { gofreeHost?: string; gofreePort?: number } = {};
+    if (draft.dataSource === 'gofree') {
+      const gofreeTarget = validateGofreeTarget(draft.gofreeHost, draft.gofreePort);
+      if (!gofreeTarget.ok) {
+        setDraft({ ...draft, gofreeHost: gofreeTarget.host || '192.168.0.1', gofreePort: gofreeTarget.port ?? 10110 });
+        setSaveError(gofreeTarget.error);
+        return;
+      }
+      gofreeCorrections = { gofreeHost: gofreeTarget.host, gofreePort: gofreeTarget.port };
+    }
+    const settingsToSave = { ...draft, tcpHost: target.host, tcpPort: target.tcpPort, ...gofreeCorrections };
     if (ipc) {
       const result = await ipc.setSettings(settingsToSave);
       if (result && result.success === false) {
@@ -109,38 +136,113 @@ export default function Settings() {
           Save failed: {saveError}
         </div>
       )}
-      {/* Connection */}
+      {/* Connection — Data Source */}
       <section>
         <h2 className="text-lg font-semibold text-n2k-accent mb-3">Connection</h2>
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <label className="block text-xs text-gray-400 mb-1">Serial Port</label>
-            <select
-              value={draft.serialPort}
-              onChange={(e) => setDraft({ ...draft, serialPort: e.target.value })}
-              className="w-full bg-n2k-bg border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+
+        {/* FE1: Data Source radio group */}
+        <div className="mb-4">
+          <label className="block text-xs text-gray-400 mb-2">Data Source</label>
+          <div className="flex rounded overflow-hidden border border-gray-700 w-fit">
+            <button
+              type="button"
+              onClick={() => handleDataSourceChange('ngt1')}
+              className={`px-4 py-1.5 text-sm font-medium transition-colors ${
+                (draft.dataSource ?? 'ngt1') === 'ngt1'
+                  ? 'bg-n2k-accent text-black'
+                  : 'bg-n2k-bg text-gray-400 hover:text-gray-200'
+              }`}
+              data-testid="datasource-ngt1"
             >
-              <option value={draft.serialPort}>{draft.serialPort}</option>
-              {ports.filter((p) => p.path !== draft.serialPort).map((p) => (
-                <option key={p.path} value={p.path}>
-                  {p.path} {p.manufacturer ? `(${p.manufacturer})` : ''}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="block text-xs text-gray-400 mb-1">Baud Rate</label>
-            <select
-              value={draft.serialBaud}
-              onChange={(e) => setDraft({ ...draft, serialBaud: Number(e.target.value) })}
-              className="w-full bg-n2k-bg border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+              NGT-1 (USB)
+            </button>
+            <button
+              type="button"
+              onClick={() => handleDataSourceChange('gofree')}
+              className={`px-4 py-1.5 text-sm font-medium transition-colors ${
+                draft.dataSource === 'gofree'
+                  ? 'bg-n2k-accent text-black'
+                  : 'bg-n2k-bg text-gray-400 hover:text-gray-200'
+              }`}
+              data-testid="datasource-gofree"
             >
-              {[4800, 9600, 38400, 115200].map((b) => (
-                <option key={b} value={b}>{b}</option>
-              ))}
-            </select>
+              GoFree (Ethernet)
+            </button>
           </div>
+          <p className="text-xs text-gray-500 mt-1">
+            {draft.dataSource === 'gofree'
+              ? 'Receiving NMEA 0183 from a B&G GoFree router over TCP.'
+              : 'Receiving NMEA 2000 data from an Actisense NGT-1 USB adapter.'}
+          </p>
         </div>
+
+        {/* FE2: NGT-1 fields — Serial Port + Baud Rate */}
+        {(draft.dataSource ?? 'ngt1') === 'ngt1' && (
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">Serial Port</label>
+              <select
+                value={draft.serialPort}
+                onChange={(e) => setDraft({ ...draft, serialPort: e.target.value })}
+                className="w-full bg-n2k-bg border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                data-testid="serial-port-select"
+              >
+                <option value={draft.serialPort}>{draft.serialPort}</option>
+                {ports.filter((p) => p.path !== draft.serialPort).map((p) => (
+                  <option key={p.path} value={p.path}>
+                    {p.path} {p.manufacturer ? `(${p.manufacturer})` : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">Baud Rate</label>
+              <select
+                value={draft.serialBaud}
+                onChange={(e) => setDraft({ ...draft, serialBaud: Number(e.target.value) })}
+                className="w-full bg-n2k-bg border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                data-testid="baud-rate-select"
+              >
+                {[4800, 9600, 38400, 115200].map((b) => (
+                  <option key={b} value={b}>{b}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+        )}
+
+        {/* FE2: GoFree fields — IP + Port */}
+        {draft.dataSource === 'gofree' && (
+          <div className="grid grid-cols-[1fr_auto_7rem] gap-2 items-end">
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">GoFree IP Address</label>
+              <input
+                type="text"
+                value={draft.gofreeHost ?? '192.168.0.1'}
+                onChange={(e) => setDraft({ ...draft, gofreeHost: e.target.value })}
+                onBlur={(e) => setDraft({ ...draft, gofreeHost: sanitizeGofreeHost(e.target.value) || '192.168.0.1' })}
+                className="w-full bg-n2k-bg border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                placeholder="192.168.0.1"
+                data-testid="gofree-host-input"
+              />
+            </div>
+            <span className="text-gray-500 pb-1.5">:</span>
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">Port</label>
+              <input
+                type="number"
+                min={1}
+                max={65535}
+                step={1}
+                value={draft.gofreePort ?? 10110}
+                onChange={(e) => setDraft({ ...draft, gofreePort: Number(e.target.value) })}
+                className="w-full bg-n2k-bg border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                placeholder="10110"
+                data-testid="gofree-port-input"
+              />
+            </div>
+          </div>
+        )}
       </section>
 
       {/* PGN Sources */}

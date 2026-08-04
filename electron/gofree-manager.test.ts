@@ -1,90 +1,30 @@
 /**
- * Tests for GoFreeManager — NMEA 0183 sentence parsing and event emission.
+ * Tests for GoFreeManager — GoFree Tier 2 WebSocket JSON parsing.
  *
- * BE6: Unit tests for sentence parsing, normalization, and true wind fallback.
- * BE7: Integration test with a mock TCP server.
- *
- * All tests use discoveryTimeoutMs: 0 to skip UDP multicast discovery and
- * connect directly to the configured host (localhost for the integration test).
+ * Coverage:
+ *   - Channel-ID → PGN mapping (each required channel produces the correct
+ *     PGN and store field with correct unit conversion)
+ *   - `valid: false` observation is discarded
+ *   - Both `Data` and `Many` envelope formats
+ *   - TWA/AWA sign normalization (signed → 0–360°)
+ *   - Keepalive timer sends `SettingListReq` at 30 s
+ *   - Malformed / non-JSON messages are silently skipped
+ *   - Integration test against a real `ws` WebSocketServer on 127.0.0.1
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import * as net from 'net';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { EventEmitter } from 'events';
+import { WebSocketServer } from 'ws';
 import { GoFreeManager } from './gofree-manager';
 import type { ParsedPGN } from './serial-manager';
 
 // ---------------------------------------------------------------------------
-// NMEA sentence helpers
+// Constants (kept in sync with gofree-manager.ts)
 // ---------------------------------------------------------------------------
 
-/** Compute NMEA-0183 XOR checksum and return the complete sentence with checksum. */
-function mkSentence(base: string): string {
-  let cs = 0;
-  // XOR all characters between '$' (exclusive) and '*' (exclusive)
-  for (let i = 1; i < base.length; i++) {
-    cs ^= base.charCodeAt(i);
-  }
-  return base + '*' + cs.toString(16).toUpperCase().padStart(2, '0');
-}
-
-// Unit conversion constants (matching gofree-manager.ts)
 const KTS_TO_MS = 1 / 1.94384;
 const DEG_TO_RAD = Math.PI / 180;
-const RAD_TO_DEG = 180 / Math.PI;
 
-/** Compute expected true wind from apparent wind + STW (matches analysis-engine formula). */
-function computeTrueWind(awsKts: number, awaDeg: number, stwKts: number): { tws: number; twa: number } {
-  const awaRad = awaDeg * DEG_TO_RAD;
-  const u = awsKts * Math.sin(awaRad);
-  const v = awsKts * Math.cos(awaRad) - stwKts;
-  const tws = Math.sqrt(u * u + v * v);
-  const twaRad = Math.atan2(u, v);
-  const twaDeg = (((twaRad * RAD_TO_DEG) % 360) + 360) % 360;
-  return { tws, twa: twaDeg };
-}
-
-// ---------------------------------------------------------------------------
-// Helper: synchronously feed a sentence to a GoFreeManager's internal parser
-// without going through the TCP socket. We access the private method via cast.
-// ---------------------------------------------------------------------------
-
-function feedSentence(manager: GoFreeManager, sentence: string): void {
-  // Access private method for unit testing
-  (manager as any).parseSentence(sentence);
-}
-
-// ---------------------------------------------------------------------------
-// Sentence fixtures with correct checksums
-// ---------------------------------------------------------------------------
-
-// $WIMWV — apparent wind, 45° starboard, 12.5 kts
-const WIMWV_APPARENT = mkSentence('$WIMWV,045.0,R,12.5,N,A');
-// $WIMWV — apparent wind, port side (-45°), 10 kts
-const WIMWV_APPARENT_PORT = mkSentence('$WIMWV,315.0,R,10.0,N,A'); // 315° == port 45°
-// $WIMWV — true wind, 52° starboard, 8 kts
-const WIMWV_TRUE = mkSentence('$WIMWV,052.0,T,08.0,N,A');
-// $IIVHW — STW 5.2 kts, heading magnetic 355°
-const IIVHW = mkSentence('$IIVHW,0.0,T,355.0,M,5.2,N,9.6,K');
-// $GPRMC — lat 48.117N, lon 11.517E, SOG 22.4 kts, COG 084.4°
-const GPRMC = mkSentence('$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W');
-// $GPVTG — SOG 5.5 kts, COG true 054.7°
-const GPVTG = mkSentence('$GPVTG,054.7,T,034.4,M,005.5,N,010.2,K');
-// $HCHDG — heading 355°
-const HCHDG = mkSentence('$HCHDG,355.0,0.0,E,0.0,E');
-// $HCHDT — heading true 355°
-const HCHDT = mkSentence('$HCHDT,355.0,T');
-// $GPGLL — lat 42.0N, lon 71.0W
-const GPGLL = mkSentence('$GPGLL,4200.0000,N,07100.0000,W,123456,A');
-// Malformed: bad checksum
-const BAD_CHECKSUM = '$WIMWV,045.0,R,12.5,N,A*FF';
-// Missing field sentence — truncated (too few commas), nmea-simple returns null fields
-const MISSING_FIELD = mkSentence('$WIMWV,R,N,A');
-// Unknown sentence type
-const UNKNOWN = mkSentence('$XXABC,1,2,3');
-
-// ---------------------------------------------------------------------------
-// PGN numbers (must match gofree-manager.ts constants)
-// ---------------------------------------------------------------------------
 const PGN_WIND = 130306;
 const PGN_STW = 128259;
 const PGN_SOG_COG = 129026;
@@ -92,15 +32,71 @@ const PGN_POSITION = 129025;
 const PGN_HEADING = 127250;
 
 // ---------------------------------------------------------------------------
-// BE6 Unit tests
+// Helpers
 // ---------------------------------------------------------------------------
 
-describe('GoFreeManager — unit tests (sentence parsing)', () => {
+/** Feed a raw JSON payload directly into the manager's parser (bypasses socket). */
+function feedRaw(mgr: GoFreeManager, raw: string): void {
+  (mgr as any).handleMessage(raw);
+}
+
+/**
+ * Minimal EventEmitter-based WebSocket mock used by keepalive / lifecycle
+ * tests. Records every `send()` payload so tests can inspect DataReq +
+ * keepalive frames without spinning up a real socket.
+ */
+class MockWebSocket extends EventEmitter {
+  static instances: MockWebSocket[] = [];
+  readyState = 0;
+  sent: string[] = [];
+
+  constructor(public url: string) {
+    super();
+    MockWebSocket.instances.push(this);
+  }
+
+  send(data: string): void {
+    this.sent.push(data);
+  }
+
+  close(): void {
+    this.readyState = 3;
+    this.emit('close', 1000);
+  }
+
+  terminate(): void {
+    this.readyState = 3;
+  }
+
+  simulateOpen(): void {
+    this.readyState = 1;
+    this.emit('open');
+  }
+
+  simulateMessage(data: string): void {
+    this.emit('message', data);
+  }
+
+  simulateClose(code = 1006): void {
+    this.readyState = 3;
+    this.emit('close', code);
+  }
+}
+
+function latest(instances: MockWebSocket[]): MockWebSocket {
+  return instances[instances.length - 1];
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — channel-ID mapping and message parsing
+// ---------------------------------------------------------------------------
+
+describe('GoFreeManager — channel-ID → PGN mapping', () => {
   let manager: GoFreeManager;
   let emitted: ParsedPGN[];
 
   beforeEach(() => {
-    manager = new GoFreeManager({ discoveryTimeoutMs: 0 });
+    manager = new GoFreeManager();
     emitted = [];
     manager.on('pgn', (pgn: ParsedPGN) => emitted.push(pgn));
   });
@@ -109,303 +105,384 @@ describe('GoFreeManager — unit tests (sentence parsing)', () => {
     manager.removeAllListeners();
   });
 
-  // -----------------------------------------------------------------------
-  // $WIMWV ref=R (apparent wind)
-  // -----------------------------------------------------------------------
+  it('channel 141 (TWA) → PGN 130306 windAngle (True), radians', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 141, inst: 0, val: 45, valid: true }] }));
+    const wind = emitted.find(
+      (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
+    );
+    expect(wind).toBeDefined();
+    expect(wind!.fields.windAngle).toBeCloseTo(45 * DEG_TO_RAD, 4);
+  });
 
-  it('$WIMWV ref=R → emits apparent wind (PGN 130306, ref=Apparent)', () => {
-    feedSentence(manager, WIMWV_APPARENT);
-    const apparent = emitted.find(
+  it('channel 47 (TWS) → PGN 130306 windSpeed (True), m/s', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 47, val: 12.5, valid: true }] }));
+    const wind = emitted.find(
+      (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
+    );
+    expect(wind).toBeDefined();
+    expect(wind!.fields.windSpeed).toBeCloseTo(12.5 * KTS_TO_MS, 4);
+  });
+
+  it('TWA + TWS pair → combined True wind event with both fields', () => {
+    feedRaw(manager, JSON.stringify({
+      Data: [
+        { id: 47, val: 15, valid: true },
+        { id: 141, val: 60, valid: true },
+      ],
+    }));
+    const trueWinds = emitted.filter(
+      (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
+    );
+    const combined = trueWinds[trueWinds.length - 1];
+    expect(combined).toBeDefined();
+    expect(combined.fields.windSpeed).toBeCloseTo(15 * KTS_TO_MS, 4);
+    expect(combined.fields.windAngle).toBeCloseTo(60 * DEG_TO_RAD, 4);
+  });
+
+  it('channel 140 (AWA) → PGN 130306 windAngle (Apparent), radians', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 140, val: 30, valid: true }] }));
+    const wind = emitted.find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'Apparent',
     );
-    expect(apparent).toBeDefined();
-    // AWS: 12.5 kts → m/s
-    expect(apparent!.fields.windSpeed).toBeCloseTo(12.5 * KTS_TO_MS, 4);
-    // AWA: 45° → radians
-    expect(apparent!.fields.windAngle).toBeCloseTo(45 * DEG_TO_RAD, 4);
+    expect(wind).toBeDefined();
+    expect(wind!.fields.windAngle).toBeCloseTo(30 * DEG_TO_RAD, 4);
   });
 
-  // -----------------------------------------------------------------------
-  // $WIMWV ref=T (true wind)
-  // -----------------------------------------------------------------------
-
-  it('$WIMWV ref=T → emits true wind (PGN 130306, ref=True (boat referenced))', () => {
-    feedSentence(manager, WIMWV_TRUE);
-    const trueWind = emitted.find(
-      (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
-    );
-    expect(trueWind).toBeDefined();
-    // TWS: 8 kts → m/s
-    expect(trueWind!.fields.windSpeed).toBeCloseTo(8 * KTS_TO_MS, 4);
-    // TWA: 52° → radians
-    expect(trueWind!.fields.windAngle).toBeCloseTo(52 * DEG_TO_RAD, 4);
-  });
-
-  // -----------------------------------------------------------------------
-  // $IIVHW
-  // -----------------------------------------------------------------------
-
-  it('$IIVHW → emits STW (PGN 128259) and heading (PGN 127250)', () => {
-    feedSentence(manager, IIVHW);
-    const stwPgn = emitted.find((p) => p.pgn === PGN_STW);
-    expect(stwPgn).toBeDefined();
-    // STW: 5.2 kts → m/s
-    expect(stwPgn!.fields.speedWaterReferenced).toBeCloseTo(5.2 * KTS_TO_MS, 4);
-
-    const hdgPgn = emitted.find((p) => p.pgn === PGN_HEADING);
-    expect(hdgPgn).toBeDefined();
-    // Heading: 355° → radians
-    expect(hdgPgn!.fields.heading).toBeCloseTo(355 * DEG_TO_RAD, 4);
-  });
-
-  // -----------------------------------------------------------------------
-  // $GPRMC
-  // -----------------------------------------------------------------------
-
-  it('$GPRMC → emits position (PGN 129025) and SOG/COG (PGN 129026)', () => {
-    feedSentence(manager, GPRMC);
-    const posPgn = emitted.find((p) => p.pgn === PGN_POSITION);
-    expect(posPgn).toBeDefined();
-    expect(posPgn!.fields.latitude).toBeCloseTo(48.117, 2);
-    expect(posPgn!.fields.longitude).toBeCloseTo(11.517, 2);
-
-    const sogCogPgn = emitted.find((p) => p.pgn === PGN_SOG_COG);
-    expect(sogCogPgn).toBeDefined();
-    // SOG: 22.4 kts → m/s
-    expect(sogCogPgn!.fields.sog).toBeCloseTo(22.4 * KTS_TO_MS, 3);
-    // COG: 084.4° → radians
-    expect(sogCogPgn!.fields.cog).toBeCloseTo(84.4 * DEG_TO_RAD, 3);
-  });
-
-  // -----------------------------------------------------------------------
-  // $GPVTG
-  // -----------------------------------------------------------------------
-
-  it('$GPVTG → emits SOG/COG (PGN 129026)', () => {
-    feedSentence(manager, GPVTG);
-    const sogCogPgn = emitted.find((p) => p.pgn === PGN_SOG_COG);
-    expect(sogCogPgn).toBeDefined();
-    expect(sogCogPgn!.fields.sog).toBeCloseTo(5.5 * KTS_TO_MS, 4);
-    expect(sogCogPgn!.fields.cog).toBeCloseTo(54.7 * DEG_TO_RAD, 4);
-  });
-
-  // -----------------------------------------------------------------------
-  // $HCHDG
-  // -----------------------------------------------------------------------
-
-  it('$HCHDG → emits heading (PGN 127250, field: heading)', () => {
-    feedSentence(manager, HCHDG);
-    const hdgPgn = emitted.find((p) => p.pgn === PGN_HEADING && p.fields.heading != null);
-    expect(hdgPgn).toBeDefined();
-    expect(hdgPgn!.fields.heading).toBeCloseTo(355 * DEG_TO_RAD, 4);
-  });
-
-  // -----------------------------------------------------------------------
-  // $HCHDT (fallback heading)
-  // -----------------------------------------------------------------------
-
-  it('$HCHDT → emits heading fallback (PGN 127250, field: headingTrue)', () => {
-    feedSentence(manager, HCHDT);
-    const hdgPgn = emitted.find((p) => p.pgn === PGN_HEADING && p.fields.headingTrue != null);
-    expect(hdgPgn).toBeDefined();
-    expect(hdgPgn!.fields.headingTrue).toBeCloseTo(355 * DEG_TO_RAD, 4);
-  });
-
-  // -----------------------------------------------------------------------
-  // Malformed / unknown sentences
-  // -----------------------------------------------------------------------
-
-  it('malformed sentence (bad checksum) → silently skipped, no crash', () => {
-    expect(() => feedSentence(manager, BAD_CHECKSUM)).not.toThrow();
-    expect(emitted).toHaveLength(0);
-  });
-
-  it('missing-field sentence → silently skipped, no crash', () => {
-    expect(() => feedSentence(manager, MISSING_FIELD)).not.toThrow();
-    // Missing speed/angle in MWV → should not emit any PGN
-    const windPgns = emitted.filter((p) => p.pgn === PGN_WIND);
-    expect(windPgns).toHaveLength(0);
-  });
-
-  it('unknown sentence type → silently ignored, no crash', () => {
-    expect(() => feedSentence(manager, UNKNOWN)).not.toThrow();
-    expect(emitted).toHaveLength(0);
-  });
-
-  // -----------------------------------------------------------------------
-  // AWA normalization (port tack)
-  // -----------------------------------------------------------------------
-
-  it('AWA port tack: NMEA 315° → emits windAngle in radians matching 315°', () => {
-    feedSentence(manager, WIMWV_APPARENT_PORT);
-    const apparent = emitted.find(
+  it('channel 46 (AWS) → PGN 130306 windSpeed (Apparent), m/s', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 46, val: 14, valid: true }] }));
+    const wind = emitted.find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'Apparent',
     );
-    expect(apparent).toBeDefined();
-    // 315° = port 45°. Downstream normalizeWindAngle(315°) → {angle: 45, side: 'port'}
-    expect(apparent!.fields.windAngle).toBeCloseTo(315 * DEG_TO_RAD, 4);
+    expect(wind).toBeDefined();
+    expect(wind!.fields.windSpeed).toBeCloseTo(14 * KTS_TO_MS, 4);
   });
 
-  it('AWA negative (signed port) → normalized to 0–360° before radians', () => {
-    // NMEA can also deliver negative angles (some devices); exercise the normalization
-    // by directly testing the internal dispatchSentence path via a manual call.
-    const negativeAwaSentence = '$WIMWV,-045.0,R,10.0,N,A';
-    let checksum = 0;
-    for (let i = 1; i < negativeAwaSentence.length; i++) {
-      checksum ^= negativeAwaSentence.charCodeAt(i);
-    }
-    const full = negativeAwaSentence + '*' + checksum.toString(16).toUpperCase().padStart(2, '0');
-    feedSentence(manager, full);
-    const apparent = emitted.find(
-      (p) => p.pgn === PGN_WIND && p.fields.reference === 'Apparent',
-    );
-    expect(apparent).toBeDefined();
-    // -45° normalized to 315° → 315 * DEG_TO_RAD
-    expect(apparent!.fields.windAngle).toBeCloseTo(315 * DEG_TO_RAD, 4);
+  it('channel 42 (BSPD) → PGN 128259 speedWaterReferenced, m/s', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 42, val: 6.2, valid: true }] }));
+    const stw = emitted.find((p) => p.pgn === PGN_STW);
+    expect(stw).toBeDefined();
+    expect(stw!.fields.speedWaterReferenced).toBeCloseTo(6.2 * KTS_TO_MS, 4);
   });
 
-  // -----------------------------------------------------------------------
-  // True wind fallback
-  // -----------------------------------------------------------------------
-
-  it('true wind fallback: only ref=R + STW → computed TWS/TWA emitted as True (boat referenced)', () => {
-    // Feed STW first (IIVHW gives STW = 5.2 kts)
-    feedSentence(manager, IIVHW);
-    emitted.length = 0; // reset to isolate wind events
-
-    // Feed apparent wind (no ref=T has been received)
-    feedSentence(manager, WIMWV_APPARENT); // AWS=12.5, AWA=45°
-
-    const trueWind = emitted.find(
-      (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
-    );
-    expect(trueWind).toBeDefined();
-
-    // Verify computed values match the reference formula
-    const expected = computeTrueWind(12.5, 45, 5.2);
-    expect(trueWind!.fields.windSpeed).toBeCloseTo(expected.tws * KTS_TO_MS, 3);
-    expect(trueWind!.fields.windAngle).toBeCloseTo(expected.twa * DEG_TO_RAD, 3);
+  it('channel 41 (SOG) → PGN 129026 sog, m/s', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 41, val: 7.5, valid: true }] }));
+    const p = emitted.find((e) => e.pgn === PGN_SOG_COG && e.fields.sog != null);
+    expect(p).toBeDefined();
+    expect(p!.fields.sog).toBeCloseTo(7.5 * KTS_TO_MS, 4);
   });
 
-  it('no true wind fallback when ref=T has been received', () => {
-    // Receive ref=T first
-    feedSentence(manager, WIMWV_TRUE);
-    feedSentence(manager, IIVHW);
-    emitted.length = 0;
-
-    // Now receive ref=R — should NOT emit computed true wind since hasTrueWindSentence=true
-    feedSentence(manager, WIMWV_APPARENT);
-
-    const trueWindCount = emitted.filter(
-      (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
-    ).length;
-    // Only apparent wind emitted, no fallback computation
-    expect(trueWindCount).toBe(0);
+  it('channel 9 (COG) → PGN 129026 cog, radians', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 9, val: 84.4, valid: true }] }));
+    const p = emitted.find((e) => e.pgn === PGN_SOG_COG && e.fields.cog != null);
+    expect(p).toBeDefined();
+    expect(p!.fields.cog).toBeCloseTo(84.4 * DEG_TO_RAD, 4);
   });
 
-  it('true wind fallback absent when STW not yet known', () => {
-    // Feed only apparent wind, no STW
-    feedSentence(manager, WIMWV_APPARENT);
-    const trueWind = emitted.find(
-      (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
-    );
-    // No fallback without STW
-    expect(trueWind).toBeUndefined();
+  it('channel 37 (HDG) → PGN 127250 heading, radians', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 37, val: 355, valid: true }] }));
+    const hdg = emitted.find((e) => e.pgn === PGN_HEADING && e.fields.heading != null);
+    expect(hdg).toBeDefined();
+    expect(hdg!.fields.heading).toBeCloseTo(355 * DEG_TO_RAD, 4);
+  });
+
+  it('channel 421 (LAT) → PGN 129025 latitude (decimal degrees passthrough)', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 421, val: 42.5, valid: true }] }));
+    const pos = emitted.find((e) => e.pgn === PGN_POSITION && e.fields.latitude != null);
+    expect(pos).toBeDefined();
+    expect(pos!.fields.latitude).toBeCloseTo(42.5, 6);
+  });
+
+  it('channel 422 (LON) → PGN 129025 longitude (decimal degrees passthrough)', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 422, val: -71.0, valid: true }] }));
+    const pos = emitted.find((e) => e.pgn === PGN_POSITION && e.fields.longitude != null);
+    expect(pos).toBeDefined();
+    expect(pos!.fields.longitude).toBeCloseTo(-71, 6);
+  });
+
+  it('channel 235 (VMG) → logged as PGN_WIND field, m/s', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 235, val: 5.0, valid: true }] }));
+    const p = emitted.find((e) => e.pgn === PGN_WIND && e.fields.vmg != null);
+    expect(p).toBeDefined();
+    expect(p!.fields.vmg).toBeCloseTo(5 * KTS_TO_MS, 4);
+  });
+
+  it('channel 226 (LEE) → logged as PGN_HEADING field, radians', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 226, val: 3, valid: true }] }));
+    const p = emitted.find((e) => e.pgn === PGN_HEADING && e.fields.leeway != null);
+    expect(p).toBeDefined();
+    expect(p!.fields.leeway).toBeCloseTo(3 * DEG_TO_RAD, 4);
   });
 });
 
 // ---------------------------------------------------------------------------
-// BE7 Integration test — mock TCP server
+// Envelope handling, filtering, normalization
 // ---------------------------------------------------------------------------
 
-describe('GoFreeManager — integration test (mock TCP server)', () => {
-  let server: net.Server;
-  let serverPort: number;
+describe('GoFreeManager — envelope handling and filtering', () => {
+  let manager: GoFreeManager;
+  let emitted: ParsedPGN[];
 
-  beforeEach(async () => {
-    server = net.createServer();
-    await new Promise<void>((resolve) => {
-      server.listen(0, '127.0.0.1', () => resolve());
-    });
-    serverPort = (server.address() as net.AddressInfo).port;
+  beforeEach(() => {
+    manager = new GoFreeManager();
+    emitted = [];
+    manager.on('pgn', (pgn: ParsedPGN) => emitted.push(pgn));
   });
 
-  afterEach(async () => {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+  afterEach(() => {
+    manager.removeAllListeners();
   });
 
-  it('connects to mock TCP server and emits correct PGN events for a full sentence set', async () => {
-    const FIXTURE_SENTENCES = [
-      // Heading first so it is available for subsequent wind computations
-      mkSentence('$HCHDG,180.0,0.0,E,0.0,E'),
-      // STW
-      mkSentence('$IIVHW,0.0,T,355.0,M,6.0,N,11.1,K'),
-      // True wind
-      mkSentence('$WIMWV,040.0,T,10.0,N,A'),
-      // Apparent wind
-      mkSentence('$WIMWV,050.0,R,14.0,N,A'),
-      // Position
-      mkSentence('$GPRMC,120000,A,4200.000,N,07100.000,W,008.0,045.0,010826,000.0,W'),
-      // SOG/COG via VTG
-      mkSentence('$GPVTG,045.0,T,040.0,M,008.0,N,014.8,K'),
-    ];
+  it('valid:false observation → discarded (no PGN emitted)', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 47, val: 12.5, valid: false }] }));
+    expect(emitted).toHaveLength(0);
+  });
 
-    // Stream fixture sentences when a client connects
-    server.on('connection', (socket) => {
-      for (const sentence of FIXTURE_SENTENCES) {
-        socket.write(sentence + '\r\n');
-      }
-      // Leave socket open (GoFreeManager reads until close/error)
-    });
+  it('Data envelope → observations processed in order', () => {
+    feedRaw(manager, JSON.stringify({
+      Data: [
+        { id: 47, val: 10, valid: true },
+        { id: 42, val: 5, valid: true },
+      ],
+    }));
+    expect(emitted.find((p) => p.pgn === PGN_WIND && p.fields.windSpeed != null)).toBeDefined();
+    expect(emitted.find((p) => p.pgn === PGN_STW)).toBeDefined();
+  });
 
-    const manager = new GoFreeManager({ discoveryTimeoutMs: 0 });
-    const received: ParsedPGN[] = [];
-    manager.on('pgn', (pgn: ParsedPGN) => received.push(pgn));
+  it('Many envelope → all inner Data blocks processed', () => {
+    feedRaw(manager, JSON.stringify({
+      Many: [
+        { Data: [{ id: 47, val: 10, valid: true }] },
+        { Data: [{ id: 42, val: 5, valid: true }] },
+        { Data: [{ id: 37, val: 180, valid: true }] },
+      ],
+    }));
+    expect(emitted.find((p) => p.pgn === PGN_WIND && p.fields.windSpeed != null)).toBeDefined();
+    expect(emitted.find((p) => p.pgn === PGN_STW)).toBeDefined();
+    expect(emitted.find((p) => p.pgn === PGN_HEADING && p.fields.heading != null)).toBeDefined();
+  });
 
-    // Connect directly to mock server (no multicast discovery)
-    await manager.connect('127.0.0.1', serverPort);
-
-    // Wait for data to arrive (short delay for async I/O)
-    await new Promise<void>((resolve) => setTimeout(resolve, 150));
-
-    // Verify heading (PGN 127250)
-    const hdgPgn = received.find((p) => p.pgn === PGN_HEADING && p.fields.heading != null);
-    expect(hdgPgn).toBeDefined();
-    expect(hdgPgn!.fields.heading).toBeCloseTo(180 * DEG_TO_RAD, 3);
-
-    // Verify STW (PGN 128259)
-    const stwPgn = received.find((p) => p.pgn === PGN_STW);
-    expect(stwPgn).toBeDefined();
-    expect(stwPgn!.fields.speedWaterReferenced).toBeCloseTo(6.0 * KTS_TO_MS, 3);
-
-    // Verify TWS/TWA from direct ref=T sentence (PGN 130306)
-    const twPgn = received.find(
+  it('TWA normalization: negative signed degrees (port) → 0–360°', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 141, val: -45, valid: true }] }));
+    const wind = emitted.find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
     );
-    expect(twPgn).toBeDefined();
-    expect(twPgn!.fields.windSpeed).toBeCloseTo(10 * KTS_TO_MS, 3);
-    expect(twPgn!.fields.windAngle).toBeCloseTo(40 * DEG_TO_RAD, 3);
+    expect(wind).toBeDefined();
+    // -45° → 315°
+    expect(wind!.fields.windAngle).toBeCloseTo(315 * DEG_TO_RAD, 4);
+  });
 
-    // Verify apparent wind (PGN 130306, ref=Apparent)
-    const awPgn = received.find(
+  it('AWA normalization: negative signed degrees → 0–360°', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 140, val: -30, valid: true }] }));
+    const wind = emitted.find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'Apparent',
     );
-    expect(awPgn).toBeDefined();
-    expect(awPgn!.fields.windSpeed).toBeCloseTo(14 * KTS_TO_MS, 3);
-    expect(awPgn!.fields.windAngle).toBeCloseTo(50 * DEG_TO_RAD, 3);
+    expect(wind).toBeDefined();
+    // -30° → 330°
+    expect(wind!.fields.windAngle).toBeCloseTo(330 * DEG_TO_RAD, 4);
+  });
 
-    // Verify position from RMC (PGN 129025)
-    const posPgn = received.find((p) => p.pgn === PGN_POSITION);
-    expect(posPgn).toBeDefined();
-    expect(posPgn!.fields.latitude).toBeCloseTo(42.0, 2);
-    expect(posPgn!.fields.longitude).toBeCloseTo(-71.0, 2);
+  it('malformed / non-JSON message → silently skipped, no crash', () => {
+    expect(() => feedRaw(manager, 'not-json!')).not.toThrow();
+    expect(() => feedRaw(manager, '{bad json')).not.toThrow();
+    expect(() => feedRaw(manager, '')).not.toThrow();
+    expect(() => feedRaw(manager, 'null')).not.toThrow();
+    expect(() => feedRaw(manager, '42')).not.toThrow();
+    expect(emitted).toHaveLength(0);
+  });
 
-    // Verify SOG/COG from VTG (PGN 129026)
-    const sogPgn = received.find((p) => p.pgn === PGN_SOG_COG && p.fields.sog != null);
-    expect(sogPgn).toBeDefined();
-    expect(sogPgn!.fields.sog).toBeCloseTo(8 * KTS_TO_MS, 3);
-    expect(sogPgn!.fields.cog).toBeCloseTo(45 * DEG_TO_RAD, 3);
+  it('unknown channel id → silently ignored', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 99999, val: 1.0, valid: true }] }));
+    expect(emitted).toHaveLength(0);
+  });
 
-    await manager.disconnect();
+  it('observation missing val → discarded (no PGN emitted)', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 47, valid: true }] }));
+    expect(emitted).toHaveLength(0);
+  });
+
+  it('non-Data / non-Many payload (e.g. SettingListRsp) → silently ignored', () => {
+    feedRaw(manager, JSON.stringify({ SettingListRsp: [{ groupId: 2, values: [] }] }));
+    expect(emitted).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Keepalive & subscribe (via injected MockWebSocket)
+// ---------------------------------------------------------------------------
+
+describe('GoFreeManager — subscribe + keepalive', () => {
+  beforeEach(() => {
+    MockWebSocket.instances.length = 0;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    MockWebSocket.instances.length = 0;
+  });
+
+  it('sends DataReq subscribe on open with all required channel IDs', async () => {
+    const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
+    await mgr.connect('127.0.0.1', 2053);
+
+    const ws = latest(MockWebSocket.instances);
+    expect(ws).toBeDefined();
+    ws.simulateOpen();
+
+    expect(ws.sent).toHaveLength(1);
+    const req = JSON.parse(ws.sent[0]);
+    expect(req.DataReq).toBeDefined();
+    expect(Array.isArray(req.DataReq)).toBe(true);
+
+    const ids = req.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
+    // PRD-required channel IDs
+    expect(ids).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422]);
+
+    for (const entry of req.DataReq) {
+      expect(entry.repeat).toBe(true);
+      expect(entry.inst).toBe(0);
+    }
+
+    await mgr.disconnect();
+  });
+
+  it('keepalive: sends SettingListReq every 30 s after open', async () => {
+    vi.useFakeTimers();
+    const mgr = new GoFreeManager({
+      keepaliveIntervalMs: 30_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    // 1 message so far: the DataReq subscribe
+    expect(ws.sent).toHaveLength(1);
+
+    // +30 s → one keepalive
+    vi.advanceTimersByTime(30_000);
+    expect(ws.sent).toHaveLength(2);
+    expect(JSON.parse(ws.sent[1])).toEqual({ SettingListReq: [{ groupId: 2 }] });
+
+    // +30 s → second keepalive
+    vi.advanceTimersByTime(30_000);
+    expect(ws.sent).toHaveLength(3);
+    expect(JSON.parse(ws.sent[2])).toEqual({ SettingListReq: [{ groupId: 2 }] });
+
+    await mgr.disconnect();
+  });
+
+  it('disconnect() stops the keepalive timer', async () => {
+    vi.useFakeTimers();
+    const mgr = new GoFreeManager({
+      keepaliveIntervalMs: 30_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    // Subscribe
+    expect(ws.sent).toHaveLength(1);
+
+    await mgr.disconnect();
+
+    // Advance well past several keepalive intervals — no additional sends
+    vi.advanceTimersByTime(120_000);
+    expect(ws.sent).toHaveLength(1);
+  });
+
+  it('emits gofree:status events for connecting → connected → disconnected', async () => {
+    const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
+    const states: string[] = [];
+    mgr.on('gofree:status', (s: any) => states.push(s.state));
+
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+    await mgr.disconnect();
+
+    expect(states).toContain('connecting');
+    expect(states).toContain('connected');
+    expect(states[states.length - 1]).toBe('disconnected');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integration test — real WebSocket server via `ws`
+// ---------------------------------------------------------------------------
+
+describe('GoFreeManager — integration (real WebSocket server)', () => {
+  it('connects, subscribes, and emits PGN events for a streamed Data message', async () => {
+    const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    await new Promise<void>((resolve) => server.once('listening', () => resolve()));
+    const port = (server.address() as any).port;
+
+    let subscribeReceived: any = null;
+
+    server.on('connection', (socket) => {
+      socket.on('message', (data: any) => {
+        let msg: any;
+        try {
+          msg = JSON.parse(data.toString());
+        } catch {
+          return;
+        }
+        if (msg?.DataReq && !subscribeReceived) {
+          subscribeReceived = msg;
+          // Reply with a Data envelope covering the required channel IDs
+          socket.send(JSON.stringify({
+            Data: [
+              { id: 141, inst: 0, val: 55, valid: true },
+              { id: 47, inst: 0, val: 12, valid: true },
+              { id: 42, inst: 0, val: 6.0, valid: true },
+              { id: 41, inst: 0, val: 7.5, valid: true },
+              { id: 9, inst: 0, val: 80, valid: true },
+              { id: 37, inst: 0, val: 90, valid: true },
+              { id: 421, inst: 0, val: 42.0, valid: true },
+              { id: 422, inst: 0, val: -71.0, valid: true },
+              { id: 140, inst: 0, val: 30, valid: true },
+              { id: 46, inst: 0, val: 14, valid: true },
+            ],
+          }));
+          // Then a Many envelope with an additional STW update
+          socket.send(JSON.stringify({
+            Many: [{ Data: [{ id: 42, val: 6.4, valid: true }] }],
+          }));
+        }
+      });
+    });
+
+    const mgr = new GoFreeManager();
+    const received: ParsedPGN[] = [];
+    mgr.on('pgn', (p: ParsedPGN) => received.push(p));
+
+    await mgr.connect('127.0.0.1', port);
+
+    // Wait for the server-side reply to be processed
+    await new Promise<void>((resolve) => setTimeout(resolve, 250));
+
+    expect(subscribeReceived).not.toBeNull();
+    expect(Array.isArray(subscribeReceived.DataReq)).toBe(true);
+
+    expect(received.find((p) => p.pgn === PGN_STW && p.fields.speedWaterReferenced != null)).toBeDefined();
+    expect(received.find((p) => p.pgn === PGN_SOG_COG && p.fields.sog != null)).toBeDefined();
+    expect(received.find((p) => p.pgn === PGN_SOG_COG && p.fields.cog != null)).toBeDefined();
+    expect(received.find((p) => p.pgn === PGN_HEADING && p.fields.heading != null)).toBeDefined();
+    expect(received.find((p) => p.pgn === PGN_POSITION && p.fields.latitude != null)).toBeDefined();
+    expect(received.find((p) => p.pgn === PGN_POSITION && p.fields.longitude != null)).toBeDefined();
+    expect(received.find(
+      (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
+    )).toBeDefined();
+    expect(received.find(
+      (p) => p.pgn === PGN_WIND && p.fields.reference === 'Apparent',
+    )).toBeDefined();
+
+    // Verify a specific value's unit conversion end-to-end
+    const stw = received.find((p) => p.pgn === PGN_STW);
+    expect(stw!.fields.speedWaterReferenced).toBeCloseTo(6.0 * KTS_TO_MS, 3);
+
+    await mgr.disconnect();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 });

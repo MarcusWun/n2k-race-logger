@@ -1,49 +1,72 @@
 /**
- * GoFree Ethernet Data Source Manager
+ * GoFree Ethernet Data Source Manager (GoFree Tier 2 / WebSocket)
  *
- * Handles auto-discovery of a B&G GoFree router via UDP multicast (239.2.1.1:2052),
- * falls back to a configured IP/port if discovery times out, then opens a TCP socket
- * and streams NMEA 0183 sentences.
+ * Connects to the B&G H5000 CPU via WebSocket (default `ws://192.168.1.233:2053`),
+ * subscribes to the required channel IDs with a `DataReq` message, and streams
+ * the resulting JSON observations into ParsedPGN events so the downstream
+ * pipeline (Dashboard, analysis engine, recording) treats GoFree data
+ * identically to NGT-1 data.
  *
  * Emits:
- *   'pgn'          — ParsedPGN objects (same shape as SerialManager) for the N2K pipeline
- *   'gofree:status' — GoFreeStatusEvent with connection state updates
+ *   'pgn'            — ParsedPGN objects (same shape as SerialManager)
+ *   'gofree:status'  — GoFreeStatusEvent with connection state updates
  *
  * IMPORTANT: This manager NEVER sends the NGT-1 BST initialization command
- * [0x11, 0x02, 0x00]. That command is specific to the Actisense NGT-1 serial device
- * and must remain entirely within serial-manager.ts.
+ * `[0x11, 0x02, 0x00]`. That command is specific to the Actisense NGT-1 serial
+ * device and remains entirely within serial-manager.ts.
  */
 
 import { EventEmitter } from 'events';
-import * as net from 'net';
-import * as dgram from 'dgram';
-import { parseNmeaSentence } from 'nmea-simple';
+import { WebSocket } from 'ws';
 import type { ParsedPGN } from './serial-manager';
 
-// Unit conversion constants
-const KTS_TO_MS = 1 / 1.94384; // knots → m/s (N2K unit for speed)
-const DEG_TO_RAD = Math.PI / 180; // degrees → radians (N2K unit for angles)
+// Unit conversions to match the NGT-1 pipeline (m/s and radians).
+const KTS_TO_MS = 1 / 1.94384;
+const DEG_TO_RAD = Math.PI / 180;
 
-// GoFree multicast discovery constants (GoFree specification)
-const GOFREE_MULTICAST_GROUP = '239.2.1.1';
-const GOFREE_DISCOVERY_PORT = 2052;
+// Timer / reconnect defaults (PRD-specified).
+const DEFAULT_KEEPALIVE_INTERVAL_MS = 30_000;
+const DEFAULT_RECONNECT_INTERVAL_MS = 5_000;
+const DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
 
-// Default discovery timeout and reconnect settings
-const DEFAULT_DISCOVERY_TIMEOUT_MS = 5000;
-const RECONNECT_INTERVAL_MS = 5000;
-const MAX_RECONNECT_ATTEMPTS = 3;
+// N2K PGN numbers emitted downstream so consumers are source-agnostic.
+const PGN_WIND = 130306;      // Wind Data
+const PGN_STW = 128259;       // Speed - Water Referenced
+const PGN_SOG_COG = 129026;   // COG & SOG - Rapid Update
+const PGN_POSITION = 129025;  // Position - Rapid Update
+const PGN_HEADING = 127250;   // Vessel Heading
 
-// N2K PGN numbers used to make data source-agnostic to the downstream pipeline.
-// GoFree data is emitted with these real PGN numbers so the renderer, analysis
-// engine, and recording pipeline treat it identically to NGT-1 data.
-const PGN_WIND = 130306; // Wind Data
-const PGN_STW = 128259; // Speed - Water Referenced
-const PGN_SOG_COG = 129026; // COG & SOG - Rapid Update
-const PGN_POSITION = 129025; // Position - Rapid Update
-const PGN_HEADING = 127250; // Vessel Heading
+// GoFree Tier 2 channel IDs (H5000).
+const CH_TWA = 141;
+const CH_TWS = 47;
+const CH_BSPD = 42;
+const CH_SOG = 41;
+const CH_COG = 9;
+const CH_HDG = 37;
+const CH_LAT = 421;
+const CH_LON = 422;
+const CH_AWA = 140;
+const CH_AWS = 46;
+const CH_VMG = 235;
+const CH_LEE = 226;
+
+/** Full DataReq subscription list — sent immediately on WebSocket open. */
+const REQUIRED_CHANNEL_IDS = [
+  CH_TWA,
+  CH_TWS,
+  CH_BSPD,
+  CH_SOG,
+  CH_COG,
+  CH_HDG,
+  CH_LAT,
+  CH_LON,
+  CH_AWA,
+  CH_AWS,
+  CH_VMG,
+  CH_LEE,
+];
 
 export type GoFreeState =
-  | 'searching'
   | 'connecting'
   | 'connected'
   | 'reconnecting'
@@ -57,58 +80,58 @@ export interface GoFreeStatusEvent {
   error?: string;
 }
 
-/**
- * Compute true wind speed and angle from apparent wind and boat speed.
- * All inputs/outputs in knots and degrees (0–360°).
- * Matches the formula used by the renderer Dashboard and analysis-engine.ts.
- */
-function computeTrueWind(
-  awsKts: number,
-  awaDeg: number,
-  stwKts: number,
-): { tws: number; twa: number } {
-  const awaRad = awaDeg * DEG_TO_RAD;
-  const u = awsKts * Math.sin(awaRad);
-  const v = awsKts * Math.cos(awaRad) - stwKts;
-  const tws = Math.sqrt(u * u + v * v);
-  const twaRad = Math.atan2(u, v);
-  const twaDeg = (((twaRad * 180) / Math.PI) % 360 + 360) % 360;
-  return { tws, twa: twaDeg };
+export interface GoFreeManagerOptions {
+  /** Keepalive tick interval in ms (default 30000). */
+  keepaliveIntervalMs?: number;
+  /** Reconnect delay in ms (default 5000). */
+  reconnectIntervalMs?: number;
+  /** Max reconnect attempts before entering the `error` state (default 3). */
+  maxReconnectAttempts?: number;
+  /**
+   * Injectable WebSocket implementation — allows tests to substitute a mock
+   * without touching the network. Defaults to the real `ws` client.
+   */
+  WebSocketImpl?: any;
 }
 
-export interface GoFreeManagerOptions {
-  /**
-   * Timeout for UDP multicast discovery before falling back to configured host.
-   * Defaults to 5000ms. Set to 0 in unit/integration tests to skip discovery.
-   */
-  discoveryTimeoutMs?: number;
+interface Observation {
+  id: number;
+  inst?: number;
+  val?: number | null;
+  valid?: boolean;
 }
 
 export class GoFreeManager extends EventEmitter {
   private state: GoFreeState = 'disconnected';
-  private tcpSocket: net.Socket | null = null;
-  private udpSocket: dgram.Socket | null = null;
-  private discoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  private ws: any = null;
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
-  private lineBuffer = '';
 
-  // Last known values used for true wind fallback computation
-  private lastStwKts: number | null = null;
+  // Accumulators used to pair TWA/TWS and AWA/AWS observations that arrive
+  // in separate messages. Angles are stored already normalized to 0–360°.
+  private lastTwaDeg: number | null = null;
+  private lastTwsKts: number | null = null;
+  private lastAwaDeg: number | null = null;
   private lastAwsKts: number | null = null;
-  private lastAwaDeg: number | null = null; // 0–360° normalized
-  /** True once we receive a WIMWV ref=T in this connection session. */
-  private hasTrueWindSentence = false;
 
-  // Resolved TCP target (may be updated by multicast discovery)
-  private targetIp: string = '192.168.0.1';
-  private targetPort: number = 10110;
+  private targetHost = '192.168.1.233';
+  private targetPort = 2053;
 
-  private readonly discoveryTimeoutMs: number;
+  private readonly keepaliveIntervalMs: number;
+  private readonly reconnectIntervalMs: number;
+  private readonly maxReconnectAttempts: number;
+  private readonly WebSocketImpl: any;
 
   constructor(options?: GoFreeManagerOptions) {
     super();
-    this.discoveryTimeoutMs = options?.discoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS;
+    this.keepaliveIntervalMs =
+      options?.keepaliveIntervalMs ?? DEFAULT_KEEPALIVE_INTERVAL_MS;
+    this.reconnectIntervalMs =
+      options?.reconnectIntervalMs ?? DEFAULT_RECONNECT_INTERVAL_MS;
+    this.maxReconnectAttempts =
+      options?.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS;
+    this.WebSocketImpl = options?.WebSocketImpl ?? WebSocket;
   }
 
   // ---------------------------------------------------------------------------
@@ -116,338 +139,294 @@ export class GoFreeManager extends EventEmitter {
   // ---------------------------------------------------------------------------
 
   getStatus(): GoFreeStatusEvent {
-    return {
-      state: this.state,
-      ip: this.targetIp,
-      port: this.targetPort,
-    };
+    return { state: this.state, ip: this.targetHost, port: this.targetPort };
   }
 
   /**
-   * Begin the connection sequence: UDP multicast discovery → TCP connection.
-   * If host/port are provided they are used as the fallback target when
-   * discovery times out.
+   * Open a WebSocket to the H5000 and subscribe to the required channels.
+   * If a previous session is active it is closed cleanly first.
    */
   async connect(host?: string, port?: number): Promise<void> {
     await this.disconnect();
-    if (host !== undefined) this.targetIp = host;
+    if (host !== undefined) this.targetHost = host;
     if (port !== undefined) this.targetPort = port;
     this.reconnectAttempts = 0;
     this.resetSessionState();
-    this.startDiscovery();
+    this.openSocket();
   }
 
-  /** Close all sockets and cancel timers cleanly. */
+  /** Close the socket cleanly and cancel all timers. */
   async disconnect(): Promise<void> {
-    this.clearDiscoveryTimer();
     this.clearReconnectTimer();
-    this.cleanupUdp();
-    this.cleanupTcp();
+    this.clearKeepaliveTimer();
+    this.cleanupSocket();
     this.setState('disconnected');
   }
 
   // ---------------------------------------------------------------------------
-  // Discovery
+  // Socket lifecycle
   // ---------------------------------------------------------------------------
 
-  private startDiscovery(): void {
-    this.setState('searching');
+  private openSocket(): void {
+    const url = `ws://${this.targetHost}:${this.targetPort}`;
+    this.setState('connecting', this.targetHost, this.targetPort);
+    console.log(`[GoFreeManager] WebSocket connecting to ${url}`);
 
-    if (this.discoveryTimeoutMs === 0) {
-      // Skip discovery (used in tests or when configured to connect directly)
-      this.connectTcp(this.targetIp, this.targetPort);
+    let ws: any;
+    try {
+      ws = new this.WebSocketImpl(url);
+    } catch (err) {
+      this.handleConnectionFailure(
+        `WebSocket construction failed: ${(err as Error).message}`,
+      );
       return;
     }
+    this.ws = ws;
 
-    // Start discovery timeout: fall back to configured host if no announcement arrives
-    this.discoveryTimer = setTimeout(() => {
-      this.discoveryTimer = null;
-      this.cleanupUdp();
-      this.connectTcp(this.targetIp, this.targetPort);
-    }, this.discoveryTimeoutMs);
-
-    try {
-      this.udpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
-
-      this.udpSocket.on('error', (err: Error) => {
-        console.warn('[GoFreeManager] UDP discovery error:', err.message);
-        this.clearDiscoveryTimer();
-        this.cleanupUdp();
-        this.connectTcp(this.targetIp, this.targetPort);
-      });
-
-      this.udpSocket.on('message', (msg: Buffer) => {
-        try {
-          const json = JSON.parse(msg.toString('utf-8'));
-          const nmeaService = Array.isArray(json.Services)
-            ? json.Services.find((s: any) => s.Service === 'nmea-0183')
-            : null;
-          if (nmeaService && json.IP && nmeaService.Port) {
-            this.clearDiscoveryTimer();
-            this.cleanupUdp();
-            this.targetIp = String(json.IP);
-            this.targetPort = Number(nmeaService.Port);
-            console.log(`[GoFreeManager] Discovered GoFree at ${this.targetIp}:${this.targetPort}`);
-            this.connectTcp(this.targetIp, this.targetPort);
-          }
-        } catch {
-          // Malformed discovery packet — ignore
-        }
-      });
-
-      this.udpSocket.bind(GOFREE_DISCOVERY_PORT, () => {
-        try {
-          this.udpSocket!.addMembership(GOFREE_MULTICAST_GROUP);
-          console.log(`[GoFreeManager] Listening for GoFree on ${GOFREE_MULTICAST_GROUP}:${GOFREE_DISCOVERY_PORT}`);
-        } catch (err) {
-          console.warn('[GoFreeManager] Multicast join failed, falling back to configured host:', (err as Error).message);
-          this.clearDiscoveryTimer();
-          this.cleanupUdp();
-          this.connectTcp(this.targetIp, this.targetPort);
-        }
-      });
-    } catch (err) {
-      console.warn('[GoFreeManager] UDP socket creation failed:', (err as Error).message);
-      this.clearDiscoveryTimer();
-      this.cleanupUdp();
-      this.connectTcp(this.targetIp, this.targetPort);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // TCP connection
-  // ---------------------------------------------------------------------------
-
-  private connectTcp(ip: string, port: number): void {
-    this.setState('connecting', ip, port);
-    console.log(`[GoFreeManager] TCP connecting to ${ip}:${port}`);
-
-    const socket = new net.Socket();
-    socket.setTimeout(10000);
-
-    const fail = (err: Error) => {
-      socket.removeAllListeners();
-      if (!socket.destroyed) socket.destroy();
-      this.tcpSocket = null;
-      this.handleConnectionFailure(`TCP connect failed to ${ip}:${port}: ${err.message}`);
-    };
-
-    socket.once('error', fail);
-    socket.once('timeout', () => fail(new Error('connection timed out')));
-
-    socket.connect(port, ip, () => {
-      socket.removeListener('error', fail);
-      socket.removeListener('timeout', () => {});
-
-      this.tcpSocket = socket;
+    ws.on('open', () => {
       this.reconnectAttempts = 0;
-      this.lineBuffer = '';
-      this.setState('connected', ip, port);
-      console.log(`[GoFreeManager] TCP connected to ${ip}:${port}`);
+      this.setState('connected', this.targetHost, this.targetPort);
+      console.log(`[GoFreeManager] WebSocket connected to ${url}`);
+      this.subscribe();
+      this.startKeepalive();
+    });
 
-      socket.on('data', (data: Buffer) => this.handleData(data));
+    ws.on('message', (data: any) => {
+      // `ws` delivers Buffer/ArrayBuffer/Buffer[] depending on binaryType,
+      // but GoFree text frames always decode to UTF-8 JSON strings.
+      const text =
+        typeof data === 'string'
+          ? data
+          : Buffer.isBuffer(data)
+            ? data.toString('utf-8')
+            : String(data);
+      this.handleMessage(text);
+    });
 
-      socket.on('error', (err: Error) => {
-        console.error('[GoFreeManager] TCP error:', err.message);
-        this.cleanupTcp();
-        if (this.state === 'connected' || this.state === 'reconnecting') {
-          this.handleConnectionFailure(err.message);
-        }
-      });
+    ws.on('error', (err: Error) => {
+      // Log only — the ensuing `close` drives reconnect / state transition.
+      console.error('[GoFreeManager] WebSocket error:', err.message);
+    });
 
-      socket.on('close', () => {
-        this.cleanupTcp();
-        if (this.state === 'connected') {
-          this.handleConnectionFailure('Connection closed unexpectedly');
-        }
-      });
+    ws.on('close', (code?: number) => {
+      this.clearKeepaliveTimer();
+      this.cleanupSocket();
+      if (this.state === 'disconnected') return; // user-initiated close
+      const msg = `WebSocket closed${code != null ? ` (code=${code})` : ''}`;
+      this.handleConnectionFailure(msg);
     });
   }
 
-  // ---------------------------------------------------------------------------
-  // NMEA data handling
-  // ---------------------------------------------------------------------------
-
-  private handleData(data: Buffer): void {
-    // Accumulate in a line buffer; split on newlines
-    this.lineBuffer += data.toString('ascii');
-    const lines = this.lineBuffer.split('\n');
-    // Keep the incomplete last chunk in the buffer
-    this.lineBuffer = lines.pop() ?? '';
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.length > 0) {
-        this.parseSentence(trimmed);
-      }
-    }
+  private subscribe(): void {
+    const req = {
+      DataReq: REQUIRED_CHANNEL_IDS.map((id) => ({ id, repeat: true, inst: 0 })),
+    };
+    this.send(req);
   }
 
-  private parseSentence(sentence: string): void {
+  private send(obj: any): void {
+    if (!this.ws) return;
     try {
-      const parsed = parseNmeaSentence(sentence);
-      // nmea-simple throws on bad checksum, so chxOk should always be true here.
-      // Guard defensively anyway.
-      if (!parsed.chxOk) return;
-      this.dispatchSentence(parsed);
-    } catch {
-      // Malformed sentence (bad checksum, missing fields, unknown type) — silently skip
+      this.ws.send(JSON.stringify(obj));
+    } catch (err) {
+      console.warn('[GoFreeManager] send failed:', (err as Error).message);
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Message handling
+  // ---------------------------------------------------------------------------
 
   /**
-   * Map parsed NMEA sentence fields to N2K-compatible PGN events.
-   *
-   * Unit conversions applied to match N2K / canboatjs field format:
-   *   - Speeds: knots → m/s  (÷ 1.94384)
-   *   - Angles: degrees → radians (× π/180), with 0–2π wrapping for port/stbd
-   *   - Position: already in decimal degrees (no conversion)
-   *
-   * This makes the downstream pipeline (Dashboard.tsx, analysis-engine.ts,
-   * recording) source-agnostic — identical to NGT-1 data.
+   * Parse a raw JSON message from the H5000 and dispatch any observations.
+   * Handles both `{Data:[...]}` and `{Many:[{Data:[...]}, ...]}` envelopes.
+   * Malformed / non-JSON / non-object payloads are silently skipped.
    */
-  private dispatchSentence(parsed: any): void {
+  private handleMessage(raw: string): void {
+    if (!raw || typeof raw !== 'string') return;
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return; // non-JSON — silently skip
+    }
+    if (!parsed || typeof parsed !== 'object') return;
+
+    if (Array.isArray(parsed.Many)) {
+      for (const item of parsed.Many) {
+        if (item && Array.isArray(item.Data)) {
+          this.processObservations(item.Data);
+        }
+      }
+      return;
+    }
+
+    if (Array.isArray(parsed.Data)) {
+      this.processObservations(parsed.Data);
+    }
+    // Other message types (e.g. SettingListRsp) are ignored.
+  }
+
+  private processObservations(obs: Observation[]): void {
+    for (const o of obs) {
+      if (!o || typeof o.id !== 'number') continue;
+      if (o.valid === false) continue; // discard invalid observations
+      if (o.val === undefined || o.val === null || !Number.isFinite(o.val)) continue;
+      this.handleObservation(o);
+    }
+  }
+
+  private handleObservation(o: Observation): void {
     const ts = new Date().toISOString();
+    const val = o.val as number;
 
-    switch (parsed.sentenceId) {
-      case 'MWV': {
-        // $WIMWV — Wind Speed and Angle
-        // nmea-simple returns NaN (not null) for missing numeric fields;
-        // JSON.stringify shows NaN as null but NaN == null is false.
-        if (!Number.isFinite(parsed.speed) || !Number.isFinite(parsed.windAngle)) return;
-        // NMEA angles can be signed (negative = port); normalize to 0–360°
-        const angleDeg360 = ((parsed.windAngle % 360) + 360) % 360;
-        const angleRad = angleDeg360 * DEG_TO_RAD;
-        const speedMs = (parsed.speed as number) * KTS_TO_MS;
-
-        if (parsed.reference === 'relative') {
-          // Apparent wind
-          this.lastAwsKts = parsed.speed as number;
-          this.lastAwaDeg = angleDeg360;
-
-          this.emitPgn(PGN_WIND, {
-            windSpeed: speedMs,
-            windAngle: angleRad,
-            reference: 'Apparent',
-          }, ts);
-
-          // True wind fallback: compute from apparent wind + STW when no ref=T sentence
-          // arrives in this connection session (mirrors the renderer's computeTrueWind path)
-          if (!this.hasTrueWindSentence && this.lastStwKts !== null) {
-            const tw = computeTrueWind(parsed.speed as number, angleDeg360, this.lastStwKts);
-            const twaRad = tw.twa * DEG_TO_RAD;
-            this.emitPgn(PGN_WIND, {
-              windSpeed: tw.tws * KTS_TO_MS,
-              windAngle: twaRad,
-              reference: 'True (boat referenced)',
-            }, ts);
-          }
-        } else if (parsed.reference === 'true') {
-          // True wind — use directly
-          this.hasTrueWindSentence = true;
-          this.emitPgn(PGN_WIND, {
-            windSpeed: speedMs,
-            windAngle: angleRad,
-            reference: 'True (boat referenced)',
-          }, ts);
+    switch (o.id) {
+      case CH_TWA: {
+        // Signed degrees (negative = port). Normalize to 0–360° so downstream
+        // normalizeWindAngle() logic matches the NGT-1 path.
+        const deg360 = ((val % 360) + 360) % 360;
+        this.lastTwaDeg = deg360;
+        const fields: Record<string, any> = {
+          windAngle: deg360 * DEG_TO_RAD,
+          reference: 'True (boat referenced)',
+        };
+        if (this.lastTwsKts !== null) {
+          fields.windSpeed = this.lastTwsKts * KTS_TO_MS;
         }
+        this.emitPgn(PGN_WIND, fields, ts);
         break;
       }
-
-      case 'VHW': {
-        // $IIVHW — Speed Through Water + Heading Magnetic
-        if (Number.isFinite(parsed.speedKnots)) {
-          this.lastStwKts = parsed.speedKnots as number;
-          this.emitPgn(PGN_STW, {
-            speedWaterReferenced: (parsed.speedKnots as number) * KTS_TO_MS,
-          }, ts);
+      case CH_TWS: {
+        this.lastTwsKts = val;
+        const fields: Record<string, any> = {
+          windSpeed: val * KTS_TO_MS,
+          reference: 'True (boat referenced)',
+        };
+        if (this.lastTwaDeg !== null) {
+          fields.windAngle = this.lastTwaDeg * DEG_TO_RAD;
         }
-        if (Number.isFinite(parsed.degreesMagnetic)) {
-          this.emitPgn(PGN_HEADING, {
-            heading: (parsed.degreesMagnetic as number) * DEG_TO_RAD,
-          }, ts);
-        }
+        this.emitPgn(PGN_WIND, fields, ts);
         break;
       }
-
-      case 'GLL': {
-        // $GPGLL — Geographic Position: Latitude/Longitude
-        if (Number.isFinite(parsed.latitude) && Number.isFinite(parsed.longitude)) {
-          this.emitPgn(PGN_POSITION, {
-            latitude: parsed.latitude as number,
-            longitude: parsed.longitude as number,
-          }, ts);
+      case CH_AWA: {
+        const deg360 = ((val % 360) + 360) % 360;
+        this.lastAwaDeg = deg360;
+        const fields: Record<string, any> = {
+          windAngle: deg360 * DEG_TO_RAD,
+          reference: 'Apparent',
+        };
+        if (this.lastAwsKts !== null) {
+          fields.windSpeed = this.lastAwsKts * KTS_TO_MS;
         }
+        this.emitPgn(PGN_WIND, fields, ts);
         break;
       }
-
-      case 'RMC': {
-        // $GPRMC — Recommended Minimum Navigation Information
-        if (Number.isFinite(parsed.latitude) && Number.isFinite(parsed.longitude)) {
-          this.emitPgn(PGN_POSITION, {
-            latitude: parsed.latitude as number,
-            longitude: parsed.longitude as number,
-          }, ts);
+      case CH_AWS: {
+        this.lastAwsKts = val;
+        const fields: Record<string, any> = {
+          windSpeed: val * KTS_TO_MS,
+          reference: 'Apparent',
+        };
+        if (this.lastAwaDeg !== null) {
+          fields.windAngle = this.lastAwaDeg * DEG_TO_RAD;
         }
-        if (Number.isFinite(parsed.speedKnots) || Number.isFinite(parsed.trackTrue)) {
-          const sogMs = Number.isFinite(parsed.speedKnots) ? (parsed.speedKnots as number) * KTS_TO_MS : undefined;
-          const cogRad = Number.isFinite(parsed.trackTrue) ? (parsed.trackTrue as number) * DEG_TO_RAD : undefined;
-          this.emitPgn(PGN_SOG_COG, {
-            ...(sogMs !== undefined ? { sog: sogMs } : {}),
-            ...(cogRad !== undefined ? { cog: cogRad } : {}),
-          }, ts);
-        }
+        this.emitPgn(PGN_WIND, fields, ts);
         break;
       }
-
-      case 'VTG': {
-        // $GPVTG — Track Made Good and Ground Speed
-        const sogMs = Number.isFinite(parsed.speedKnots) ? (parsed.speedKnots as number) * KTS_TO_MS : undefined;
-        const cogRad = Number.isFinite(parsed.trackTrue) ? (parsed.trackTrue as number) * DEG_TO_RAD : undefined;
-        if (sogMs !== undefined || cogRad !== undefined) {
-          this.emitPgn(PGN_SOG_COG, {
-            ...(sogMs !== undefined ? { sog: sogMs } : {}),
-            ...(cogRad !== undefined ? { cog: cogRad } : {}),
-          }, ts);
-        }
+      case CH_BSPD: {
+        this.emitPgn(PGN_STW, { speedWaterReferenced: val * KTS_TO_MS }, ts);
         break;
       }
-
-      case 'HDG': {
-        // $HCHDG — Heading, Deviation and Variation
-        if (Number.isFinite(parsed.heading)) {
-          this.emitPgn(PGN_HEADING, {
-            heading: (parsed.heading as number) * DEG_TO_RAD,
-          }, ts);
-        }
+      case CH_SOG: {
+        this.emitPgn(PGN_SOG_COG, { sog: val * KTS_TO_MS }, ts);
         break;
       }
-
-      case 'HDT': {
-        // $HCHDT — Heading, True (fallback heading source)
-        if (Number.isFinite(parsed.heading)) {
-          this.emitPgn(PGN_HEADING, {
-            headingTrue: (parsed.heading as number) * DEG_TO_RAD,
-          }, ts);
-        }
+      case CH_COG: {
+        this.emitPgn(PGN_SOG_COG, { cog: val * DEG_TO_RAD }, ts);
         break;
       }
-
+      case CH_HDG: {
+        this.emitPgn(PGN_HEADING, { heading: val * DEG_TO_RAD }, ts);
+        break;
+      }
+      case CH_LAT: {
+        this.emitPgn(PGN_POSITION, { latitude: val }, ts);
+        break;
+      }
+      case CH_LON: {
+        this.emitPgn(PGN_POSITION, { longitude: val }, ts);
+        break;
+      }
+      case CH_VMG: {
+        // Logged but no dashboard tile required — attach to PGN_WIND payload
+        // as an auxiliary field so downstream store code can pick it up if
+        // it wants without breaking source-agnosticism.
+        this.emitPgn(PGN_WIND, { vmg: val * KTS_TO_MS }, ts);
+        break;
+      }
+      case CH_LEE: {
+        // Leeway in degrees — attached to PGN_HEADING for downstream storage.
+        this.emitPgn(PGN_HEADING, { leeway: val * DEG_TO_RAD }, ts);
+        break;
+      }
       default:
-        // Unknown sentence type — silently ignore per spec
+        // Unknown channel ID — silently ignored.
         break;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Keepalive
+  // ---------------------------------------------------------------------------
+
+  private startKeepalive(): void {
+    this.clearKeepaliveTimer();
+    this.keepaliveTimer = setInterval(() => {
+      this.send({ SettingListReq: [{ groupId: 2 }] });
+    }, this.keepaliveIntervalMs);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Reconnect logic
+  // ---------------------------------------------------------------------------
+
+  private handleConnectionFailure(message: string): void {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error(`[GoFreeManager] Max reconnect attempts reached: ${message}`);
+      this.setState('error', this.targetHost, this.targetPort, message);
+      return;
+    }
+    this.reconnectAttempts++;
+    console.log(
+      `[GoFreeManager] Reconnecting (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${this.reconnectIntervalMs}ms`,
+    );
+    this.setState('reconnecting', this.targetHost, this.targetPort);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.openSocket();
+    }, this.reconnectIntervalMs);
   }
 
   // ---------------------------------------------------------------------------
   // Event helpers
   // ---------------------------------------------------------------------------
 
-  private emitPgn(pgn: number, fields: Record<string, any>, timestamp: string): void {
+  private emitPgn(
+    pgn: number,
+    fields: Record<string, any>,
+    timestamp: string,
+  ): void {
     const parsed: ParsedPGN = { pgn, fields, timestamp };
     this.emit('pgn', parsed);
   }
 
-  private setState(state: GoFreeState, ip?: string, port?: number, error?: string): void {
+  private setState(
+    state: GoFreeState,
+    ip?: string,
+    port?: number,
+    error?: string,
+  ): void {
     this.state = state;
     const event: GoFreeStatusEvent = { state };
     if (ip !== undefined) event.ip = ip;
@@ -457,42 +436,20 @@ export class GoFreeManager extends EventEmitter {
   }
 
   // ---------------------------------------------------------------------------
-  // Reconnect logic
-  // ---------------------------------------------------------------------------
-
-  private handleConnectionFailure(message: string): void {
-    if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-      console.error(`[GoFreeManager] Max reconnect attempts reached: ${message}`);
-      this.setState('error', this.targetIp, this.targetPort, message);
-      return;
-    }
-
-    this.reconnectAttempts++;
-    console.log(`[GoFreeManager] Reconnecting (attempt ${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}) in ${RECONNECT_INTERVAL_MS}ms`);
-    this.setState('reconnecting', this.targetIp, this.targetPort);
-
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connectTcp(this.targetIp, this.targetPort);
-    }, RECONNECT_INTERVAL_MS);
-  }
-
-  // ---------------------------------------------------------------------------
   // Cleanup helpers
   // ---------------------------------------------------------------------------
 
   private resetSessionState(): void {
-    this.hasTrueWindSentence = false;
-    this.lastStwKts = null;
-    this.lastAwsKts = null;
+    this.lastTwaDeg = null;
+    this.lastTwsKts = null;
     this.lastAwaDeg = null;
-    this.lineBuffer = '';
+    this.lastAwsKts = null;
   }
 
-  private clearDiscoveryTimer(): void {
-    if (this.discoveryTimer !== null) {
-      clearTimeout(this.discoveryTimer);
-      this.discoveryTimer = null;
+  private clearKeepaliveTimer(): void {
+    if (this.keepaliveTimer !== null) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
     }
   }
 
@@ -503,24 +460,20 @@ export class GoFreeManager extends EventEmitter {
     }
   }
 
-  private cleanupUdp(): void {
-    if (this.udpSocket !== null) {
+  private cleanupSocket(): void {
+    if (this.ws !== null) {
       try {
-        this.udpSocket.close();
+        this.ws.removeAllListeners?.();
+        const rs = this.ws.readyState;
+        if (rs === 0 /* CONNECTING */ || rs === 1 /* OPEN */) {
+          this.ws.close?.();
+        } else {
+          this.ws.terminate?.();
+        }
       } catch {
-        // Ignore close errors
+        // Ignore cleanup errors
       }
-      this.udpSocket = null;
-    }
-  }
-
-  private cleanupTcp(): void {
-    if (this.tcpSocket !== null) {
-      this.tcpSocket.removeAllListeners();
-      if (!this.tcpSocket.destroyed) {
-        this.tcpSocket.destroy();
-      }
-      this.tcpSocket = null;
+      this.ws = null;
     }
   }
 }

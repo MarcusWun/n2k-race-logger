@@ -407,12 +407,6 @@ export class PolarEngine {
       if (points.length === 0) continue;
       // Ensure per-row points are sorted by TWA for interpolation
       points.sort((a, b) => a.twa - b.twa);
-      // Anchor every row at (0°, 0 BSP). This enables smooth linear
-      // interpolation from dead upwind (BSP=0) through each row's VMG
-      // angle — matching how Expedition models the sub-VMG polar curve.
-      // The file's (0,0) sentinel was discarded above; we add this
-      // canonical anchor explicitly so all rows share the same origin.
-      points.unshift({ twa: 0, bsp: 0 });
       rows.push({ tws, points });
     }
 
@@ -492,12 +486,12 @@ export class PolarEngine {
     const maxTWS = table.tws[table.tws.length - 1];
     if (tws < minTWS || tws > maxTWS) return null;
 
-    // Clamp TWA to grid range — angles slightly outside the polar's VMG min
-    // (e.g. sailing tighter than the recorded VMG angle) should return the
-    // boundary speed rather than null.
+    // Return null for TWA outside the polar's recorded range.
+    // No output for angles tighter than the VMG angle — the polar
+    // does not define performance there and we do not extrapolate.
     const minTWA = table.twa[0];
     const maxTWA = table.twa[table.twa.length - 1];
-    twa = Math.max(minTWA, Math.min(maxTWA, twa));
+    if (twa < minTWA || twa > maxTWA) return null;
 
     // Find surrounding TWS indices
     let twsLow = 0;

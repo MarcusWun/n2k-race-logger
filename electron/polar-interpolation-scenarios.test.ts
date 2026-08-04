@@ -100,48 +100,38 @@ describe('Scenario 2 — Within-row upwind TWS=10 TWA=43°', () => {
 
 // ===================================================================
 // Scenario 3 — Sub-VMG angle (tighter than VMG)
-// TWS=10, TWA=20°: should ramp from 0 at 0° toward VMG.
-// Pass: 0 < result < 6.16; result at 20° < result at 39.265°
+// TWS=10, TWA=20°: below polar minimum — no output (null).
+// Policy: no extrapolation below the polar's recorded VMG angle.
 // ===================================================================
 describe('Scenario 3 — Sub-VMG TWS=10 TWA=20°', () => {
-  it('PCHIP: 0 < result < 6.16; less than VMG speed', () => {
-    const result20 = engine.interpolateSpeed(stratos, 10, 20, 'pchip')!;
-    const resultVMG = engine.interpolateSpeed(stratos, 10, 39.265, 'pchip')!;
-    console.log(`[QA] Scenario 3 PCHIP: TWA=20° → ${result20.toFixed(4)} kt, VMG → ${resultVMG.toFixed(4)} kt`);
-    expect(result20).not.toBeNull();
-    expect(result20).toBeGreaterThan(0);
-    expect(result20).toBeLessThan(6.16);
-    expect(result20).toBeLessThan(resultVMG);
+  it('PCHIP: returns null (no interpolation below VMG angle)', () => {
+    const result = engine.interpolateSpeed(stratos, 10, 20, 'pchip');
+    console.log(`[QA] Scenario 3 PCHIP: TWA=20° → ${result} (expected null)`);
+    expect(result).toBeNull();
   });
 
-  it('Akima: 0 < result < 6.16; less than VMG speed', () => {
-    const result20 = engine.interpolateSpeed(stratos, 10, 20, 'akima')!;
-    const resultVMG = engine.interpolateSpeed(stratos, 10, 39.265, 'akima')!;
-    console.log(`[QA] Scenario 3 Akima: TWA=20° → ${result20.toFixed(4)} kt, VMG → ${resultVMG.toFixed(4)} kt`);
-    expect(result20).not.toBeNull();
-    expect(result20).toBeGreaterThan(0);
-    expect(result20).toBeLessThan(6.16);
-    expect(result20).toBeLessThan(resultVMG);
+  it('Akima: returns null (no interpolation below VMG angle)', () => {
+    const result = engine.interpolateSpeed(stratos, 10, 20, 'akima');
+    console.log(`[QA] Scenario 3 Akima: TWA=20° → ${result} (expected null)`);
+    expect(result).toBeNull();
   });
 });
 
 // ===================================================================
 // Scenario 4 — Dead upwind boundary
-// TWS=10, TWA=0°: expected BSP = 0 (dead upwind anchor)
+// TWS=10, TWA=0°: below polar minimum — no output (null).
 // ===================================================================
 describe('Scenario 4 — Dead upwind TWS=10 TWA=0°', () => {
-  it('PCHIP: returns exactly 0', () => {
-    const result = engine.interpolateSpeed(stratos, 10, 0, 'pchip')!;
-    console.log(`[QA] Scenario 4 PCHIP: TWA=0° → ${result} kt`);
-    expect(result).not.toBeNull();
-    expect(result).toBeCloseTo(0, 10);
+  it('PCHIP: returns null (below polar minimum)', () => {
+    const result = engine.interpolateSpeed(stratos, 10, 0, 'pchip');
+    console.log(`[QA] Scenario 4 PCHIP: TWA=0° → ${result} (expected null)`);
+    expect(result).toBeNull();
   });
 
-  it('Akima: returns exactly 0', () => {
-    const result = engine.interpolateSpeed(stratos, 10, 0, 'akima')!;
-    console.log(`[QA] Scenario 4 Akima: TWA=0° → ${result} kt`);
-    expect(result).not.toBeNull();
-    expect(result).toBeCloseTo(0, 10);
+  it('Akima: returns null (below polar minimum)', () => {
+    const result = engine.interpolateSpeed(stratos, 10, 0, 'akima');
+    console.log(`[QA] Scenario 4 Akima: TWA=0° → ${result} (expected null)`);
+    expect(result).toBeNull();
   });
 });
 

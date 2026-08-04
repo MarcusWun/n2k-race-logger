@@ -206,16 +206,14 @@ describe('Polar edge cases', () => {
     expect(result.percentPolar).toBeNull();
   });
 
-  it('clamps to boundary speed when TWA is below polar min (sailing tighter than VMG)', () => {
-    // TEST_POLAR minTWA=40 — TWA=20 clamps to 40 → returns BSP at TWS=10, TWA=40 = 3.5
+  it('returns null when TWA is outside polar range (too low — sailing tighter than VMG)', () => {
     const speed = engine.interpolateSpeed(TEST_POLAR, 10, 20);
-    expect(speed).toBeCloseTo(3.5, 2);
+    expect(speed).toBeNull();
   });
 
-  it('clamps to boundary speed when TWA is above polar max', () => {
-    // TEST_POLAR maxTWA=80 — TWA=200 clamps to 80 → returns BSP at TWS=10, TWA=80 = 5.5
+  it('returns null when TWA is outside polar range (too high)', () => {
     const speed = engine.interpolateSpeed(TEST_POLAR, 10, 200);
-    expect(speed).toBeCloseTo(5.5, 2);
+    expect(speed).toBeNull();
   });
 
   it('returns null when TWS is outside polar range (too low)', () => {
@@ -281,9 +279,8 @@ describe('Expedition polar parsing', () => {
     const table = engine.parseExpeditionContent(EXPEDITION_SAMPLE);
     expect(table).not.toBeNull();
     expect(table!.tws).toEqual([4, 6]);
-    // Union of TWA across rows, sorted; 0° anchor is added to every row
-    // for smooth sub-VMG interpolation (file sentinel discarded, then re-added)
-    expect(table!.twa).toEqual([0, 52, 60, 75, 90, 139.7, 142.85]);
+    // Union of TWA across rows, sorted, excluding the (0,0) sentinel
+    expect(table!.twa).toEqual([52, 60, 75, 90, 139.7, 142.85]);
   });
 
   it('preserves exact BSP values at each row\'s known TWA points', () => {
@@ -314,15 +311,11 @@ describe('Expedition polar parsing', () => {
     expect(Math.abs((table.speeds[1][idx1397] as number) - 4.9245)).toBeLessThan(0.1);
   });
 
-  it('adds TWA=0 anchor with BSP=0 to every row for smooth sub-VMG interpolation', () => {
+  it('discards the (TWA=0, BSP=0) sentinel from every row', () => {
     const table = engine.parseExpeditionContent(EXPEDITION_SAMPLE)!;
-    // File's (0,0) sentinel is discarded, then a canonical (0°, 0) anchor is
-    // added to every row so the polar curve ramps smoothly to 0 at dead upwind.
-    expect(table.twa[0]).toBe(0);
-    // All rows must have BSP=0 at the TWA=0 anchor
-    for (const row of table.speeds) {
-      expect(row[0]).toBe(0);
-    }
+    // The (0,0) sentinel is dropped; no 0° entry in the canonical TWA axis.
+    // Performance is undefined (null) for TWA tighter than the polar's VMG angle.
+    expect(table.twa).not.toContain(0);
   });
 
   it('ignores comment lines starting with !', () => {
@@ -334,7 +327,7 @@ describe('Expedition polar parsing', () => {
 `;
     const table = engine.parseExpeditionContent(withComments)!;
     expect(table.tws).toEqual([4, 6]);
-    expect(table.twa).toEqual([0, 52, 60]);
+    expect(table.twa).toEqual([52, 60]);
   });
 
   it('ignores blank lines', () => {
@@ -408,31 +401,36 @@ describe('Expedition polar: no inflated % polar near VMG angles', () => {
 10 0 0  39 6.50  60 7.00  90 7.00  180 4.00
 `;
 
-  it('linearly interpolates sub-VMG BSP from (0°,0) toward VMG speed for each row', () => {
+  it('holds boundary BSP (not zero) for TWS=6 at TWA below its VMG min (39°)', () => {
     const table = engine.parseExpeditionContent(VMG_POLAR)!;
     // Canonical axis includes TWA=39 (from TWS=10 row).
-    // TWS=6 VMG is at 43°. At TWA=39°, linear ramp from (0°,0) to (43°,5.50):
-    //   t = 39/43 = 0.9070 → BSP = 0.9070 * 5.50 ≈ 4.99
+    // TWS=6 has min TWA=43, so at TWA=39 it holds BSP=5.50 (boundary hold).
+    // This prevents zero-clamping from corrupting bilinear interpolation
+    // between adjacent TWS rows with different VMG minima.
     const idx39 = table.twa.indexOf(39);
     expect(idx39).toBeGreaterThanOrEqual(0);
-    // TWS=6 is speeds[0]
-    expect(table.speeds[0][idx39]).toBeCloseTo(4.99, 1);
-    // BSP must be < VMG speed (not flat-clamped to it)
-    expect(table.speeds[0][idx39]).toBeLessThan(5.50);
+    expect(table.speeds[0][idx39]).toBeCloseTo(5.50, 2);
   });
 
-  it('produces a sane polar % (not 300%+) for a segment at TWA near VMG angle', () => {
+  it('returns null polar % for TWA tighter than the VMG angle (no extrapolation below VMG)', () => {
     const table = engine.parseExpeditionContent(VMG_POLAR)!;
-    // TWS=8 (between 6 and 10), TWA=41 (between canonical 39° and 43°)
-    // With boundary-hold: both rows have real BSP near their VMG speed (~5.5–6.5)
-    // so target speed at TWS=8, TWA=41 ≈ ~6.0 kts. Actual STW=5.8 → ~97%.
-    const targetSpeed = engine.interpolateSpeed(table, 8, 41);
+    // VMG_POLAR: TWS=6 VMG=43°, TWS=10 VMG=39°.
+    // TWA=35° is below both VMG minima — no performance output.
+    const result = engine.computePerformance(table, 8, 35, 5.8);
+    expect(result.percentPolar).toBeNull();
+  });
+
+  it('returns a valid polar % for TWA at or above the VMG angle', () => {
+    const table = engine.parseExpeditionContent(VMG_POLAR)!;
+    // TWA=43° is within the canonical axis (it is TWS=6's VMG min).
+    // At TWS=8, TWA=43°: boundary-hold ensures both rows have real BSP ~5.5–6.5 kt.
+    const targetSpeed = engine.interpolateSpeed(table, 8, 43);
     expect(targetSpeed).not.toBeNull();
-    expect(targetSpeed!).toBeGreaterThan(4.0);  // Not near-zero
-    const result = engine.computePerformance(table, 8, 41, 5.8);
+    expect(targetSpeed!).toBeGreaterThan(4.0);
+    const result = engine.computePerformance(table, 8, 43, 5.8);
     expect(result.percentPolar).not.toBeNull();
-    expect(result.percentPolar!).toBeLessThan(130);  // Not 300%+
-    expect(result.percentPolar!).toBeGreaterThan(70);  // Plausible range
+    expect(result.percentPolar!).toBeLessThan(130);
+    expect(result.percentPolar!).toBeGreaterThan(70);
   });
 });
 

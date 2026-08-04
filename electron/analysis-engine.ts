@@ -7,6 +7,9 @@
  */
 
 import type { PolarTable } from './polar-engine';
+import type { InterpolationMethod } from './polar-engine';
+export type { InterpolationMethod };
+import { pchip, akima } from './spline';
 import { normalizeWindAngle, normalizeWindAngleValue, type WindSide } from './wind-utils';
 
 // Unit conversion constants (same as Dashboard.tsx)
@@ -463,9 +466,43 @@ export function computeSegmentPerformance(
   });
 }
 
-/** Bilinear interpolation — mirrors PolarEngine.interpolateSpeed. */
-export function interpolateSpeed(table: PolarTable, tws: number, twa: number): number | null {
-  if (isNaN(tws) || isNaN(twa) || tws <= 0 || twa <= 0) return null;
+// ---------------------------------------------------------------------------
+// Spline cache for TWA interpolation — mirrors polar-engine.ts approach
+// ---------------------------------------------------------------------------
+
+const _aeSplineCache = new WeakMap<PolarTable, Map<string, (x: number) => number>>();
+
+function _aeGetOrBuildSpline(
+  table: PolarTable,
+  rowIdx: number,
+  method: 'pchip' | 'akima',
+): (x: number) => number {
+  if (!_aeSplineCache.has(table)) {
+    _aeSplineCache.set(table, new Map());
+  }
+  const cache = _aeSplineCache.get(table)!;
+  const key = `${method}:${rowIdx}`;
+  if (!cache.has(key)) {
+    const xs = table.twa;
+    const ys = table.speeds[rowIdx];
+    cache.set(key, method === 'pchip' ? pchip(xs, ys) : akima(xs, ys));
+  }
+  return cache.get(key)!;
+}
+
+/**
+ * Interpolate boat speed — mirrors PolarEngine.interpolateSpeed.
+ * TWS dimension: always linear. TWA dimension: controlled by `method`.
+ *
+ * @param method  'linear' (default) | 'pchip' | 'akima'
+ */
+export function interpolateSpeed(
+  table: PolarTable,
+  tws: number,
+  twa: number,
+  method: InterpolationMethod = 'linear',
+): number | null {
+  if (isNaN(tws) || isNaN(twa) || tws <= 0 || twa < 0) return null;
 
   const minTWS = table.tws[0];
   const maxTWS = table.tws[table.tws.length - 1];
@@ -479,6 +516,28 @@ export function interpolateSpeed(table: PolarTable, tws: number, twa: number): n
   while (twsLow < table.tws.length - 1 && table.tws[twsLow + 1] <= tws) twsLow++;
   const twsHigh = Math.min(twsLow + 1, table.tws.length - 1);
 
+  if (!table.speeds[twsLow] || !table.speeds[twsHigh]) return null;
+
+  // --- Spline path (PCHIP or Akima in TWA dimension) ---
+  if (method !== 'linear') {
+    const splineFn0 = _aeGetOrBuildSpline(table, twsLow, method);
+    const speed0 = splineFn0(twa);
+
+    if (twsLow === twsHigh) {
+      return Math.round(speed0 * 100) / 100;
+    }
+
+    const splineFn1 = _aeGetOrBuildSpline(table, twsHigh, method);
+    const speed1 = splineFn1(twa);
+
+    const tws0 = table.tws[twsLow];
+    const tws1 = table.tws[twsHigh];
+    const tTWS = (tws - tws0) / (tws1 - tws0);
+    const result = speed0 * (1 - tTWS) + speed1 * tTWS;
+    return Math.round(result * 100) / 100;
+  }
+
+  // --- Linear path (original bilinear interpolation) ---
   let twaLow = 0;
   while (twaLow < table.twa.length - 1 && table.twa[twaLow + 1] <= twa) twaLow++;
   const twaHigh = Math.min(twaLow + 1, table.twa.length - 1);

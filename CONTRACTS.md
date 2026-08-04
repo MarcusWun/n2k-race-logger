@@ -48,6 +48,26 @@ type WindSide = 'port' | 'starboard' | 'centerline'
 - Side context is carried separately as port/starboard/centerline.
 - Display format uses the normalized angle plus side indicator, e.g. `45°P`, `45°S`, or centerline form where appropriate.
 
+## Polar Interpolation Method
+
+### `InterpolationMethod`
+
+```ts
+export type InterpolationMethod = 'linear' | 'pchip' | 'akima';
+```
+
+Exported from `electron/polar-engine.ts` (re-exported from `electron/analysis-engine.ts`).
+
+Controls the 1-D spline algorithm used in the TWA dimension during polar speed lookup. The TWS dimension always uses linear interpolation.
+
+- **`'linear'`** — piecewise linear (default; preserves backward compatibility for all existing call-sites that omit the parameter).
+- **`'pchip'`** — Fritsch–Carlson PCHIP; monotonicity-preserving cubic Hermite. Implemented in `electron/spline.ts`.
+- **`'akima'`** — Akima 1970 locally weighted cubic. Implemented in `electron/spline.ts`.
+
+Default is `'linear'` in both `PolarEngine.interpolateSpeed()` and the standalone `interpolateSpeed()` in `analysis-engine.ts`. The default will be updated to the QA-selected winner after Gate 1.
+
+Splines are memoised per `(PolarTable, rowIndex, method)` via a `WeakMap` so they are built once per table object and reused on subsequent calls.
+
 ## TCP Connection Contract
 
 Default TCP target remains:

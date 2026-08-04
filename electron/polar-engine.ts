@@ -1,6 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { pchip, akima } from './spline';
+
+/**
+ * Interpolation method for the TWA dimension of polar lookups.
+ * TWS dimension always uses linear interpolation.
+ * Default is 'linear' for backward compatibility.
+ */
+export type InterpolationMethod = 'linear' | 'pchip' | 'akima';
 
 /**
  * TWS column index × TWA row index → boat speed in knots.
@@ -49,6 +57,37 @@ const SUN_FAST_3300_POLAR: PolarTable = {
     [7.5, 10.0, 11.5, 12.5, 13.2, 12.8, 12.3, 11.7, 11.0, 10.3, 9.5, 8.7, 7.8, 7.0, 6.1, 5.2, 4.3],
   ],
 };
+
+// ---------------------------------------------------------------------------
+// Spline cache for polar TWA interpolation (memoised per table × row × method)
+// ---------------------------------------------------------------------------
+
+/** Key: `${method}:${rowIndex}` */
+type SplineKey = string;
+const _splineCache = new WeakMap<PolarTable, Map<SplineKey, (x: number) => number>>();
+
+/**
+ * Return a cached spline for a single TWS row of the polar table.
+ * Builds it on first access, then reuses on subsequent calls for the same
+ * (table, rowIndex, method) combination.
+ */
+function getOrBuildSpline(
+  table: PolarTable,
+  rowIdx: number,
+  method: 'pchip' | 'akima',
+): (x: number) => number {
+  if (!_splineCache.has(table)) {
+    _splineCache.set(table, new Map());
+  }
+  const cache = _splineCache.get(table)!;
+  const key: SplineKey = `${method}:${rowIdx}`;
+  if (!cache.has(key)) {
+    const xs = table.twa;
+    const ys = table.speeds[rowIdx];
+    cache.set(key, method === 'pchip' ? pchip(xs, ys) : akima(xs, ys));
+  }
+  return cache.get(key)!;
+}
 
 export class PolarEngine {
   private profiles: Map<number, BoatProfile> = new Map();
@@ -432,13 +471,21 @@ export class PolarEngine {
   }
 
   /**
-   * Bilinear interpolation of boat speed given TWS and TWA.
+   * Interpolate boat speed given TWS and TWA.
+   * TWS dimension: always linear. TWA dimension: controlled by `method`.
    * Returns null if interpolation is not possible (out of range).
+   *
+   * @param method  'linear' (default) | 'pchip' | 'akima'
    */
-  interpolateSpeed(table: PolarTable, tws: number, twa: number): number | null {
+  interpolateSpeed(
+    table: PolarTable,
+    tws: number,
+    twa: number,
+    method: InterpolationMethod = 'linear',
+  ): number | null {
     // Validate inputs
     if (isNaN(tws) || isNaN(twa)) return null;
-    if (tws <= 0 || twa <= 0) return null;
+    if (tws <= 0 || twa < 0) return null;
 
     // Check TWS bounds
     const minTWS = table.tws[0];
@@ -459,7 +506,30 @@ export class PolarEngine {
     }
     const twsHigh = Math.min(twsLow + 1, table.tws.length - 1);
 
-    // Find surrounding TWA indices
+    // Guard against invalid TWS index
+    if (twsLow >= table.tws.length || twsHigh >= table.tws.length) return null;
+    if (!table.speeds[twsLow] || !table.speeds[twsHigh]) return null;
+
+    // --- Spline path (PCHIP or Akima in TWA dimension) ---
+    if (method !== 'linear') {
+      const splineFn = getOrBuildSpline(table, twsLow, method);
+      const speed0 = splineFn(twa);
+
+      if (twsLow === twsHigh) {
+        return Math.round(speed0 * 100) / 100;
+      }
+
+      const splineFn1 = getOrBuildSpline(table, twsHigh, method);
+      const speed1 = splineFn1(twa);
+
+      const tws0 = table.tws[twsLow];
+      const tws1 = table.tws[twsHigh];
+      const tTWS = (tws - tws0) / (tws1 - tws0);
+      const result = speed0 * (1 - tTWS) + speed1 * tTWS;
+      return Math.round(result * 100) / 100;
+    }
+
+    // --- Linear path (original bilinear interpolation) ---
     let twaLow = 0;
     while (twaLow < table.twa.length - 1 && table.twa[twaLow + 1] <= twa) {
       twaLow++;
@@ -467,19 +537,10 @@ export class PolarEngine {
     const twaHigh = Math.min(twaLow + 1, table.twa.length - 1);
 
     // Guard against invalid indices
-    if (
-      twsLow >= table.tws.length ||
-      twsHigh >= table.tws.length ||
-      twaLow >= table.twa.length ||
-      twaHigh >= table.twa.length
-    ) {
-      return null;
-    }
+    if (twaLow >= table.twa.length || twaHigh >= table.twa.length) return null;
 
     // Validate speeds array dimensions
     if (
-      !table.speeds[twsLow] ||
-      !table.speeds[twsHigh] ||
       table.speeds[twsLow].length <= twaLow ||
       table.speeds[twsLow].length <= twaHigh
     ) {

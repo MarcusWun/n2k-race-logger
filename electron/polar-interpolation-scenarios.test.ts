@@ -158,7 +158,7 @@ describe('Scenario 4 — Dead upwind TWS=10 TWA=0°', () => {
 // ===================================================================
 describe('Scenario 5 — Bilinear TWS=11.3 TWA=43°', () => {
   it('PCHIP: 5.5 ≤ result ≤ 7.5; at or above linear reference', () => {
-    const linearRef = engine.interpolateSpeed(stratos, 11.3, 43)!; // default = 'linear'
+    const linearRef = engine.interpolateSpeed(stratos, 11.3, 43, 'linear')!;
     const result = engine.interpolateSpeed(stratos, 11.3, 43, 'pchip')!;
     console.log(`[QA] Scenario 5 PCHIP: ${result.toFixed(4)} kt (linear ref: ${linearRef.toFixed(4)} kt)`);
     expect(result).not.toBeNull();
@@ -169,7 +169,7 @@ describe('Scenario 5 — Bilinear TWS=11.3 TWA=43°', () => {
   });
 
   it('Akima: 5.5 ≤ result ≤ 7.5; at or above linear reference', () => {
-    const linearRef = engine.interpolateSpeed(stratos, 11.3, 43)!; // default = 'linear'
+    const linearRef = engine.interpolateSpeed(stratos, 11.3, 43, 'linear')!;
     const result = engine.interpolateSpeed(stratos, 11.3, 43, 'akima')!;
     console.log(`[QA] Scenario 5 Akima: ${result.toFixed(4)} kt (linear ref: ${linearRef.toFixed(4)} kt)`);
     expect(result).not.toBeNull();
@@ -282,9 +282,9 @@ describe('Scenario 8 — Regression guard: .pol 3×3 grid', () => {
     expect(result).toBeLessThan(5.0 + 0.1);
   });
 
-  it('Linear (default) still works unchanged at TWS=8 TWA=50', () => {
-    // Verify backward compat: no-method call uses linear, same as before
-    const linear = engine.interpolateSpeed(pol, 8, 50);
+  it('Linear explicit still gives 3.375 at TWS=8 TWA=50', () => {
+    // Verify the linear path is still correct regardless of default method
+    const linear = engine.interpolateSpeed(pol, 8, 50, 'linear');
     const explicit = engine.interpolateSpeed(pol, 8, 50, 'linear');
     expect(linear).toBeCloseTo(3.375, 2);
     expect(explicit).toBeCloseTo(3.375, 2);

@@ -3,6 +3,7 @@ import type { PolarData } from '../../types/polar';
 import { usePolarStore } from '../../store/usePolarStore';
 import { useN2KStore } from '../../store/useN2KStore';
 import { normalizedWindAngleValue } from '../../utils/angles';
+import { pchip } from '../../lib/spline';
 
 interface PolarDiagramProps {
   polarData: PolarData | null;
@@ -33,24 +34,15 @@ function polarToCanvas(
 }
 
 /**
- * 1-D linear interpolation within a single TWS row.
- * twaAxis and speedRow are parallel arrays from polarData.
+ * Build a PCHIP evaluator for a single TWS row.
+ * Returns a function (twa) → speed.  Falls back to 0 for degenerate rows.
  */
-function interpolateRowSpeed(
+function buildRowEvaluator(
   twaAxis: number[],
   speedRow: number[],
-  targetTwa: number,
-): number {
-  if (twaAxis.length === 0) return 0;
-  if (targetTwa <= twaAxis[0]) return speedRow[0] ?? 0;
-  if (targetTwa >= twaAxis[twaAxis.length - 1]) return speedRow[twaAxis.length - 1] ?? 0;
-  for (let i = 0; i < twaAxis.length - 1; i++) {
-    if (twaAxis[i] <= targetTwa && twaAxis[i + 1] >= targetTwa) {
-      const t = (targetTwa - twaAxis[i]) / (twaAxis[i + 1] - twaAxis[i]);
-      return speedRow[i] * (1 - t) + speedRow[i + 1] * t;
-    }
-  }
-  return 0;
+): (twa: number) => number {
+  if (twaAxis.length < 2) return () => speedRow[0] ?? 0;
+  return (twa: number) => Math.max(0, pchip(twaAxis, speedRow)(twa));
 }
 
 export default function PolarDiagram({ polarData }: PolarDiagramProps) {
@@ -164,6 +156,9 @@ export default function PolarDiagram({ polarData }: PolarDiagramProps) {
       const twaAxis = polarData.twa;
       const speedRow = polarData.speeds[twsIdx] ?? [];
 
+      // Build PCHIP evaluator once per row
+      const evalSpeed = buildRowEvaluator(twaAxis, speedRow);
+
       // Find the VMG angle: first TWA in the axis where the row has BSP > 0
       const vmgIdx = speedRow.findIndex((s) => s > 0);
       const startTwa = vmgIdx >= 0 ? Math.ceil(twaAxis[vmgIdx] ?? 0) : 1;
@@ -174,7 +169,7 @@ export default function PolarDiagram({ polarData }: PolarDiagramProps) {
 
       let started = false;
       for (let deg = startTwa; deg <= 180; deg++) {
-        const speed = interpolateRowSpeed(twaAxis, speedRow, deg);
+        const speed = evalSpeed(deg);
         if (speed <= 0) continue;
         const pt = polarToCanvas(cx, cy, deg, speed, scale);
         if (!started) { ctx.moveTo(pt.x, pt.y); started = true; }
@@ -183,7 +178,7 @@ export default function PolarDiagram({ polarData }: PolarDiagramProps) {
       if (started) ctx.stroke();
 
       // Label at 180°
-      const endSpeed = interpolateRowSpeed(twaAxis, speedRow, 180);
+      const endSpeed = evalSpeed(180);
       if (endSpeed > 0) {
         const lp = polarToCanvas(cx, cy, 180, endSpeed, scale);
         ctx.fillStyle = color;

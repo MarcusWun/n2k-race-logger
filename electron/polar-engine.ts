@@ -475,13 +475,13 @@ export class PolarEngine {
    * TWS dimension: always linear. TWA dimension: controlled by `method`.
    * Returns null if interpolation is not possible (out of range).
    *
-   * @param method  'linear' (default) | 'pchip' | 'akima'
+   * @param method  'pchip' (default) | 'linear' | 'akima'
    */
   interpolateSpeed(
     table: PolarTable,
     tws: number,
     twa: number,
-    method: InterpolationMethod = 'linear',
+    method: InterpolationMethod = 'pchip',
   ): number | null {
     // Validate inputs
     if (isNaN(tws) || isNaN(twa)) return null;

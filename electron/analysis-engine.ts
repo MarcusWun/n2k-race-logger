@@ -494,13 +494,13 @@ function _aeGetOrBuildSpline(
  * Interpolate boat speed — mirrors PolarEngine.interpolateSpeed.
  * TWS dimension: always linear. TWA dimension: controlled by `method`.
  *
- * @param method  'linear' (default) | 'pchip' | 'akima'
+ * @param method  'pchip' (default) | 'linear' | 'akima'
  */
 export function interpolateSpeed(
   table: PolarTable,
   tws: number,
   twa: number,
-  method: InterpolationMethod = 'linear',
+  method: InterpolationMethod = 'pchip',
 ): number | null {
   if (isNaN(tws) || isNaN(twa) || tws <= 0 || twa < 0) return null;
 

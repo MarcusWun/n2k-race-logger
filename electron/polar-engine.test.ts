@@ -138,14 +138,14 @@ describe('TWA interpolation', () => {
     // TWA=47 is 2/7 of the way from 45 to 52
     // At TWS=6: speed at TWA=45 is 2.0, speed at TWA=52 is 2.5
     // Interpolated: 2.0 + (2/7) * (2.5 - 2.0) = 2.0 + 0.142857 = 2.142857
-    const speed = engine.interpolateSpeed(TWA_INTERP_TABLE, 6, 47);
+    const speed = engine.interpolateSpeed(TWA_INTERP_TABLE, 6, 47, 'linear');
     expect(speed).toBeCloseTo(2.14, 1);
   });
 
   it('interpolates TWA=47 at exact TWS=10', () => {
     // At TWS=10: speed at TWA=45 is 3.5, speed at TWA=52 is 4.2
     // Interpolated: 3.5 + (2/7) * (4.2 - 3.5) = 3.5 + 0.2 = 3.7
-    const speed = engine.interpolateSpeed(TWA_INTERP_TABLE, 10, 47);
+    const speed = engine.interpolateSpeed(TWA_INTERP_TABLE, 10, 47, 'linear');
     expect(speed).toBeCloseTo(3.7, 1);
   });
 });
@@ -254,7 +254,7 @@ describe('Bilinear interpolation', () => {
     // edge0 = 2.0*0.5 + 3.0*0.5 = 2.5
     // edge1 = 3.5*0.5 + 5.0*0.5 = 4.25
     // result = 2.5*0.5 + 4.25*0.5 = 3.375
-    const speed = engine.interpolateSpeed(TEST_POLAR, 8, 50);
+    const speed = engine.interpolateSpeed(TEST_POLAR, 8, 50, 'linear');
     expect(speed).toBeCloseTo(3.375, 2);
   });
 });

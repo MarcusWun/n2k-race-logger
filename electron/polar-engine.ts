@@ -6,7 +6,7 @@ import { pchip, akima } from './spline';
 /**
  * Interpolation method for the TWA dimension of polar lookups.
  * TWS dimension always uses linear interpolation.
- * Default is 'linear' for backward compatibility.
+ * Default is 'pchip' (selected as QA Gate 1 winner on 2026-08-03; use 'linear' for exact backward-compatible behavior).
  */
 export type InterpolationMethod = 'linear' | 'pchip' | 'akima';
 

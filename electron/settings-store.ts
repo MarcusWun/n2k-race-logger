@@ -28,7 +28,7 @@ export const DEFAULT_SETTINGS: Record<string, any> = {
   sailInventory: DEFAULT_SAIL_INVENTORY.map((s) => ({ ...s })),
   // Phase 2.7: GoFree Ethernet Data Source
   dataSource: 'ngt1' as 'ngt1' | 'gofree',
-  gofreeHost: '192.168.0.1',
+  gofreeHost: '192.168.1.233',
   gofreePort: 2053,
 };
 

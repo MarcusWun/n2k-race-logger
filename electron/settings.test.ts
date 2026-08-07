@@ -190,7 +190,7 @@ describe('GoFree settings — Phase 2.7', () => {
   it('new settings fields have correct defaults when file is absent', () => {
     const loaded = loadAppSettings();
     expect(loaded.dataSource).toBe('ngt1');
-    expect(loaded.gofreeHost).toBe('192.168.0.1');
+    expect(loaded.gofreeHost).toBe('192.168.1.233');
     expect(loaded.gofreePort).toBe(2053);
   });
 
@@ -213,7 +213,7 @@ describe('GoFree settings — Phase 2.7', () => {
     const loaded = loadAppSettings();
     // GoFree defaults are filled in
     expect(loaded.dataSource).toBe('ngt1');
-    expect(loaded.gofreeHost).toBe('192.168.0.1');
+    expect(loaded.gofreeHost).toBe('192.168.1.233');
     expect(loaded.gofreePort).toBe(2053);
     // Existing fields are preserved
     expect(loaded.serialPort).toBe('COM5');

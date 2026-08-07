@@ -320,7 +320,7 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     MockWebSocket.instances.length = 0;
   });
 
-  it('full 3-step handshake: DataListReq → DataInfoReq → DataReq with correct inst', async () => {
+  it('2-step handshake: DataListReq → DataList → batch DataReq(s) for all available channels', async () => {
     const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
     await mgr.connect('127.0.0.1', 2053);
 
@@ -328,42 +328,50 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     expect(ws).toBeDefined();
     ws.simulateOpen();
 
-    // Step 1: DataListReq sent
+    // Step 1: DataListReq sent immediately on open
     expect(ws.sent).toHaveLength(1);
     expect(JSON.parse(ws.sent[0]).DataListReq).toMatchObject({ group: 40 });
 
-    // H5000 responds with DataList
+    // H5000 responds with DataList (12 channels — fits in one batch of 40)
     const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
-    // Step 2: DataInfoReq sent for matching IDs
+    // Step 2: DataReq sent for ALL available IDs (no DataInfoReq step)
     expect(ws.sent).toHaveLength(2);
-    const infoReq = JSON.parse(ws.sent[1]);
-    expect(Array.isArray(infoReq.DataInfoReq)).toBe(true);
-    const infoIds = [...infoReq.DataInfoReq].sort((a: number, b: number) => a - b);
-    expect(infoIds).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422]);
-
-    // H5000 responds with DataInfo (inst=0 for all, inst=1 for one channel)
-    ws.simulateMessage(JSON.stringify({
-      DataInfo: allIds.map((id) => ({
-        id,
-        instanceInfo: [{ inst: id === 42 ? 1 : 0 }], // BSPD uses inst=1 in this test
-      })),
-    }));
-
-    // Step 3: DataReq sent with correct instance numbers from DataInfo
-    expect(ws.sent).toHaveLength(3);
-    const req = JSON.parse(ws.sent[2]);
+    const req = JSON.parse(ws.sent[1]);
     expect(Array.isArray(req.DataReq)).toBe(true);
+    const sentIds = req.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
+    expect(sentIds).toEqual(allIds.slice().sort((a, b) => a - b));
     for (const entry of req.DataReq) {
       expect(entry.repeat).toBe(true);
-      // Channel 42 (BSPD) should use inst=1 as returned by DataInfo
-      if (entry.id === 42) {
-        expect(entry.inst).toBe(1);
-      } else {
-        expect(entry.inst).toBe(0);
-      }
+      expect(entry.inst).toBe(0);
     }
+
+    await mgr.disconnect();
+  });
+
+  it('batch DataReq: 50 available IDs splits into 2 batches of 40', async () => {
+    const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
+    await mgr.connect('127.0.0.1', 2053);
+
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    // DataListReq sent
+    expect(ws.sent).toHaveLength(1);
+
+    // H5000 responds with 50 channels
+    const fiftyIds = Array.from({ length: 50 }, (_, i) => i + 1);
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: fiftyIds } }));
+
+    // 50 IDs / 40 batch size = 2 batches → 2 DataReq messages
+    expect(ws.sent).toHaveLength(3); // 1 DataListReq + 2 DataReq batches
+    const batch1 = JSON.parse(ws.sent[1]);
+    const batch2 = JSON.parse(ws.sent[2]);
+    expect(Array.isArray(batch1.DataReq)).toBe(true);
+    expect(Array.isArray(batch2.DataReq)).toBe(true);
+    expect(batch1.DataReq).toHaveLength(40);
+    expect(batch2.DataReq).toHaveLength(10);
 
     await mgr.disconnect();
   });
@@ -486,15 +494,7 @@ describe('GoFreeManager — integration (real WebSocket server)', () => {
           }));
           return;
         }
-        // Step 2: respond to DataInfoReq with instance metadata
-        if (msg?.DataInfoReq != null) {
-          const ids: number[] = Array.isArray(msg.DataInfoReq) ? msg.DataInfoReq : [];
-          socket.send(JSON.stringify({
-            DataInfo: ids.map((id: number) => ({ id, instanceInfo: [{ inst: 0 }] })),
-          }));
-          return;
-        }
-        // Step 3: respond to DataReq with a data stream
+        // Step 2: respond to DataReq with a data stream
         if (msg?.DataReq && !subscribeReceived) {
           subscribeReceived = msg;
           // Reply with a Data envelope covering the required channel IDs

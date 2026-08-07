@@ -119,8 +119,6 @@ export class GoFreeManager extends EventEmitter {
   private lastAwsKts: number | null = null;
   private discoveryTimer: ReturnType<typeof setTimeout> | null = null;
   private discoveryComplete = false;
-  // IDs confirmed available in DataList, waiting for DataInfo instance details
-  private pendingInfoIds: number[] = [];
 
   private targetHost = '192.168.1.233';
   private targetPort = 2053;
@@ -226,11 +224,15 @@ export class GoFreeManager extends EventEmitter {
   }
 
   /**
-   * Step 1 of the GoFree Tier 2 handshake: request the device's data channel
-   * list. The H5000 responds with a `DataList` message.
-   * On receiving DataList we send DataInfoReq (step 2).
-   * If no DataList arrives within DISCOVERY_TIMEOUT_MS we fall back to
-   * subscribing directly with default inst=0 (handles older firmware).
+   * Step 1: request the full channel list from the H5000.
+   * On success we subscribe to all available channels in batches (step 2).
+   * Fallback: if no DataList arrives in time, subscribe directly to
+   * REQUIRED_CHANNEL_IDS with inst=0.
+   *
+   * The C++ B-G-H5000-Logger subscribes to all ~350 available channels in
+   * batches of ~40 rather than a curated subset. We match that approach:
+   * subscribing to all available IDs ensures the H5000 starts streaming,
+   * and we filter the incoming data by channel ID on our side.
    */
   private startDiscovery(): void {
     this.discoveryComplete = false;
@@ -241,36 +243,39 @@ export class GoFreeManager extends EventEmitter {
     this.discoveryTimer = setTimeout(() => {
       this.discoveryTimer = null;
       if (!this.discoveryComplete) {
-        this.emit('debug', '[GoFree] DataList timeout — falling back to direct DataReq (inst=0)');
-        this.subscribe(REQUIRED_CHANNEL_IDS.map((id) => ({ id, inst: 0 })));
+        this.emit('debug', '[GoFree] DataList timeout — subscribing to required IDs directly');
+        this.subscribeInBatches(REQUIRED_CHANNEL_IDS);
       }
     }, DISCOVERY_TIMEOUT_MS);
   }
 
   /**
-   * Step 2: request instance metadata for the channel IDs we want.
-   * Called after DataList confirms they exist on this device.
+   * Step 2: subscribe to all available channel IDs in batches of 40.
+   * Matching the C++ logger's approach: subscribe broadly, filter locally.
    */
-  private requestInfo(ids: number[]): void {
-    this.pendingInfoIds = ids;
-    this.emit('debug', `[GoFree] Step 2: Sending DataInfoReq for ${ids.length} channels`);
-    this.send({ DataInfoReq: ids });
-  }
-
-  /**
-   * Step 3: send DataReq for each channel with its confirmed instance number.
-   */
-  private subscribe(entries: Array<{ id: number; inst: number }>): void {
+  private subscribeAll(availableIds: number[]): void {
     this.discoveryComplete = true;
     if (this.discoveryTimer !== null) {
       clearTimeout(this.discoveryTimer);
       this.discoveryTimer = null;
     }
-    const req = {
-      DataReq: entries.map(({ id, inst }) => ({ id, repeat: true, inst })),
-    };
-    this.emit('debug', `[GoFree] Step 3: Sending DataReq for ${entries.length} channels: ${entries.map((e) => e.id).join(',')}`);
-    this.send(req);
+    this.emit('debug', `[GoFree] Step 2: Subscribing to all ${availableIds.length} available channels in batches`);
+    this.subscribeInBatches(availableIds);
+  }
+
+  /** Send DataReq in batches of 40, inst=0 for all. */
+  private subscribeInBatches(ids: number[], batchSize = 40): void {
+    const batches: number[][] = [];
+    for (let i = 0; i < ids.length; i += batchSize) {
+      batches.push(ids.slice(i, i + batchSize));
+    }
+    this.emit('debug', `[GoFree] Sending ${batches.length} DataReq batch(es) for ${ids.length} channels`);
+    for (const batch of batches) {
+      const req = {
+        DataReq: batch.map((id) => ({ id, repeat: true, inst: 0 })),
+      };
+      this.send(req);
+    }
   }
 
   private send(obj: any): void {
@@ -309,37 +314,14 @@ export class GoFreeManager extends EventEmitter {
     // Log the top-level keys so we can see the envelope structure.
     this.emit('debug', `[GoFree keys] ${Object.keys(parsed).join(', ')}`);
 
-    // Step 1 response: DataList → move to step 2 (DataInfoReq)
+    // Step 1 response: DataList → subscribe to all available channels in batches
     if (parsed.DataList != null) {
       const available: number[] = Array.isArray(parsed.DataList.list)
         ? parsed.DataList.list
         : [];
       this.emit('debug', `[GoFree] DataList received — ${available.length} channels available`);
-      const toQuery = available.length > 0
-        ? REQUIRED_CHANNEL_IDS.filter((id) => available.includes(id))
-        : REQUIRED_CHANNEL_IDS;
-      this.requestInfo(toQuery);
-      return;
-    }
-
-    // Step 2 response: DataInfo → move to step 3 (DataReq with correct inst)
-    if (parsed.DataInfo != null) {
-      const info: any[] = Array.isArray(parsed.DataInfo) ? parsed.DataInfo : [];
-      this.emit('debug', `[GoFree] DataInfo received — ${info.length} channel descriptors`);
-      const entries: Array<{ id: number; inst: number }> = [];
-      for (const item of info) {
-        if (typeof item.id !== 'number') continue;
-        // Use first available instance; fall back to 0
-        const inst = Array.isArray(item.instanceInfo) && item.instanceInfo.length > 0
-          ? (item.instanceInfo[0].inst ?? 0)
-          : 0;
-        entries.push({ id: item.id, inst });
-      }
-      // Fall back to required IDs with inst=0 if DataInfo was empty
-      const toSubscribe = entries.length > 0
-        ? entries
-        : this.pendingInfoIds.map((id) => ({ id, inst: 0 }));
-      this.subscribe(toSubscribe);
+      const toSubscribe = available.length > 0 ? available : REQUIRED_CHANNEL_IDS;
+      this.subscribeAll(toSubscribe);
       return;
     }
 
@@ -538,7 +520,6 @@ export class GoFreeManager extends EventEmitter {
     this.lastAwaDeg = null;
     this.lastAwsKts = null;
     this.discoveryComplete = false;
-    this.pendingInfoIds = [];
     if (this.discoveryTimer !== null) {
       clearTimeout(this.discoveryTimer);
       this.discoveryTimer = null;

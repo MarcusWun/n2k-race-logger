@@ -119,6 +119,8 @@ export class GoFreeManager extends EventEmitter {
   private lastAwsKts: number | null = null;
   private discoveryTimer: ReturnType<typeof setTimeout> | null = null;
   private discoveryComplete = false;
+  // IDs confirmed available in DataList, waiting for DataInfo instance details
+  private pendingInfoIds: number[] = [];
 
   private targetHost = '192.168.1.233';
   private targetPort = 2053;
@@ -215,48 +217,59 @@ export class GoFreeManager extends EventEmitter {
 
     ws.on('close', (code?: number) => {
       this.clearKeepaliveTimer();
+      const msg = `WebSocket closed${code != null ? ` (code=${code})` : ''}`;
+      this.emit('debug', `[GoFree] ${msg}`);
       this.cleanupSocket();
       if (this.state === 'disconnected') return; // user-initiated close
-      const msg = `WebSocket closed${code != null ? ` (code=${code})` : ''}`;
       this.handleConnectionFailure(msg);
     });
   }
 
   /**
    * Step 1 of the GoFree Tier 2 handshake: request the device's data channel
-   * list. The H5000 responds with a `DataList` message containing available
-   * channel IDs. We cross-reference against REQUIRED_CHANNEL_IDS and subscribe
-   * to those that exist on this device.
-   *
-   * If no `DataList` arrives within DISCOVERY_TIMEOUT_MS we fall back to
-   * subscribing directly with our hardcoded IDs (handles older firmware).
+   * list. The H5000 responds with a `DataList` message.
+   * On receiving DataList we send DataInfoReq (step 2).
+   * If no DataList arrives within DISCOVERY_TIMEOUT_MS we fall back to
+   * subscribing directly with default inst=0 (handles older firmware).
    */
   private startDiscovery(): void {
     this.discoveryComplete = false;
-    this.emit('debug', '[GoFree] Sending DataListReq (group 40) to begin discovery');
+    this.pendingInfoIds = [];
+    this.emit('debug', '[GoFree] Step 1: Sending DataListReq (group 40)');
     this.send({ DataListReq: { group: 40 } });
 
-    // Fallback: if no DataList arrives in time, subscribe directly.
     this.discoveryTimer = setTimeout(() => {
       this.discoveryTimer = null;
       if (!this.discoveryComplete) {
-        this.emit('debug', '[GoFree] DataList timeout — falling back to direct DataReq');
-        this.subscribe(REQUIRED_CHANNEL_IDS);
+        this.emit('debug', '[GoFree] DataList timeout — falling back to direct DataReq (inst=0)');
+        this.subscribe(REQUIRED_CHANNEL_IDS.map((id) => ({ id, inst: 0 })));
       }
     }, DISCOVERY_TIMEOUT_MS);
   }
 
-  /** Step 2: subscribe to channel IDs confirmed available on this device. */
-  private subscribe(ids: number[]): void {
+  /**
+   * Step 2: request instance metadata for the channel IDs we want.
+   * Called after DataList confirms they exist on this device.
+   */
+  private requestInfo(ids: number[]): void {
+    this.pendingInfoIds = ids;
+    this.emit('debug', `[GoFree] Step 2: Sending DataInfoReq for ${ids.length} channels`);
+    this.send({ DataInfoReq: ids });
+  }
+
+  /**
+   * Step 3: send DataReq for each channel with its confirmed instance number.
+   */
+  private subscribe(entries: Array<{ id: number; inst: number }>): void {
     this.discoveryComplete = true;
     if (this.discoveryTimer !== null) {
       clearTimeout(this.discoveryTimer);
       this.discoveryTimer = null;
     }
     const req = {
-      DataReq: ids.map((id) => ({ id, repeat: true, inst: 0 })),
+      DataReq: entries.map(({ id, inst }) => ({ id, repeat: true, inst })),
     };
-    this.emit('debug', `[GoFree] Sending DataReq for ${ids.length} channels: ${ids.join(',')}`);
+    this.emit('debug', `[GoFree] Step 3: Sending DataReq for ${entries.length} channels: ${entries.map((e) => e.id).join(',')}`);
     this.send(req);
   }
 
@@ -296,16 +309,36 @@ export class GoFreeManager extends EventEmitter {
     // Log the top-level keys so we can see the envelope structure.
     this.emit('debug', `[GoFree keys] ${Object.keys(parsed).join(', ')}`);
 
-    // DataList response: complete discovery and subscribe to matching channels.
+    // Step 1 response: DataList → move to step 2 (DataInfoReq)
     if (parsed.DataList != null) {
       const available: number[] = Array.isArray(parsed.DataList.list)
         ? parsed.DataList.list
         : [];
       this.emit('debug', `[GoFree] DataList received — ${available.length} channels available`);
-      const toSubscribe = available.length > 0
+      const toQuery = available.length > 0
         ? REQUIRED_CHANNEL_IDS.filter((id) => available.includes(id))
         : REQUIRED_CHANNEL_IDS;
-      this.emit('debug', `[GoFree] Subscribing to ${toSubscribe.length} matching channels: ${toSubscribe.join(',')}`);
+      this.requestInfo(toQuery);
+      return;
+    }
+
+    // Step 2 response: DataInfo → move to step 3 (DataReq with correct inst)
+    if (parsed.DataInfo != null) {
+      const info: any[] = Array.isArray(parsed.DataInfo) ? parsed.DataInfo : [];
+      this.emit('debug', `[GoFree] DataInfo received — ${info.length} channel descriptors`);
+      const entries: Array<{ id: number; inst: number }> = [];
+      for (const item of info) {
+        if (typeof item.id !== 'number') continue;
+        // Use first available instance; fall back to 0
+        const inst = Array.isArray(item.instanceInfo) && item.instanceInfo.length > 0
+          ? (item.instanceInfo[0].inst ?? 0)
+          : 0;
+        entries.push({ id: item.id, inst });
+      }
+      // Fall back to required IDs with inst=0 if DataInfo was empty
+      const toSubscribe = entries.length > 0
+        ? entries
+        : this.pendingInfoIds.map((id) => ({ id, inst: 0 }));
       this.subscribe(toSubscribe);
       return;
     }
@@ -505,6 +538,7 @@ export class GoFreeManager extends EventEmitter {
     this.lastAwaDeg = null;
     this.lastAwsKts = null;
     this.discoveryComplete = false;
+    this.pendingInfoIds = [];
     if (this.discoveryTimer !== null) {
       clearTimeout(this.discoveryTimer);
       this.discoveryTimer = null;

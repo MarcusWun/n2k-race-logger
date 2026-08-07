@@ -320,7 +320,7 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     MockWebSocket.instances.length = 0;
   });
 
-  it('sends DataListReq on open, then DataReq after DataList response', async () => {
+  it('full 3-step handshake: DataListReq → DataInfoReq → DataReq with correct inst', async () => {
     const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
     await mgr.connect('127.0.0.1', 2053);
 
@@ -328,28 +328,41 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     expect(ws).toBeDefined();
     ws.simulateOpen();
 
-    // First message must be DataListReq (discovery step 1)
+    // Step 1: DataListReq sent
     expect(ws.sent).toHaveLength(1);
-    const discovery = JSON.parse(ws.sent[0]);
-    expect(discovery.DataListReq).toBeDefined();
-    expect(discovery.DataListReq.group).toBe(40);
+    expect(JSON.parse(ws.sent[0]).DataListReq).toMatchObject({ group: 40 });
 
-    // Simulate H5000 DataList response with all required IDs available
+    // H5000 responds with DataList
     const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
-    // Second message must be DataReq for all matching channel IDs
+    // Step 2: DataInfoReq sent for matching IDs
     expect(ws.sent).toHaveLength(2);
-    const req = JSON.parse(ws.sent[1]);
-    expect(req.DataReq).toBeDefined();
+    const infoReq = JSON.parse(ws.sent[1]);
+    expect(Array.isArray(infoReq.DataInfoReq)).toBe(true);
+    const infoIds = [...infoReq.DataInfoReq].sort((a: number, b: number) => a - b);
+    expect(infoIds).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422]);
+
+    // H5000 responds with DataInfo (inst=0 for all, inst=1 for one channel)
+    ws.simulateMessage(JSON.stringify({
+      DataInfo: allIds.map((id) => ({
+        id,
+        instanceInfo: [{ inst: id === 42 ? 1 : 0 }], // BSPD uses inst=1 in this test
+      })),
+    }));
+
+    // Step 3: DataReq sent with correct instance numbers from DataInfo
+    expect(ws.sent).toHaveLength(3);
+    const req = JSON.parse(ws.sent[2]);
     expect(Array.isArray(req.DataReq)).toBe(true);
-
-    const ids = req.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
-    expect(ids).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422]);
-
     for (const entry of req.DataReq) {
       expect(entry.repeat).toBe(true);
-      expect(entry.inst).toBe(0);
+      // Channel 42 (BSPD) should use inst=1 as returned by DataInfo
+      if (entry.id === 42) {
+        expect(entry.inst).toBe(1);
+      } else {
+        expect(entry.inst).toBe(0);
+      }
     }
 
     await mgr.disconnect();
@@ -466,14 +479,22 @@ describe('GoFreeManager — integration (real WebSocket server)', () => {
         } catch {
           return;
         }
-        // Step 1: respond to discovery request with available channel IDs
+        // Step 1: respond to DataListReq with available channel IDs
         if (msg?.DataListReq != null) {
           socket.send(JSON.stringify({
             DataList: { groupId: 40, list: [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422] },
           }));
           return;
         }
-        // Step 2: respond to DataReq with a data stream
+        // Step 2: respond to DataInfoReq with instance metadata
+        if (msg?.DataInfoReq != null) {
+          const ids: number[] = Array.isArray(msg.DataInfoReq) ? msg.DataInfoReq : [];
+          socket.send(JSON.stringify({
+            DataInfo: ids.map((id: number) => ({ id, instanceInfo: [{ inst: 0 }] })),
+          }));
+          return;
+        }
+        // Step 3: respond to DataReq with a data stream
         if (msg?.DataReq && !subscribeReceived) {
           subscribeReceived = msg;
           // Reply with a Data envelope covering the required channel IDs

@@ -262,18 +262,25 @@ export class GoFreeManager extends EventEmitter {
     this.subscribeInBatches(availableIds);
   }
 
-  /** Send DataReq in batches of 40, inst=0 for all. */
+  /**
+   * Send DataInfoReq + DataReq in batches.
+   *
+   * The C++ B-G-H5000-Logger sends DataInfoReq immediately followed by DataReq
+   * for the same batch without waiting for a DataInfo response. The H5000
+   * appears to need DataInfoReq as a registration step before it will start
+   * streaming data for those channels. We match that pattern exactly.
+   */
   private subscribeInBatches(ids: number[], batchSize = 40): void {
     const batches: number[][] = [];
     for (let i = 0; i < ids.length; i += batchSize) {
       batches.push(ids.slice(i, i + batchSize));
     }
-    this.emit('debug', `[GoFree] Sending ${batches.length} DataReq batch(es) for ${ids.length} channels`);
+    this.emit('debug', `[GoFree] Sending ${batches.length} batch(es) (DataInfoReq+DataReq) for ${ids.length} channels`);
     for (const batch of batches) {
-      const req = {
-        DataReq: batch.map((id) => ({ id, repeat: true, inst: 0 })),
-      };
-      this.send(req);
+      // Register the channels first (no need to wait for a DataInfo response)
+      this.send({ DataInfoReq: batch });
+      // Immediately request streaming data for the same channels
+      this.send({ DataReq: batch.map((id) => ({ id, repeat: true, inst: 0 })) });
     }
   }
 

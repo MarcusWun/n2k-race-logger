@@ -1,8 +1,8 @@
 import type { GofreeStatusPayload, GofreeState } from '../types/ipc';
 import { sanitizeTcpHost, parseTcpPort, validateTcpTarget } from './tcp';
 
-const DEFAULT_GOFREE_HOST = '192.168.0.1';
-const DEFAULT_GOFREE_PORT = 10110;
+const DEFAULT_GOFREE_HOST = '192.168.1.233';
+const DEFAULT_GOFREE_PORT = 2053;
 
 /** Returns the human-readable label for a GoFree connection status payload. */
 export function getGofreeStatusLabel(status: GofreeStatusPayload | null): string {

@@ -76,6 +76,15 @@ function openDebugWindow(): void {
 }
 
 /**
+ * Get the main window's webContents for IPC push events.
+ * Using a direct reference to mainWindow is safer than BrowserWindow.getAllWindows()[0]
+ * because the debug window may be open at the same time, making getAllWindows() ordering unreliable.
+ */
+export function getMainWebContents() {
+  return mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null;
+}
+
+/**
  * Send raw data line to the debug window (if open).
  */
 export function sendDebugData(line: string): void {

@@ -82,7 +82,7 @@ export default function Settings() {
     if (draft.dataSource === 'gofree') {
       const gofreeTarget = validateGofreeTarget(draft.gofreeHost, draft.gofreePort);
       if (!gofreeTarget.ok) {
-        setDraft({ ...draft, gofreeHost: gofreeTarget.host || '192.168.0.1', gofreePort: gofreeTarget.port ?? 10110 });
+        setDraft({ ...draft, gofreeHost: gofreeTarget.host || '192.168.1.233', gofreePort: gofreeTarget.port ?? 2053 });
         setSaveError(gofreeTarget.error);
         return;
       }
@@ -171,7 +171,7 @@ export default function Settings() {
           </div>
           <p className="text-xs text-gray-500 mt-1">
             {draft.dataSource === 'gofree'
-              ? 'Receiving NMEA 0183 from a B&G GoFree router over TCP.'
+              ? 'Streaming GoFree Tier 2 data from a B&G H5000 CPU over WebSocket.'
               : 'Receiving NMEA 2000 data from an Actisense NGT-1 USB adapter.'}
           </p>
         </div>
@@ -218,11 +218,11 @@ export default function Settings() {
               <label className="block text-xs text-gray-400 mb-1">GoFree IP Address</label>
               <input
                 type="text"
-                value={draft.gofreeHost ?? '192.168.0.1'}
+                value={draft.gofreeHost ?? '192.168.1.233'}
                 onChange={(e) => setDraft({ ...draft, gofreeHost: e.target.value })}
-                onBlur={(e) => setDraft({ ...draft, gofreeHost: sanitizeGofreeHost(e.target.value) || '192.168.0.1' })}
+                onBlur={(e) => setDraft({ ...draft, gofreeHost: sanitizeGofreeHost(e.target.value) || '192.168.1.233' })}
                 className="w-full bg-n2k-bg border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
-                placeholder="192.168.0.1"
+                placeholder="192.168.1.233"
                 data-testid="gofree-host-input"
               />
             </div>
@@ -234,10 +234,10 @@ export default function Settings() {
                 min={1}
                 max={65535}
                 step={1}
-                value={draft.gofreePort ?? 10110}
+                value={draft.gofreePort ?? 2053}
                 onChange={(e) => setDraft({ ...draft, gofreePort: Number(e.target.value) })}
                 className="w-full bg-n2k-bg border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
-                placeholder="10110"
+                placeholder="2053"
                 data-testid="gofree-port-input"
               />
             </div>

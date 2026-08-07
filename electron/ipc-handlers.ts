@@ -14,7 +14,7 @@ import {
   aggregatePerformance,
 } from './analysis-engine';
 import type { SegmentThresholds, SailTagData } from './analysis-engine';
-import { sendDebugData } from './main';
+import { sendDebugData, getMainWebContents } from './main';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
@@ -118,12 +118,13 @@ let currentDataSource: 'ngt1' | 'gofree' = 'ngt1';
 // Avoids disk reads in the hot PGN event path.
 let cachedSourcePreferences: Record<number, number> = {};
 
-// Get the BrowserWindow's webContents to send IPC events to renderer
+// Get the main window's webContents to send IPC events to renderer.
+// Uses a direct reference via getMainWebContents() rather than getAllWindows()[0]
+// to avoid returning the debug window when it happens to be at index 0.
 import { BrowserWindow } from 'electron';
 
 function getWebContents() {
-  const windows = BrowserWindow.getAllWindows();
-  return windows.length > 0 ? windows[0].webContents : null;
+  return getMainWebContents();
 }
 
 /**
@@ -204,6 +205,7 @@ export function registerIPCHandlers(): void {
 
   // Forward GoFree connection state to renderer
   goFreeManager.on('gofree:status', (status: GoFreeStatusEvent) => {
+    sendDebugData(`[GoFree] Status → renderer: ${status.state}${status.error ? ` — ${status.error}` : ''}`);
     getWebContents()?.send('gofree:status', status);
   });
 
@@ -233,7 +235,7 @@ export function registerIPCHandlers(): void {
     try {
       if (currentDataSource === 'gofree') {
         const settings = loadAppSettings();
-        const gofreeHost = settings.gofreeHost || '192.168.0.1';
+        const gofreeHost = settings.gofreeHost || '192.168.1.233';
         const gofreePort = settings.gofreePort || 2053;
         await goFreeManager!.connect(gofreeHost, gofreePort);
       } else {

@@ -38,7 +38,7 @@ describe('Phase 2.7 GoFree status chip — label text', () => {
 
   it('falls back to defaults when ip/port absent in connected state', () => {
     const payload: GofreeStatusPayload = { state: 'connected' };
-    expect(getGofreeStatusLabel(payload)).toBe('GoFree — Connected (192.168.0.1:10110)');
+    expect(getGofreeStatusLabel(payload)).toBe('GoFree — Connected (192.168.1.233:2053)');
   });
 
   it('returns "GoFree — Reconnecting..." for state=reconnecting', () => {

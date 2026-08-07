@@ -236,7 +236,6 @@ export class GoFreeManager extends EventEmitter {
    */
   private startDiscovery(): void {
     this.discoveryComplete = false;
-    this.pendingInfoIds = [];
     this.emit('debug', '[GoFree] Step 1: Sending DataListReq (group 40)');
     this.send({ DataListReq: { group: 40 } });
 

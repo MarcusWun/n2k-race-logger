@@ -191,7 +191,7 @@ describe('GoFree settings — Phase 2.7', () => {
     const loaded = loadAppSettings();
     expect(loaded.dataSource).toBe('ngt1');
     expect(loaded.gofreeHost).toBe('192.168.0.1');
-    expect(loaded.gofreePort).toBe(10110);
+    expect(loaded.gofreePort).toBe(2053);
   });
 
   it('dataSource persists and reloads via spread-merge', () => {
@@ -214,7 +214,7 @@ describe('GoFree settings — Phase 2.7', () => {
     // GoFree defaults are filled in
     expect(loaded.dataSource).toBe('ngt1');
     expect(loaded.gofreeHost).toBe('192.168.0.1');
-    expect(loaded.gofreePort).toBe(10110);
+    expect(loaded.gofreePort).toBe(2053);
     // Existing fields are preserved
     expect(loaded.serialPort).toBe('COM5');
     expect(loaded.dataDirectory).toBe('/custom/races');

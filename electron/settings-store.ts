@@ -29,7 +29,7 @@ export const DEFAULT_SETTINGS: Record<string, any> = {
   // Phase 2.7: GoFree Ethernet Data Source
   dataSource: 'ngt1' as 'ngt1' | 'gofree',
   gofreeHost: '192.168.0.1',
-  gofreePort: 10110,
+  gofreePort: 2053,
 };
 
 const CRITICAL_PERSISTED_FIELDS = ['dataDirectory', 'activePolarProfile', 'sailInventory'];

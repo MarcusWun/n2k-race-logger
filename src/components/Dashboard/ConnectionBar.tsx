@@ -68,7 +68,10 @@ export default function ConnectionBar() {
   const handleConnect = async () => {
     const ipc = getIPC();
     if (!ipc) return;
-    if (status.status === 'connected') {
+    const connectedNow = isGoFree
+      ? gofreeStatus?.state === 'connected'
+      : status.status === 'connected';
+    if (connectedNow) {
       await ipc.disconnect();
     } else {
       setLocalError(null);
@@ -93,10 +96,12 @@ export default function ConnectionBar() {
     if (ipc) ipc.openDebug();
   };
 
-  const isConnected = status.status === 'connected';
-
   // FE3: Status chip adapts to active data source
   const isGoFree = dataSource === 'gofree';
+
+  const isConnected = isGoFree
+    ? gofreeStatus?.state === 'connected'
+    : status.status === 'connected';
 
   const ngt1StatusColor = {
     disconnected: 'bg-gray-500',

@@ -229,7 +229,7 @@ export function registerIPCHandlers(): void {
       if (currentDataSource === 'gofree') {
         const settings = loadAppSettings();
         const gofreeHost = settings.gofreeHost || '192.168.0.1';
-        const gofreePort = settings.gofreePort || 10110;
+        const gofreePort = settings.gofreePort || 2053;
         await goFreeManager!.connect(gofreeHost, gofreePort);
       } else {
         await serialManager!.connect(payload as any);

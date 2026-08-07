@@ -29,6 +29,9 @@ const DEFAULT_KEEPALIVE_INTERVAL_MS = 30_000;
 const DEFAULT_RECONNECT_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
 
+// How long to wait for DataList response before falling back to direct DataReq.
+const DISCOVERY_TIMEOUT_MS = 3_000;
+
 // N2K PGN numbers emitted downstream so consumers are source-agnostic.
 const PGN_WIND = 130306;      // Wind Data
 const PGN_STW = 128259;       // Speed - Water Referenced
@@ -114,6 +117,8 @@ export class GoFreeManager extends EventEmitter {
   private lastTwsKts: number | null = null;
   private lastAwaDeg: number | null = null;
   private lastAwsKts: number | null = null;
+  private discoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  private discoveryComplete = false;
 
   private targetHost = '192.168.1.233';
   private targetPort = 2053;
@@ -187,7 +192,7 @@ export class GoFreeManager extends EventEmitter {
       this.reconnectAttempts = 0;
       this.setState('connected', this.targetHost, this.targetPort);
       console.log(`[GoFreeManager] WebSocket connected to ${url}`);
-      this.subscribe();
+      this.startDiscovery();
       this.startKeepalive();
     });
 
@@ -217,11 +222,41 @@ export class GoFreeManager extends EventEmitter {
     });
   }
 
-  private subscribe(): void {
+  /**
+   * Step 1 of the GoFree Tier 2 handshake: request the device's data channel
+   * list. The H5000 responds with a `DataList` message containing available
+   * channel IDs. We cross-reference against REQUIRED_CHANNEL_IDS and subscribe
+   * to those that exist on this device.
+   *
+   * If no `DataList` arrives within DISCOVERY_TIMEOUT_MS we fall back to
+   * subscribing directly with our hardcoded IDs (handles older firmware).
+   */
+  private startDiscovery(): void {
+    this.discoveryComplete = false;
+    this.emit('debug', '[GoFree] Sending DataListReq (group 40) to begin discovery');
+    this.send({ DataListReq: { group: 40 } });
+
+    // Fallback: if no DataList arrives in time, subscribe directly.
+    this.discoveryTimer = setTimeout(() => {
+      this.discoveryTimer = null;
+      if (!this.discoveryComplete) {
+        this.emit('debug', '[GoFree] DataList timeout — falling back to direct DataReq');
+        this.subscribe(REQUIRED_CHANNEL_IDS);
+      }
+    }, DISCOVERY_TIMEOUT_MS);
+  }
+
+  /** Step 2: subscribe to channel IDs confirmed available on this device. */
+  private subscribe(ids: number[]): void {
+    this.discoveryComplete = true;
+    if (this.discoveryTimer !== null) {
+      clearTimeout(this.discoveryTimer);
+      this.discoveryTimer = null;
+    }
     const req = {
-      DataReq: REQUIRED_CHANNEL_IDS.map((id) => ({ id, repeat: true, inst: 0 })),
+      DataReq: ids.map((id) => ({ id, repeat: true, inst: 0 })),
     };
-    this.emit('debug', `[GoFree] Sending DataReq for ${REQUIRED_CHANNEL_IDS.length} channels: ${JSON.stringify(req)}`);
+    this.emit('debug', `[GoFree] Sending DataReq for ${ids.length} channels: ${ids.join(',')}`);
     this.send(req);
   }
 
@@ -260,6 +295,20 @@ export class GoFreeManager extends EventEmitter {
 
     // Log the top-level keys so we can see the envelope structure.
     this.emit('debug', `[GoFree keys] ${Object.keys(parsed).join(', ')}`);
+
+    // DataList response: complete discovery and subscribe to matching channels.
+    if (parsed.DataList != null) {
+      const available: number[] = Array.isArray(parsed.DataList.list)
+        ? parsed.DataList.list
+        : [];
+      this.emit('debug', `[GoFree] DataList received — ${available.length} channels available`);
+      const toSubscribe = available.length > 0
+        ? REQUIRED_CHANNEL_IDS.filter((id) => available.includes(id))
+        : REQUIRED_CHANNEL_IDS;
+      this.emit('debug', `[GoFree] Subscribing to ${toSubscribe.length} matching channels: ${toSubscribe.join(',')}`);
+      this.subscribe(toSubscribe);
+      return;
+    }
 
     if (Array.isArray(parsed.Many)) {
       for (const item of parsed.Many) {
@@ -455,6 +504,11 @@ export class GoFreeManager extends EventEmitter {
     this.lastTwsKts = null;
     this.lastAwaDeg = null;
     this.lastAwsKts = null;
+    this.discoveryComplete = false;
+    if (this.discoveryTimer !== null) {
+      clearTimeout(this.discoveryTimer);
+      this.discoveryTimer = null;
+    }
   }
 
   private clearKeepaliveTimer(): void {

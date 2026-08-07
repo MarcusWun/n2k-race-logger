@@ -221,6 +221,7 @@ export class GoFreeManager extends EventEmitter {
     const req = {
       DataReq: REQUIRED_CHANNEL_IDS.map((id) => ({ id, repeat: true, inst: 0 })),
     };
+    this.emit('debug', `[GoFree] Sending DataReq for ${REQUIRED_CHANNEL_IDS.length} channels: ${JSON.stringify(req)}`);
     this.send(req);
   }
 
@@ -245,13 +246,20 @@ export class GoFreeManager extends EventEmitter {
   private handleMessage(raw: string): void {
     if (!raw || typeof raw !== 'string') return;
 
+    // Emit raw message to debug window so we can inspect H5000 output.
+    this.emit('debug', `[GoFree RAW] ${raw.length > 500 ? raw.slice(0, 500) + '…' : raw}`);
+
     let parsed: any;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      return; // non-JSON — silently skip
+      this.emit('debug', '[GoFree] non-JSON message skipped');
+      return;
     }
     if (!parsed || typeof parsed !== 'object') return;
+
+    // Log the top-level keys so we can see the envelope structure.
+    this.emit('debug', `[GoFree keys] ${Object.keys(parsed).join(', ')}`);
 
     if (Array.isArray(parsed.Many)) {
       for (const item of parsed.Many) {
@@ -264,8 +272,11 @@ export class GoFreeManager extends EventEmitter {
 
     if (Array.isArray(parsed.Data)) {
       this.processObservations(parsed.Data);
+      return;
     }
-    // Other message types (e.g. SettingListRsp) are ignored.
+
+    // Log unhandled envelope types so we can detect unexpected formats.
+    this.emit('debug', `[GoFree unhandled] ${JSON.stringify(parsed).slice(0, 200)}`);
   }
 
   private processObservations(obs: Observation[]): void {

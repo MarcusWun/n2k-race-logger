@@ -192,6 +192,11 @@ export function registerIPCHandlers(): void {
   // Wire up GoFree → parser pipeline (GoFree Ethernet path)
   goFreeManager.on('pgn', handleParsedPgn);
 
+  // Route GoFree debug messages to the debug window (diagnostic logging)
+  goFreeManager.on('debug', (line: string) => {
+    sendDebugData(line);
+  });
+
   // Unknown/unparseable data from serial manager
   serialManager.on('pgn-unknown', (msg: any) => {
     sendDebugData(`Unknown N2K data: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`);

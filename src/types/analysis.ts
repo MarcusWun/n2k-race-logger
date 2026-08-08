@@ -49,6 +49,7 @@ export interface DetectedSegment {
   meanTws: number;
   meanTwa: number;
   meanStw: number;
+  meanVmg: number; // knots — STW × cos(TWA); positive = toward wind, negative = away from wind
   stdTws: number;
   stdTwa: number;
   stdStw: number;

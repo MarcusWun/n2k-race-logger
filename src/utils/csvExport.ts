@@ -34,7 +34,7 @@ export function buildPerformanceSummaryCsv(performanceSummary: PerformanceSummar
 }
 
 export function buildSegmentsCsv(segments: DetectedSegment[], startMs: number): string {
-  const headers = ['Start Time', 'Duration (s)', 'Sail Config', 'TWS (kts)', 'TWA (°)', 'STW (kts)', '% Polar', 'σ TWS', 'σ TWA', 'σ STW', 'Excluded'];
+  const headers = ['Start Time', 'Duration (s)', 'Sail Config', 'TWS (kts)', 'TWA (°)', 'STW (kts)', 'VMG (kts)', '% Polar', 'σ TWS', 'σ TWA', 'σ STW', 'Excluded'];
   const rows: string[][] = [headers];
 
   for (const seg of segments) {
@@ -51,6 +51,7 @@ export function buildSegmentsCsv(segments: DetectedSegment[], startMs: number): 
       seg.meanTws.toFixed(1),
       formatWindAngle(seg.meanTwa),
       seg.meanStw.toFixed(1),
+      seg.meanVmg.toFixed(2),
       seg.percentPolar != null ? `${seg.percentPolar}%` : '',
       seg.stdTws.toFixed(2),
       seg.stdTwa.toFixed(1),

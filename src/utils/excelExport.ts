@@ -322,6 +322,7 @@ export function createSegmentListWorkbook(
     'TWA (deg)',
     'TWA Side',
     'STW (kts)',
+    'VMG (kts)',
     '% Polar',
     'sigma TWS',
     'sigma TWA',
@@ -341,6 +342,7 @@ export function createSegmentListWorkbook(
       twa.angle,
       twa.side,
       segment.meanStw,
+      segment.meanVmg,
       segment.percentPolar,
       segment.stdTws,
       segment.stdTwa,
@@ -352,12 +354,13 @@ export function createSegmentListWorkbook(
     row.getCell(4).numFmt = '0.0';
     row.getCell(5).numFmt = '0" deg"';
     row.getCell(7).numFmt = '0.0';
-    row.getCell(8).numFmt = '0"%"';
-    row.getCell(9).numFmt = '0.00';
-    row.getCell(10).numFmt = '0.0';
-    row.getCell(11).numFmt = '0.00';
+    row.getCell(8).numFmt = '0.00'; // VMG
+    row.getCell(9).numFmt = '0"%"'; // % Polar
+    row.getCell(10).numFmt = '0.00';
+    row.getCell(11).numFmt = '0.0';
+    row.getCell(12).numFmt = '0.00';
 
-    const percentCell = row.getCell(8);
+    const percentCell = row.getCell(9);
     if (typeof percentCell.value === 'number') applyPercentPolarStyle(percentCell, percentCell.value);
 
     if (segment.excluded) {
@@ -370,18 +373,19 @@ export function createSegmentListWorkbook(
 
   sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: headers.length } };
   sheet.columns = [
-    { width: 12 },
-    { width: 12 },
-    { width: 20 },
-    { width: 10 },
-    { width: 10 },
-    { width: 9 },
-    { width: 10 },
-    { width: 10 },
-    { width: 10 },
-    { width: 10 },
-    { width: 10 },
-    { width: 10 },
+    { width: 12 }, // Start Time
+    { width: 12 }, // Duration
+    { width: 20 }, // Sail Config
+    { width: 10 }, // TWS
+    { width: 10 }, // TWA
+    { width: 9 },  // TWA Side
+    { width: 10 }, // STW
+    { width: 10 }, // VMG
+    { width: 10 }, // % Polar
+    { width: 10 }, // sigma TWS
+    { width: 10 }, // sigma TWA
+    { width: 10 }, // sigma STW
+    { width: 10 }, // Excluded
   ];
   styleWorksheetDefaults(sheet);
 

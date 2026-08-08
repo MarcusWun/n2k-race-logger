@@ -29,6 +29,7 @@ const sampleSegments: DetectedSegment[] = [
     meanTws: 12.34,
     meanTwa: 315,
     meanStw: 6.78,
+    meanVmg: 6.78 * Math.cos(315 * Math.PI / 180), // ~4.79
     stdTws: 0.23,
     stdTwa: 4.5,
     stdStw: 0.12,
@@ -46,6 +47,7 @@ const sampleSegments: DetectedSegment[] = [
     meanTws: 9.1,
     meanTwa: 88,
     meanStw: 5.4,
+    meanVmg: 5.4 * Math.cos(88 * Math.PI / 180), // ~0.19
     stdTws: 0.31,
     stdTwa: 3.2,
     stdStw: 0.19,
@@ -113,7 +115,7 @@ describe('Phase 2.4 Segment List Excel export', () => {
 
     const sheet = workbook.getWorksheet('Segment List')!;
     expect(sheet.views[0]).toMatchObject({ state: 'frozen', ySplit: 1 });
-    expect(sheet.autoFilter).toEqual({ from: { row: 1, column: 1 }, to: { row: 1, column: 12 } });
+    expect(sheet.autoFilter).toEqual({ from: { row: 1, column: 1 }, to: { row: 1, column: 13 } });
     expect(sheet.getRow(1).values).toEqual([
       undefined,
       'Start Time',
@@ -123,6 +125,7 @@ describe('Phase 2.4 Segment List Excel export', () => {
       'TWA (deg)',
       'TWA Side',
       'STW (kts)',
+      'VMG (kts)',
       '% Polar',
       'sigma TWS',
       'sigma TWA',
@@ -136,20 +139,22 @@ describe('Phase 2.4 Segment List Excel export', () => {
     expect(sheet.getCell('E2').value).toBe(45);
     expect(sheet.getCell('F2').value).toBe('P');
     expect(sheet.getCell('G2').value).toBe(6.78);
-    expect(sheet.getCell('H2').value).toBe(101);
-    expect(sheet.getCell('I2').value).toBe(0.23);
-    expect(sheet.getCell('J2').value).toBe(4.5);
-    expect(sheet.getCell('K2').value).toBe(0.12);
+    // H2 = VMG
+    expect(sheet.getCell('I2').value).toBe(101); // % Polar shifted to col 9
+    expect(sheet.getCell('J2').value).toBe(0.23);
+    expect(sheet.getCell('K2').value).toBe(4.5);
+    expect(sheet.getCell('L2').value).toBe(0.12);
     expect(sheet.getCell('D2').numFmt).toBe('0.0');
     expect(sheet.getCell('E2').numFmt).toBe('0" deg"');
-    expect(sheet.getCell('H2').numFmt).toBe('0"%"');
+    expect(sheet.getCell('H2').numFmt).toBe('0.00'); // VMG format
+    expect(sheet.getCell('I2').numFmt).toBe('0"%"'); // % Polar shifted
   });
 
   it('applies % Polar colors and visually distinguishes excluded rows', () => {
     const sheet = createSegmentListWorkbook(sampleSegments, new Date('2026-07-29T18:00:00.000Z').getTime()).getWorksheet('Segment List')!;
-    expect(fillColor(sheet.getCell('H2'))).toBe('FF166534');
-    expect(fillColor(sheet.getCell('H3'))).toBe('FFE5E7EB');
-    expect(sheet.getCell('L3').value).toBe('Yes');
+    expect(fillColor(sheet.getCell('I2'))).toBe('FF166534'); // % Polar ≥ 100 → green (col 9)
+    expect(fillColor(sheet.getCell('I3'))).toBe('FFE5E7EB'); // excluded row styling
+    expect(sheet.getCell('M3').value).toBe('Yes'); // Excluded column is col 13 (M)
   });
 });
 
@@ -163,7 +168,8 @@ describe('Phase 2.4 CSV regression safety', () => {
 
   it('keeps segment CSV normalized wind angle text and standard deviation columns unchanged', () => {
     const csv = buildSegmentsCsv(sampleSegments, new Date('2026-07-29T18:00:00.000Z').getTime());
-    expect(csv.split('\n')[0]).toBe('"Start Time","Duration (s)","Sail Config","TWS (kts)","TWA (°)","STW (kts)","% Polar","σ TWS","σ TWA","σ STW","Excluded"');
-    expect(csv.split('\n')[1]).toBe('"2:05","91","J2 + Main","12.3","45°P","6.8","101%","0.23","4.5","0.12","No"');
+    expect(csv.split('\n')[0]).toBe('"Start Time","Duration (s)","Sail Config","TWS (kts)","TWA (°)","STW (kts)","VMG (kts)","% Polar","σ TWS","σ TWA","σ STW","Excluded"');
+    expect(csv.split('\n')[1]).toContain('"2:05","91","J2 + Main","12.3","45°P","6.8"');
+    expect(csv.split('\n')[1]).toContain('"101%","0.23","4.5","0.12","No"');
   });
 });

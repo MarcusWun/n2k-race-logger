@@ -6,7 +6,7 @@ import { downloadCsv } from '../../utils/download';
 import { formatWindAngle } from '../../utils/angles';
 import { buildSegmentsCsv } from '../../utils/csvExport';
 
-type SortKey = 'startTime' | 'durationS' | 'meanTws' | 'meanTwa' | 'meanStw' | 'percentPolar' | 'sailConfig';
+type SortKey = 'startTime' | 'durationS' | 'meanTws' | 'meanTwa' | 'meanStw' | 'meanVmg' | 'percentPolar' | 'sailConfig';
 
 function formatTime(iso: string, startMs: number): string {
   const ms = new Date(iso).getTime();
@@ -113,6 +113,7 @@ export default function SegmentList() {
               <th className={thClass} onClick={() => handleSort('meanTws')}>TWS{arrow('meanTws')}</th>
               <th className={thClass} onClick={() => handleSort('meanTwa')}>TWA{arrow('meanTwa')}</th>
               <th className={thClass} onClick={() => handleSort('meanStw')}>STW{arrow('meanStw')}</th>
+              <th className={thClass} onClick={() => handleSort('meanVmg')}>VMG{arrow('meanVmg')}</th>
               <th className={thClass} onClick={() => handleSort('percentPolar')}>% Polar{arrow('percentPolar')}</th>
               <th className="px-2 py-1 text-gray-400">σ</th>
               <th className="px-2 py-1 text-gray-400">Excl</th>
@@ -131,6 +132,7 @@ export default function SegmentList() {
                 <td className="px-2 py-1.5 text-gray-300">{seg.meanTws.toFixed(1)}</td>
                 <td className="px-2 py-1.5 text-gray-300">{formatWindAngle(seg.meanTwa)}</td>
                 <td className="px-2 py-1.5 text-gray-300">{seg.meanStw.toFixed(1)}</td>
+                <td className="px-2 py-1.5 text-gray-300">{seg.meanVmg.toFixed(2)}</td>
                 <td className={`px-2 py-1.5 font-medium ${percentColor(seg.percentPolar)}`}>
                   {seg.percentPolar != null ? `${seg.percentPolar}%` : '—'}
                 </td>

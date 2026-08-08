@@ -24,6 +24,7 @@ export default function SegmentControls() {
         meanTws: s.mean_tws,
         meanTwa: s.mean_twa,
         meanStw: s.mean_stw,
+        meanVmg: s.mean_stw * Math.cos(s.mean_twa * Math.PI / 180),
         stdTws: s.std_tws,
         stdTwa: s.std_twa,
         stdStw: s.std_stw,

@@ -229,6 +229,7 @@ export default function Dashboard() {
         <InstrumentTile label="AWA" metricKey="awa" unit="°" format={(v) => formatWindAngle(v)} />
         <InstrumentTile label="COG" metricKey="cog" unit="°M" format={(v) => `${Math.round(v)}°M`} />
         <InstrumentTile label="TWD" metricKey="twd" unit="°M" format={(v) => `${Math.round(v)}°M`} />
+        <VmgTile />
         <PolarTile />
       </div>
 
@@ -239,6 +240,29 @@ export default function Dashboard() {
       <div className="mt-auto">
         <RecordingControls />
       </div>
+    </div>
+  );
+}
+
+function VmgTile() {
+  const stw = useN2KStore((s) => s.stw);
+  const twa = useN2KStore((s) => s.twa);
+  const isStale = useN2KStore((s) => s.isStale('stw') || s.isStale('twa'));
+  const vmg = stw != null && twa != null
+    ? stw * Math.cos(twa * Math.PI / 180)
+    : null;
+
+  return (
+    <div
+      className={`bg-n2k-surface rounded-lg p-4 flex flex-col items-center justify-center transition-opacity ${
+        isStale ? 'opacity-40' : 'opacity-100'
+      }`}
+    >
+      <span className="text-xs text-gray-500 uppercase tracking-wider mb-1">VMG</span>
+      <span className="text-2xl font-mono font-bold text-white">
+        {vmg !== null ? vmg.toFixed(2) : '—'}
+      </span>
+      <span className="text-xs text-gray-600 mt-1">kts</span>
     </div>
   );
 }

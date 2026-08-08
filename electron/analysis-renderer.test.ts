@@ -63,18 +63,21 @@ const SAMPLE_SEGMENTS: DetectedSegment[] = [
   {
     id: 1, raceId: 1, startTime: '2026-06-01T18:05:00Z', endTime: '2026-06-01T18:07:00Z',
     durationS: 120, meanTws: 11, meanTwa: 80, meanStw: 7.0,
+    meanVmg: 7.0 * Math.cos(80 * Math.PI / 180),
     stdTws: 0.3, stdTwa: 2, stdStw: 0.1, percentPolar: 95,
     sailConfig: 'J2 + Main', excluded: false, thresholds: DEFAULT_THRESHOLDS,
   },
   {
     id: 2, raceId: 1, startTime: '2026-06-01T18:15:00Z', endTime: '2026-06-01T18:17:00Z',
     durationS: 120, meanTws: 10.5, meanTwa: 85, meanStw: 6.5,
+    meanVmg: 6.5 * Math.cos(85 * Math.PI / 180),
     stdTws: 0.3, stdTwa: 2, stdStw: 0.1, percentPolar: 90,
     sailConfig: 'J2 + Main', excluded: false, thresholds: DEFAULT_THRESHOLDS,
   },
   {
     id: 3, raceId: 1, startTime: '2026-06-01T18:30:00Z', endTime: '2026-06-01T18:32:00Z',
     durationS: 120, meanTws: 14, meanTwa: 130, meanStw: 6.0,
+    meanVmg: 6.0 * Math.cos(130 * Math.PI / 180),
     stdTws: 0.4, stdTwa: 3, stdStw: 0.2, percentPolar: 85,
     sailConfig: 'A3 + Main', excluded: false, thresholds: DEFAULT_THRESHOLDS,
   },

@@ -280,7 +280,7 @@ export class GoFreeManager extends EventEmitter {
       // Register the channels first (no need to wait for a DataInfo response)
       this.send({ DataInfoReq: batch });
       // Immediately request streaming data for the same channels
-      this.send({ DataReq: batch.map((id) => ({ id, repeat: true, inst: 0 })) });
+      this.send({ DataReq: batch.map((id) => ({ id, repeat: 1, inst: 0 })) });
     }
   }
 

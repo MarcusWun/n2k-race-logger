@@ -348,7 +348,7 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     const sentIds = dataReq.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
     expect(sentIds).toEqual(allIds.slice().sort((a, b) => a - b));
     for (const entry of dataReq.DataReq) {
-      expect(entry.repeat).toBe(true);
+      expect(entry.repeat).toBe(1);
       expect(entry.inst).toBe(0);
     }
 

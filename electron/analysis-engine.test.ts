@@ -92,7 +92,7 @@ describe('Analysis Engine', () => {
       // AWS should be converted to knots
       expect(ts.aws[0].value).toBeCloseTo(6.0 * 1.94384, 1);
 
-      // AWA should be converted to normalized degrees with side context
+      // AWA stored as signed angle: positive = starboard
       expect(ts.awa[0].value).toBeCloseTo(45, 0);
       expect(ts.awaSide[0].value).toBe('starboard');
 
@@ -107,7 +107,7 @@ describe('Analysis Engine', () => {
       expect(ts.twd[0].value).not.toBeNull();
     });
 
-    it('normalizes port-side AWA/TWA to 0–180° while preserving side context', () => {
+    it('normalizes port-side AWA/TWA to signed angles while preserving side context', () => {
       const rows = [
         { timestamp: '2026-06-01T10:00:00.000Z', pgn: 128259, data: JSON.stringify({ speedWaterReferenced: 2.0 }) },
         { timestamp: '2026-06-01T10:00:00.000Z', pgn: 130306, data: JSON.stringify({ windSpeed: 5.0, windAngle: (315 * Math.PI) / 180, reference: 'Apparent' }) },
@@ -116,9 +116,10 @@ describe('Analysis Engine', () => {
 
       const ts = reconstructTimeSeries(rows);
 
-      expect(ts.awa[0].value).toBeCloseTo(45, 0);
+      // Port angles are stored as negative signed values
+      expect(ts.awa[0].value).toBeCloseTo(-45, 0);
       expect(ts.awaSide[0].value).toBe('port');
-      expect(ts.twa[1].value).toBeCloseTo(135, 0);
+      expect(ts.twa[1].value).toBeCloseTo(-135, 0);
       expect(ts.twaSide[1].value).toBe('port');
     });
   });

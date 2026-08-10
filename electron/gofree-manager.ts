@@ -29,8 +29,11 @@ const DEFAULT_KEEPALIVE_INTERVAL_MS = 30_000;
 const DEFAULT_RECONNECT_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
 
-// How long to wait for DataList response before falling back to direct DataReq.
+// How long to wait for DataList response before falling back to direct subscription.
 const DISCOVERY_TIMEOUT_MS = 3_000;
+
+// How long to wait for all DataInfo responses before sending DataReq anyway.
+const DATA_INFO_TIMEOUT_MS = 3_000;
 
 // N2K PGN numbers emitted downstream so consumers are source-agnostic.
 const PGN_WIND = 130306;      // Wind Data
@@ -91,6 +94,11 @@ export interface GoFreeManagerOptions {
   /** Max reconnect attempts before entering the `error` state (default 3). */
   maxReconnectAttempts?: number;
   /**
+   * How long to wait for DataInfo responses before sending DataReq anyway (default 3000).
+   * Set to a smaller value in tests that simulate sequential DataInfo responses.
+   */
+  dataInfoTimeoutMs?: number;
+  /**
    * Injectable WebSocket implementation — allows tests to substitute a mock
    * without touching the network. Defaults to the real `ws` client.
    */
@@ -101,6 +109,8 @@ interface Observation {
   id: number;
   inst?: number;
   val?: number | null;
+  /** H5000 often sends string values (e.g. "2.45909e+06") instead of numeric val. */
+  valStr?: string;
   valid?: boolean;
 }
 
@@ -120,12 +130,18 @@ export class GoFreeManager extends EventEmitter {
   private discoveryTimer: ReturnType<typeof setTimeout> | null = null;
   private discoveryComplete = false;
 
+  // Sequential subscription state: track DataInfo responses before sending DataReq.
+  private pendingDataInfo = new Set<number>();
+  private pendingDataReqIds: number[] = [];
+  private dataInfoTimer: ReturnType<typeof setTimeout> | null = null;
+
   private targetHost = '192.168.1.233';
   private targetPort = 2053;
 
   private readonly keepaliveIntervalMs: number;
   private readonly reconnectIntervalMs: number;
   private readonly maxReconnectAttempts: number;
+  private readonly dataInfoTimeoutMs: number;
   private readonly WebSocketImpl: any;
 
   constructor(options?: GoFreeManagerOptions) {
@@ -136,6 +152,8 @@ export class GoFreeManager extends EventEmitter {
       options?.reconnectIntervalMs ?? DEFAULT_RECONNECT_INTERVAL_MS;
     this.maxReconnectAttempts =
       options?.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS;
+    this.dataInfoTimeoutMs =
+      options?.dataInfoTimeoutMs ?? DATA_INFO_TIMEOUT_MS;
     this.WebSocketImpl = options?.WebSocketImpl ?? WebSocket;
   }
 
@@ -242,15 +260,18 @@ export class GoFreeManager extends EventEmitter {
     this.discoveryTimer = setTimeout(() => {
       this.discoveryTimer = null;
       if (!this.discoveryComplete) {
-        this.emit('debug', '[GoFree] DataList timeout — subscribing to required IDs directly');
-        this.subscribeInBatches(REQUIRED_CHANNEL_IDS);
+        this.emit('debug', '[GoFree] DataList timeout — sending DataInfoReq for required IDs');
+        this.sendDataInfoReqPhase(REQUIRED_CHANNEL_IDS);
       }
     }, DISCOVERY_TIMEOUT_MS);
   }
 
   /**
-   * Step 2: subscribe to all available channel IDs in batches of 40.
-   * Matching the C++ logger's approach: subscribe broadly, filter locally.
+   * Step 2a: send DataInfoReq for all available channel IDs.
+   * DataReq is NOT sent yet — we wait for DataInfo responses from the H5000
+   * to complete the registration handshake before requesting streaming data.
+   * This sequencing requirement is confirmed by the WsLogger reference
+   * implementation (B&G engineer, andy.bryson@navico.com).
    */
   private subscribeAll(availableIds: number[]): void {
     this.discoveryComplete = true;
@@ -258,29 +279,76 @@ export class GoFreeManager extends EventEmitter {
       clearTimeout(this.discoveryTimer);
       this.discoveryTimer = null;
     }
-    this.emit('debug', `[GoFree] Step 2: Subscribing to all ${availableIds.length} available channels in batches`);
-    this.subscribeInBatches(availableIds);
+    this.emit('debug', `[GoFree] Step 2a: Sending DataInfoReq for ${availableIds.length} channels`);
+    this.sendDataInfoReqPhase(availableIds);
   }
 
   /**
-   * Send DataInfoReq + DataReq in batches.
-   *
-   * The C++ B-G-H5000-Logger sends DataInfoReq immediately followed by DataReq
-   * for the same batch without waiting for a DataInfo response. The H5000
-   * appears to need DataInfoReq as a registration step before it will start
-   * streaming data for those channels. We match that pattern exactly.
+   * Send DataInfoReq in batches and arm the DataInfo-wait state machine.
+   * DataReq is deferred until all expected DataInfo responses arrive
+   * (or the dataInfoTimeoutMs fallback fires).
    */
-  private subscribeInBatches(ids: number[], batchSize = 40): void {
-    const batches: number[][] = [];
-    for (let i = 0; i < ids.length; i += batchSize) {
-      batches.push(ids.slice(i, i + batchSize));
+  private sendDataInfoReqPhase(ids: number[], batchSize = 40): void {
+    this.pendingDataInfo.clear();
+    for (const id of ids) {
+      this.pendingDataInfo.add(id);
     }
-    this.emit('debug', `[GoFree] Sending ${batches.length} batch(es) (DataInfoReq+DataReq) for ${ids.length} channels`);
-    for (const batch of batches) {
-      // Register the channels first (no need to wait for a DataInfo response)
-      this.send({ DataInfoReq: batch });
-      // Immediately request streaming data for the same channels
-      this.send({ DataReq: batch.map((id) => ({ id, repeat: 1, inst: 0 })) });
+    this.pendingDataReqIds = ids;
+
+    for (let i = 0; i < ids.length; i += batchSize) {
+      this.send({ DataInfoReq: ids.slice(i, i + batchSize) });
+    }
+
+    // Safety net: if DataInfo responses don't all arrive, send DataReq anyway.
+    this.dataInfoTimer = setTimeout(() => {
+      this.dataInfoTimer = null;
+      if (this.pendingDataInfo.size > 0) {
+        this.emit('debug',
+          `[GoFree] DataInfo timeout — ${this.pendingDataInfo.size} response(s) missing, sending DataReq`);
+        this.pendingDataInfo.clear();
+        const idsToRequest = this.pendingDataReqIds;
+        this.pendingDataReqIds = [];
+        this.sendDataReqPhase(idsToRequest);
+      }
+    }, this.dataInfoTimeoutMs);
+  }
+
+  /**
+   * Handle a DataInfo response from the H5000.
+   * When all expected DataInfo have arrived, send the DataReq to start streaming.
+   */
+  private handleDataInfoResponse(info: any): void {
+    // DataInfo can arrive as a single object {id, ...} or an array.
+    const ids: number[] = Array.isArray(info)
+      ? info.map((i: any) => i?.id).filter((id: any) => typeof id === 'number')
+      : typeof info?.id === 'number' ? [info.id] : [];
+
+    for (const id of ids) {
+      this.pendingDataInfo.delete(id);
+    }
+
+    if (this.pendingDataInfo.size === 0 && this.pendingDataReqIds.length > 0) {
+      if (this.dataInfoTimer !== null) {
+        clearTimeout(this.dataInfoTimer);
+        this.dataInfoTimer = null;
+      }
+      const idsToRequest = this.pendingDataReqIds;
+      this.pendingDataReqIds = [];
+      this.emit('debug',
+        `[GoFree] Step 2b: All DataInfo received — sending DataReq for ${idsToRequest.length} channels`);
+      this.sendDataReqPhase(idsToRequest);
+    }
+  }
+
+  /**
+   * Step 2b: send DataReq in batches to start streaming data.
+   * Called only after all DataInfo responses have been received (or timeout).
+   * `repeat: true` is the correct boolean type per the official B&G WsLogger.
+   */
+  private sendDataReqPhase(ids: number[], batchSize = 40): void {
+    for (let i = 0; i < ids.length; i += batchSize) {
+      const batch = ids.slice(i, i + batchSize);
+      this.send({ DataReq: batch.map((id) => ({ id, repeat: true, inst: 0 })) });
     }
   }
 
@@ -320,7 +388,7 @@ export class GoFreeManager extends EventEmitter {
     // Log the top-level keys so we can see the envelope structure.
     this.emit('debug', `[GoFree keys] ${Object.keys(parsed).join(', ')}`);
 
-    // Step 1 response: DataList → subscribe to all available channels in batches
+    // Step 1 response: DataList → send DataInfoReq for all available channels
     if (parsed.DataList != null) {
       const available: number[] = Array.isArray(parsed.DataList.list)
         ? parsed.DataList.list
@@ -331,8 +399,17 @@ export class GoFreeManager extends EventEmitter {
       return;
     }
 
+    // Step 2a response: DataInfo → track registration completeness, then send DataReq
+    if (parsed.DataInfo != null) {
+      this.handleDataInfoResponse(parsed.DataInfo);
+      return;
+    }
+
     if (Array.isArray(parsed.Many)) {
       for (const item of parsed.Many) {
+        if (item?.DataInfo != null) {
+          this.handleDataInfoResponse(item.DataInfo);
+        }
         if (item && Array.isArray(item.Data)) {
           this.processObservations(item.Data);
         }
@@ -353,14 +430,26 @@ export class GoFreeManager extends EventEmitter {
     for (const o of obs) {
       if (!o || typeof o.id !== 'number') continue;
       if (o.valid === false) continue; // discard invalid observations
-      if (o.val === undefined || o.val === null || !Number.isFinite(o.val)) continue;
-      this.handleObservation(o);
+
+      // Prefer numeric val; fall back to valStr (H5000 often sends string values
+      // including scientific notation, e.g. "2.45909e+06").
+      let numVal: number;
+      if (o.val !== undefined && o.val !== null && Number.isFinite(Number(o.val))) {
+        numVal = Number(o.val);
+      } else if (o.valStr !== undefined && o.valStr !== null) {
+        const parsed = parseFloat(o.valStr);
+        if (!Number.isFinite(parsed)) continue;
+        numVal = parsed;
+      } else {
+        continue;
+      }
+
+      this.handleObservation(o, numVal);
     }
   }
 
-  private handleObservation(o: Observation): void {
+  private handleObservation(o: Observation, val: number): void {
     const ts = new Date().toISOString();
-    const val = o.val as number;
 
     switch (o.id) {
       case CH_TWA: {
@@ -529,6 +618,12 @@ export class GoFreeManager extends EventEmitter {
     if (this.discoveryTimer !== null) {
       clearTimeout(this.discoveryTimer);
       this.discoveryTimer = null;
+    }
+    this.pendingDataInfo.clear();
+    this.pendingDataReqIds = [];
+    if (this.dataInfoTimer !== null) {
+      clearTimeout(this.dataInfoTimer);
+      this.dataInfoTimer = null;
     }
   }
 

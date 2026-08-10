@@ -2,7 +2,6 @@ import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { useAnalysisStore } from '../../store/useAnalysisStore';
 import type { TimeSeriesPoint, DetectedSegment, SailTag } from '../../types/analysis';
 import { jsPDF } from 'jspdf';
-import { formatWindAngle, normalizedWindAngleValue } from '../../utils/angles';
 
 const METRIC_CONFIGS: { key: string; label: string; unit: string; color: string }[] = [
   { key: 'tws', label: 'TWS', unit: 'kts', color: '#00d4ff' },
@@ -43,12 +42,17 @@ const SAIL_COLORS = ['#00d4ff', '#00ff88', '#ffaa00', '#ff4444', '#aa66ff', '#ff
 const RELATIVE_WIND_KEYS = new Set(['twa', 'awa']);
 
 function displayValueForMetric(key: string, value: number, precision = 1): string {
-  if (RELATIVE_WIND_KEYS.has(key)) return formatWindAngle(value, precision);
+  if (RELATIVE_WIND_KEYS.has(key)) {
+    // twa/awa are now stored as signed angles: negative = port, positive = starboard
+    const side = value < 0 ? 'P' : 'S';
+    return `${Math.abs(value).toFixed(precision)}°${side}`;
+  }
   return value.toFixed(precision);
 }
 
 function chartValueForMetric(key: string, value: number): number {
-  return RELATIVE_WIND_KEYS.has(key) ? normalizedWindAngleValue(value) : value;
+  // twa/awa are signed; use magnitude for Y-axis scaling/positioning
+  return RELATIVE_WIND_KEYS.has(key) ? Math.abs(value) : value;
 }
 
 export default function StripCharts({ segments, sailTags, onCursorTime }: StripChartsProps) {

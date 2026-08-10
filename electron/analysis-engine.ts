@@ -10,7 +10,7 @@ import type { PolarTable } from './polar-engine';
 import type { InterpolationMethod } from './polar-engine';
 export type { InterpolationMethod };
 import { pchip, akima } from './spline';
-import { normalizeWindAngle, normalizeWindAngleValue, type WindSide } from './wind-utils';
+import { normalizeWindAngle, type WindSide } from './wind-utils';
 
 // Unit conversion constants (same as Dashboard.tsx)
 const MS_TO_KTS = 1.94384;
@@ -207,8 +207,10 @@ export function reconstructTimeSeries(rows: RawPGNRow[]): TimeSeries {
     result.aws.push({ time: ts, value: p.aws ?? lastAws });
 
     const rawAwa = p.awa ?? lastAwa;
-    const normalizedAwa = normalizeWindAngleValue(rawAwa);
-    result.awa.push({ time: ts, value: normalizedAwa });
+    // Store signed angle: negative = port, positive = starboard. StripCharts uses
+    // Math.abs() for Y-axis and the sign for port/starboard display.
+    const signedAwa = rawAwa != null ? normalizeWindAngle(rawAwa).signedAngle : null;
+    result.awa.push({ time: ts, value: signedAwa });
     result.awaSide.push({ time: ts, value: rawAwa != null ? normalizeWindAngle(rawAwa).side : null });
 
     // True wind: prefer direct PGN values, fall back to computed
@@ -237,11 +239,11 @@ export function reconstructTimeSeries(rows: RawPGNRow[]): TimeSeries {
       }
     }
 
-    // Normalize TWA to 0–180° (port/starboard side tracked separately).
-    const normalizedTwa = normalizeWindAngleValue(twa);
+    // Store signed TWA: negative = port, positive = starboard.
+    const signedTwa = twa != null ? normalizeWindAngle(twa).signedAngle : null;
 
     result.tws.push({ time: ts, value: tws });
-    result.twa.push({ time: ts, value: normalizedTwa });
+    result.twa.push({ time: ts, value: signedTwa });
     result.twaSide.push({ time: ts, value: twa != null ? normalizeWindAngle(twa).side : null });
     result.twd.push({ time: ts, value: twd });
   }

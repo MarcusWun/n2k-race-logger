@@ -122,6 +122,13 @@ export class GoFreeManager extends EventEmitter {
   private discoveryTimer: ReturnType<typeof setTimeout> | null = null;
   private discoveryComplete = false;
 
+  // DataInfo phase: channel IDs waiting for DataInfo responses, and discovered
+  // instance numbers keyed by channel ID.
+  private pendingDataInfo: Set<number> = new Set();
+  private channelInstanceMap: Map<number, number[]> = new Map();
+  private dataInfoTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingSubscribeIds: number[] = [];
+
   private targetHost = '192.168.1.233';
   private targetPort = 2053;
 
@@ -166,6 +173,7 @@ export class GoFreeManager extends EventEmitter {
   async disconnect(): Promise<void> {
     this.clearReconnectTimer();
     this.clearKeepaliveTimer();
+    this.clearDataInfoTimer();
     this.cleanupSocket();
     this.setState('disconnected');
   }
@@ -245,22 +253,23 @@ export class GoFreeManager extends EventEmitter {
       this.discoveryTimer = null;
       if (!this.discoveryComplete) {
         this.emit('debug', '[GoFree] DataList timeout — subscribing to required channels directly');
-        this.sendDataReq(REQUIRED_CHANNEL_IDS);
+        // No DataList means no instance info — subscribe with inst:0 fallback.
+        this.pendingSubscribeIds = REQUIRED_CHANNEL_IDS;
+        this.channelInstanceMap = new Map();
+        this.sendDataReqFromMap();
       }
     }, DISCOVERY_TIMEOUT_MS);
   }
 
   /**
-   * Step 2: subscribe to the required navigation channels.
+   * Step 2: discover instance numbers for required channels, then subscribe.
    *
-   * Filters REQUIRED_CHANNEL_IDS to those present in the H5000's DataList,
-   * then sends DataReq directly — no DataInfoReq phase.
+   * Sends DataInfoReq for the 12 required channels. The H5000 responds with
+   * DataInfo per channel, including instanceInfo (which instances exist for
+   * that channel). We use those instances in DataReq so we don't hard-code
+   * inst:0 — some instruments may be on inst:1 (e.g. a second wind sensor).
    *
-   * DataInfoReq was removed after testing showed it produced zero DataInfo
-   * responses from the H5000 for navigation channels in both integer-array and
-   * object-array formats. The subsequent DataReq (after the timeout) also
-   * returned no data when subscribing to all 282 available channels. Narrowing
-   * the subscription to only the 12 required channels is the minimal approach.
+   * If DataInfo doesn't arrive within 3 s we fall back to inst:0 for all.
    */
   private subscribeAll(availableIds: number[]): void {
     this.discoveryComplete = true;
@@ -278,18 +287,83 @@ export class GoFreeManager extends EventEmitter {
     }
 
     const ids = toRequest.length > 0 ? toRequest : REQUIRED_CHANNEL_IDS;
-    this.emit('debug', `[GoFree] Step 2: Sending DataReq for ${ids.length} required channels: ${ids.join(',')}`);
-    this.sendDataReq(ids);
+    this.pendingSubscribeIds = ids;
+    this.pendingDataInfo = new Set(ids);
+    this.channelInstanceMap = new Map();
+
+    // Step 2a: request metadata to learn instance numbers per channel.
+    this.emit('debug', `[GoFree] Step 2a: Sending DataInfoReq for ${ids.length} channels: ${ids.join(',')}`);
+    this.send({ DataInfoReq: ids }); // integer array format per GoFree spec
+
+    // Fallback: if DataInfo doesn't arrive in 3 s, subscribe with inst:0.
+    this.dataInfoTimer = setTimeout(() => {
+      this.dataInfoTimer = null;
+      const noInfo = this.pendingSubscribeIds.filter((id) => !this.channelInstanceMap.has(id));
+      if (noInfo.length > 0) {
+        this.emit('debug', `[GoFree] DataInfo timeout — ${noInfo.length} channel(s) had no DataInfo, using inst:0`);
+      }
+      this.sendDataReqFromMap();
+    }, 3_000);
   }
 
   /**
-   * Send DataReq for the given channel IDs.
-   * `repeat: true` per the B&G WsLogger reference (B&G engineer source).
+   * Handle DataInfo responses from the H5000.
+   * Logs full instance info and removes each channel from the pending set.
+   * When all expected DataInfo have been received, sends DataReq immediately.
    */
-  private sendDataReq(ids: number[], batchSize = 40): void {
-    for (let i = 0; i < ids.length; i += batchSize) {
-      const batch = ids.slice(i, i + batchSize);
-      const payload = { DataReq: batch.map((id) => ({ id, repeat: true, inst: 0 })) };
+  private handleDataInfoResponse(items: any[]): void {
+    for (const item of items) {
+      const id = item?.id;
+      if (typeof id !== 'number') continue;
+      if (!this.pendingDataInfo.has(id)) continue; // not a channel we asked about
+
+      // Log the full DataInfo content so we can see instance numbers in the debug window.
+      this.emit(
+        'debug',
+        `[GoFree DataInfo] ch=${id} sname=${item.sname ?? '?'} numInst=${item.numInstances ?? '?'} ` +
+          `instances=${JSON.stringify(item.instanceInfo ?? [])}`,
+      );
+
+      // Collect all available instance numbers for this channel.
+      const instances: number[] = [];
+      if (Array.isArray(item.instanceInfo)) {
+        for (const ii of item.instanceInfo) {
+          if (typeof ii?.inst === 'number') instances.push(ii.inst);
+        }
+      }
+      if (instances.length === 0) instances.push(0); // default to inst:0
+
+      this.channelInstanceMap.set(id, instances);
+      this.pendingDataInfo.delete(id);
+    }
+
+    // If all required channels reported in, subscribe immediately without waiting for the timeout.
+    if (this.pendingDataInfo.size === 0 && this.dataInfoTimer !== null) {
+      clearTimeout(this.dataInfoTimer);
+      this.dataInfoTimer = null;
+      this.emit('debug', '[GoFree] All DataInfo received — sending DataReq');
+      this.sendDataReqFromMap();
+    }
+  }
+
+  /**
+   * Step 2b: subscribe using instances discovered via DataInfo.
+   * Channels with no DataInfo response use inst:0 as the fallback.
+   */
+  private sendDataReqFromMap(batchSize = 40): void {
+    const entries: Array<{ id: number; repeat: true; inst: number }> = [];
+
+    for (const id of this.pendingSubscribeIds) {
+      const instances = this.channelInstanceMap.get(id) ?? [0];
+      for (const inst of instances) {
+        entries.push({ id, repeat: true, inst });
+      }
+    }
+
+    this.emit('debug', `[GoFree] Step 2b: Sending DataReq for ${entries.length} channel/instance pair(s)`);
+    for (let i = 0; i < entries.length; i += batchSize) {
+      const batch = entries.slice(i, i + batchSize);
+      const payload = { DataReq: batch };
       this.emit('debug', `[GoFree OUT] ${JSON.stringify(payload)}`);
       this.send(payload);
     }
@@ -338,6 +412,12 @@ export class GoFreeManager extends EventEmitter {
         : [];
       this.emit('debug', `[GoFree] DataList received — ${available.length} channels available`);
       this.subscribeAll(available.length > 0 ? available : []);
+      return;
+    }
+
+    // DataInfo response: learn instance numbers for subscribed channels.
+    if (Array.isArray(parsed.DataInfo)) {
+      this.handleDataInfoResponse(parsed.DataInfo);
       return;
     }
 
@@ -548,9 +628,16 @@ export class GoFreeManager extends EventEmitter {
     this.lastAwaDeg = null;
     this.lastAwsKts = null;
     this.discoveryComplete = false;
+    this.pendingDataInfo = new Set();
+    this.channelInstanceMap = new Map();
+    this.pendingSubscribeIds = [];
     if (this.discoveryTimer !== null) {
       clearTimeout(this.discoveryTimer);
       this.discoveryTimer = null;
+    }
+    if (this.dataInfoTimer !== null) {
+      clearTimeout(this.dataInfoTimer);
+      this.dataInfoTimer = null;
     }
   }
 
@@ -558,6 +645,13 @@ export class GoFreeManager extends EventEmitter {
     if (this.keepaliveTimer !== null) {
       clearInterval(this.keepaliveTimer);
       this.keepaliveTimer = null;
+    }
+  }
+
+  private clearDataInfoTimer(): void {
+    if (this.dataInfoTimer !== null) {
+      clearTimeout(this.dataInfoTimer);
+      this.dataInfoTimer = null;
     }
   }
 

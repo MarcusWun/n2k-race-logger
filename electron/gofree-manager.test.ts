@@ -363,8 +363,12 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     expect(ws.sent).toHaveLength(2); // DataListReq + DataInfoReq
     const infoReq = JSON.parse(ws.sent[1]);
     expect(Array.isArray(infoReq.DataInfoReq)).toBe(true);
-    const infoIds = infoReq.DataInfoReq.slice().sort((a: number, b: number) => a - b);
+    // DataInfoReq uses object format [{id, inst}] matching DataReq's protocol shape
+    const infoIds = infoReq.DataInfoReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
     expect(infoIds).toEqual(allIds.slice().sort((a, b) => a - b));
+    for (const entry of infoReq.DataInfoReq) {
+      expect(entry.inst).toBe(0);
+    }
     // No DataReq yet — must wait for DataInfo responses
     expect(ws.sent.find((s: string) => JSON.parse(s).DataReq != null)).toBeUndefined();
 
@@ -555,8 +559,9 @@ describe('GoFreeManager — integration (real WebSocket server)', () => {
         }
         // Step 2a: respond to DataInfoReq with DataInfo for each requested channel
         if (msg?.DataInfoReq != null) {
-          for (const id of msg.DataInfoReq) {
-            socket.send(JSON.stringify({ DataInfo: { id, name: 'test', unit: '' } }));
+          for (const entry of msg.DataInfoReq) {
+            // DataInfoReq elements are {id, inst} objects
+            socket.send(JSON.stringify({ DataInfo: { id: entry.id, name: 'test', unit: '' } }));
           }
           return;
         }

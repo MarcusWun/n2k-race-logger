@@ -296,7 +296,9 @@ export class GoFreeManager extends EventEmitter {
     this.pendingDataReqIds = ids;
 
     for (let i = 0; i < ids.length; i += batchSize) {
-      this.send({ DataInfoReq: ids.slice(i, i + batchSize) });
+      const batch = ids.slice(i, i + batchSize);
+      // DataInfoReq uses the same object format as DataReq: [{id, inst}]
+      this.send({ DataInfoReq: batch.map((id) => ({ id, inst: 0 })) });
     }
 
     // Safety net: if DataInfo responses don't all arrive, send DataReq anyway.
@@ -346,9 +348,13 @@ export class GoFreeManager extends EventEmitter {
    * `repeat: true` is the correct boolean type per the official B&G WsLogger.
    */
   private sendDataReqPhase(ids: number[], batchSize = 40): void {
+    const sample = ids.slice(0, 5).join(',') + (ids.length > 5 ? ',...' : '');
+    this.emit('debug', `[GoFree] Sending DataReq for ${ids.length} channels (ids: ${sample})`);
     for (let i = 0; i < ids.length; i += batchSize) {
       const batch = ids.slice(i, i + batchSize);
-      this.send({ DataReq: batch.map((id) => ({ id, repeat: true, inst: 0 })) });
+      const payload = { DataReq: batch.map((id) => ({ id, repeat: true, inst: 0 })) };
+      this.emit('debug', `[GoFree OUT] ${JSON.stringify(payload).slice(0, 300)}`);
+      this.send(payload);
     }
   }
 

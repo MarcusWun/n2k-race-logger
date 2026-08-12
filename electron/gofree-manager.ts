@@ -300,6 +300,19 @@ export class GoFreeManager extends EventEmitter {
       `[GoFree] Step 2: Polling ${this.pollChannels.length} channels every ${this.pollIntervalMs} ms (repeat:false)`,
     );
 
+    // One-time diagnostic probe: send a single DataReq for every channel in the
+    // DataList that we don't already poll.  Responses appear in the debug window
+    // as [GoFree PROBE] lines so we can identify the correct channel IDs for any
+    // missing tiles (TWA, AWA, LAT, LON, etc.).
+    if (availableIds.length > 0) {
+      const knownSet = new Set(REQUIRED_CHANNEL_IDS);
+      const probeIds = availableIds.filter((id) => !knownSet.has(id));
+      this.emit('debug', `[GoFree PROBE] Probing ${probeIds.length} additional channels once (inst=0)…`);
+      for (const id of probeIds) {
+        this.send({ DataReq: [{ id, repeat: false, inst: 0 }] });
+      }
+    }
+
     // Poll immediately so the dashboard fills in without waiting for the first tick.
     this.sendPoll();
     this.startPollTimer();
@@ -514,7 +527,11 @@ export class GoFreeManager extends EventEmitter {
         break;
       }
       default:
-        // Unknown channel ID — silently ignored.
+        // Unknown channel — log for diagnostic probe so we can identify missing IDs.
+        this.emit(
+          'debug',
+          `[GoFree PROBE] ch${o.id}: val=${val.toFixed(4)} valStr="${o.valStr ?? ''}"`,
+        );
         break;
     }
   }

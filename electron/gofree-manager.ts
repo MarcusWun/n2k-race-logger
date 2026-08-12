@@ -29,11 +29,8 @@ const DEFAULT_KEEPALIVE_INTERVAL_MS = 30_000;
 const DEFAULT_RECONNECT_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
 
-// How long to wait for DataList response before falling back to direct subscription.
+// How long to wait for DataList response before subscribing directly.
 const DISCOVERY_TIMEOUT_MS = 3_000;
-
-// How long to wait for all DataInfo responses before sending DataReq anyway.
-const DATA_INFO_TIMEOUT_MS = 3_000;
 
 // N2K PGN numbers emitted downstream so consumers are source-agnostic.
 const PGN_WIND = 130306;      // Wind Data
@@ -94,11 +91,6 @@ export interface GoFreeManagerOptions {
   /** Max reconnect attempts before entering the `error` state (default 3). */
   maxReconnectAttempts?: number;
   /**
-   * How long to wait for DataInfo responses before sending DataReq anyway (default 3000).
-   * Set to a smaller value in tests that simulate sequential DataInfo responses.
-   */
-  dataInfoTimeoutMs?: number;
-  /**
    * Injectable WebSocket implementation — allows tests to substitute a mock
    * without touching the network. Defaults to the real `ws` client.
    */
@@ -130,18 +122,12 @@ export class GoFreeManager extends EventEmitter {
   private discoveryTimer: ReturnType<typeof setTimeout> | null = null;
   private discoveryComplete = false;
 
-  // Sequential subscription state: track DataInfo responses before sending DataReq.
-  private pendingDataInfo = new Set<number>();
-  private pendingDataReqIds: number[] = [];
-  private dataInfoTimer: ReturnType<typeof setTimeout> | null = null;
-
   private targetHost = '192.168.1.233';
   private targetPort = 2053;
 
   private readonly keepaliveIntervalMs: number;
   private readonly reconnectIntervalMs: number;
   private readonly maxReconnectAttempts: number;
-  private readonly dataInfoTimeoutMs: number;
   private readonly WebSocketImpl: any;
 
   constructor(options?: GoFreeManagerOptions) {
@@ -152,8 +138,6 @@ export class GoFreeManager extends EventEmitter {
       options?.reconnectIntervalMs ?? DEFAULT_RECONNECT_INTERVAL_MS;
     this.maxReconnectAttempts =
       options?.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS;
-    this.dataInfoTimeoutMs =
-      options?.dataInfoTimeoutMs ?? DATA_INFO_TIMEOUT_MS;
     this.WebSocketImpl = options?.WebSocketImpl ?? WebSocket;
   }
 
@@ -260,18 +244,23 @@ export class GoFreeManager extends EventEmitter {
     this.discoveryTimer = setTimeout(() => {
       this.discoveryTimer = null;
       if (!this.discoveryComplete) {
-        this.emit('debug', '[GoFree] DataList timeout — sending DataInfoReq for required IDs');
-        this.sendDataInfoReqPhase(REQUIRED_CHANNEL_IDS);
+        this.emit('debug', '[GoFree] DataList timeout — subscribing to required channels directly');
+        this.sendDataReq(REQUIRED_CHANNEL_IDS);
       }
     }, DISCOVERY_TIMEOUT_MS);
   }
 
   /**
-   * Step 2a: send DataInfoReq for all available channel IDs.
-   * DataReq is NOT sent yet — we wait for DataInfo responses from the H5000
-   * to complete the registration handshake before requesting streaming data.
-   * This sequencing requirement is confirmed by the WsLogger reference
-   * implementation (B&G engineer, andy.bryson@navico.com).
+   * Step 2: subscribe to the required navigation channels.
+   *
+   * Filters REQUIRED_CHANNEL_IDS to those present in the H5000's DataList,
+   * then sends DataReq directly — no DataInfoReq phase.
+   *
+   * DataInfoReq was removed after testing showed it produced zero DataInfo
+   * responses from the H5000 for navigation channels in both integer-array and
+   * object-array formats. The subsequent DataReq (after the timeout) also
+   * returned no data when subscribing to all 282 available channels. Narrowing
+   * the subscription to only the 12 required channels is the minimal approach.
    */
   private subscribeAll(availableIds: number[]): void {
     this.discoveryComplete = true;
@@ -279,81 +268,29 @@ export class GoFreeManager extends EventEmitter {
       clearTimeout(this.discoveryTimer);
       this.discoveryTimer = null;
     }
-    this.emit('debug', `[GoFree] Step 2a: Sending DataInfoReq for ${availableIds.length} channels`);
-    this.sendDataInfoReqPhase(availableIds);
+
+    const available = new Set(availableIds);
+    const toRequest = REQUIRED_CHANNEL_IDS.filter((id) => available.has(id));
+    const missing = REQUIRED_CHANNEL_IDS.filter((id) => !available.has(id));
+
+    if (missing.length > 0) {
+      this.emit('debug', `[GoFree] Note: ${missing.length} required channel(s) absent from DataList: ${missing.join(',')}`);
+    }
+
+    const ids = toRequest.length > 0 ? toRequest : REQUIRED_CHANNEL_IDS;
+    this.emit('debug', `[GoFree] Step 2: Sending DataReq for ${ids.length} required channels: ${ids.join(',')}`);
+    this.sendDataReq(ids);
   }
 
   /**
-   * Send DataInfoReq in batches and arm the DataInfo-wait state machine.
-   * DataReq is deferred until all expected DataInfo responses arrive
-   * (or the dataInfoTimeoutMs fallback fires).
+   * Send DataReq for the given channel IDs.
+   * `repeat: true` per the B&G WsLogger reference (B&G engineer source).
    */
-  private sendDataInfoReqPhase(ids: number[], batchSize = 40): void {
-    this.pendingDataInfo.clear();
-    for (const id of ids) {
-      this.pendingDataInfo.add(id);
-    }
-    this.pendingDataReqIds = ids;
-
-    for (let i = 0; i < ids.length; i += batchSize) {
-      const batch = ids.slice(i, i + batchSize);
-      // DataInfoReq uses the same object format as DataReq: [{id, inst}]
-      this.send({ DataInfoReq: batch.map((id) => ({ id, inst: 0 })) });
-    }
-
-    // Safety net: if DataInfo responses don't all arrive, send DataReq anyway.
-    this.dataInfoTimer = setTimeout(() => {
-      this.dataInfoTimer = null;
-      if (this.pendingDataInfo.size > 0) {
-        this.emit('debug',
-          `[GoFree] DataInfo timeout — ${this.pendingDataInfo.size} response(s) missing, sending DataReq`);
-        this.pendingDataInfo.clear();
-        const idsToRequest = this.pendingDataReqIds;
-        this.pendingDataReqIds = [];
-        this.sendDataReqPhase(idsToRequest);
-      }
-    }, this.dataInfoTimeoutMs);
-  }
-
-  /**
-   * Handle a DataInfo response from the H5000.
-   * When all expected DataInfo have arrived, send the DataReq to start streaming.
-   */
-  private handleDataInfoResponse(info: any): void {
-    // DataInfo can arrive as a single object {id, ...} or an array.
-    const ids: number[] = Array.isArray(info)
-      ? info.map((i: any) => i?.id).filter((id: any) => typeof id === 'number')
-      : typeof info?.id === 'number' ? [info.id] : [];
-
-    for (const id of ids) {
-      this.pendingDataInfo.delete(id);
-    }
-
-    if (this.pendingDataInfo.size === 0 && this.pendingDataReqIds.length > 0) {
-      if (this.dataInfoTimer !== null) {
-        clearTimeout(this.dataInfoTimer);
-        this.dataInfoTimer = null;
-      }
-      const idsToRequest = this.pendingDataReqIds;
-      this.pendingDataReqIds = [];
-      this.emit('debug',
-        `[GoFree] Step 2b: All DataInfo received — sending DataReq for ${idsToRequest.length} channels`);
-      this.sendDataReqPhase(idsToRequest);
-    }
-  }
-
-  /**
-   * Step 2b: send DataReq in batches to start streaming data.
-   * Called only after all DataInfo responses have been received (or timeout).
-   * `repeat: true` is the correct boolean type per the official B&G WsLogger.
-   */
-  private sendDataReqPhase(ids: number[], batchSize = 40): void {
-    const sample = ids.slice(0, 5).join(',') + (ids.length > 5 ? ',...' : '');
-    this.emit('debug', `[GoFree] Sending DataReq for ${ids.length} channels (ids: ${sample})`);
+  private sendDataReq(ids: number[], batchSize = 40): void {
     for (let i = 0; i < ids.length; i += batchSize) {
       const batch = ids.slice(i, i + batchSize);
       const payload = { DataReq: batch.map((id) => ({ id, repeat: true, inst: 0 })) };
-      this.emit('debug', `[GoFree OUT] ${JSON.stringify(payload).slice(0, 300)}`);
+      this.emit('debug', `[GoFree OUT] ${JSON.stringify(payload)}`);
       this.send(payload);
     }
   }
@@ -394,28 +331,18 @@ export class GoFreeManager extends EventEmitter {
     // Log the top-level keys so we can see the envelope structure.
     this.emit('debug', `[GoFree keys] ${Object.keys(parsed).join(', ')}`);
 
-    // Step 1 response: DataList → send DataInfoReq for all available channels
+    // Step 1 response: DataList → subscribe to required channels
     if (parsed.DataList != null) {
       const available: number[] = Array.isArray(parsed.DataList.list)
         ? parsed.DataList.list
         : [];
       this.emit('debug', `[GoFree] DataList received — ${available.length} channels available`);
-      const toSubscribe = available.length > 0 ? available : REQUIRED_CHANNEL_IDS;
-      this.subscribeAll(toSubscribe);
-      return;
-    }
-
-    // Step 2a response: DataInfo → track registration completeness, then send DataReq
-    if (parsed.DataInfo != null) {
-      this.handleDataInfoResponse(parsed.DataInfo);
+      this.subscribeAll(available.length > 0 ? available : []);
       return;
     }
 
     if (Array.isArray(parsed.Many)) {
       for (const item of parsed.Many) {
-        if (item?.DataInfo != null) {
-          this.handleDataInfoResponse(item.DataInfo);
-        }
         if (item && Array.isArray(item.Data)) {
           this.processObservations(item.Data);
         }
@@ -624,12 +551,6 @@ export class GoFreeManager extends EventEmitter {
     if (this.discoveryTimer !== null) {
       clearTimeout(this.discoveryTimer);
       this.discoveryTimer = null;
-    }
-    this.pendingDataInfo.clear();
-    this.pendingDataReqIds = [];
-    if (this.dataInfoTimer !== null) {
-      clearTimeout(this.dataInfoTimer);
-      this.dataInfoTimer = null;
     }
   }
 

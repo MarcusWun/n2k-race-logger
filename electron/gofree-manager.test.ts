@@ -343,7 +343,7 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     MockWebSocket.instances.length = 0;
   });
 
-  it('sequential handshake: DataListReq → DataList → DataInfoReq → (DataInfo per channel) → DataReq', async () => {
+  it('2-step handshake: DataListReq → DataList → DataReq for required channels only', async () => {
     const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
     await mgr.connect('127.0.0.1', 2053);
 
@@ -355,80 +355,52 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     expect(ws.sent).toHaveLength(1);
     expect(JSON.parse(ws.sent[0]).DataListReq).toMatchObject({ group: 40 });
 
-    // H5000 responds with DataList (12 channels — fits in one batch of 40)
+    // H5000 responds with DataList that includes all 12 required channels
     const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
-    // Step 2a: DataInfoReq sent for all IDs — DataReq must NOT be sent yet
-    expect(ws.sent).toHaveLength(2); // DataListReq + DataInfoReq
-    const infoReq = JSON.parse(ws.sent[1]);
-    expect(Array.isArray(infoReq.DataInfoReq)).toBe(true);
-    // DataInfoReq uses object format [{id, inst}] matching DataReq's protocol shape
-    const infoIds = infoReq.DataInfoReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
-    expect(infoIds).toEqual(allIds.slice().sort((a, b) => a - b));
-    for (const entry of infoReq.DataInfoReq) {
-      expect(entry.inst).toBe(0);
-    }
-    // No DataReq yet — must wait for DataInfo responses
-    expect(ws.sent.find((s: string) => JSON.parse(s).DataReq != null)).toBeUndefined();
-
-    // H5000 responds with DataInfo for each channel (one message per channel)
-    for (const id of allIds) {
-      ws.simulateMessage(JSON.stringify({ DataInfo: { id, name: 'test', unit: '' } }));
-    }
-
-    // Step 2b: DataReq now sent after all DataInfo received
-    expect(ws.sent).toHaveLength(3); // DataListReq + DataInfoReq + DataReq
-    const dataReq = JSON.parse(ws.sent[2]);
+    // Step 2: DataReq sent immediately — only for required channels in the DataList
+    expect(ws.sent).toHaveLength(2); // DataListReq + DataReq
+    const dataReq = JSON.parse(ws.sent[1]);
     expect(Array.isArray(dataReq.DataReq)).toBe(true);
     const sentIds = dataReq.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
+    // Should contain exactly the REQUIRED_CHANNEL_IDS that are in the DataList
     expect(sentIds).toEqual(allIds.slice().sort((a, b) => a - b));
     for (const entry of dataReq.DataReq) {
-      expect(entry.repeat).toBe(true); // boolean true (not integer 1)
+      expect(entry.repeat).toBe(true);
       expect(entry.inst).toBe(0);
     }
 
     await mgr.disconnect();
   });
 
-  it('batch subscribe: 50 available IDs — DataInfoReq in 2 batches, DataReq in 2 batches after all DataInfo', async () => {
+  it('filters DataReq to only required channels present in DataList', async () => {
     const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
     await mgr.connect('127.0.0.1', 2053);
 
     const ws = latest(MockWebSocket.instances);
     ws.simulateOpen();
-
     expect(ws.sent).toHaveLength(1);
 
-    const fiftyIds = Array.from({ length: 50 }, (_, i) => i + 1);
-    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: fiftyIds } }));
+    // DataList includes only a subset of required channels (e.g. missing LAT/LON)
+    const partialIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235]; // missing 421, 422
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: partialIds } }));
 
-    // 50 IDs → 2 DataInfoReq batches (40+10), no DataReq yet
-    expect(ws.sent).toHaveLength(3); // DataListReq + 2×DataInfoReq
-    expect(JSON.parse(ws.sent[1]).DataInfoReq).toHaveLength(40);
-    expect(JSON.parse(ws.sent[2]).DataInfoReq).toHaveLength(10);
-    expect(ws.sent.find((s: string) => JSON.parse(s).DataReq != null)).toBeUndefined();
-
-    // Simulate all 50 DataInfo responses
-    for (const id of fiftyIds) {
-      ws.simulateMessage(JSON.stringify({ DataInfo: { id, name: 'test', unit: '' } }));
-    }
-
-    // After all DataInfo: 2 DataReq batches (40+10)
-    expect(ws.sent).toHaveLength(5); // + 2×DataReq
-    expect(JSON.parse(ws.sent[3]).DataReq).toHaveLength(40);
-    expect(JSON.parse(ws.sent[4]).DataReq).toHaveLength(10);
+    // DataReq should only contain channels from partialIds
+    expect(ws.sent).toHaveLength(2);
+    const dataReq = JSON.parse(ws.sent[1]);
+    const sentIds = dataReq.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
+    expect(sentIds).toEqual(partialIds.slice().sort((a, b) => a - b));
+    // 421 and 422 should NOT be included (not in DataList)
+    expect(sentIds).not.toContain(421);
+    expect(sentIds).not.toContain(422);
 
     await mgr.disconnect();
   });
 
-  it('DataInfo timeout fallback: sends DataReq after dataInfoTimeoutMs if DataInfo responses are missing', async () => {
+  it('falls back to DataReq for required channels if DataList never arrives', async () => {
     vi.useFakeTimers();
-    // Use short timeouts so we can advance fake time precisely
-    const mgr = new GoFreeManager({
-      WebSocketImpl: MockWebSocket as any,
-      dataInfoTimeoutMs: 3_000,
-    });
+    const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
     await mgr.connect('127.0.0.1', 2053);
 
     const ws = latest(MockWebSocket.instances);
@@ -437,17 +409,10 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     expect(ws.sent).toHaveLength(1);
     expect(JSON.parse(ws.sent[0]).DataListReq).toBeDefined();
 
-    // Advance past discovery timeout (3 s) — fallback sends DataInfoReq for REQUIRED_CHANNEL_IDS
+    // Advance past discovery timeout (3 s) — fallback sends DataReq directly
     vi.advanceTimersByTime(3_000);
-    expect(ws.sent).toHaveLength(2); // DataListReq + DataInfoReq
-    expect(JSON.parse(ws.sent[1]).DataInfoReq).toBeDefined();
-    // DataReq not yet sent — waiting for DataInfo
-    expect(ws.sent.find((s: string) => JSON.parse(s).DataReq != null)).toBeUndefined();
-
-    // Advance past DataInfo timeout (3 s more) — fallback sends DataReq
-    vi.advanceTimersByTime(3_000);
-    expect(ws.sent).toHaveLength(3); // + DataReq
-    const req = JSON.parse(ws.sent[2]);
+    expect(ws.sent).toHaveLength(2); // DataListReq + DataReq
+    const req = JSON.parse(ws.sent[1]);
     expect(req.DataReq).toBeDefined();
     const ids = req.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
     expect(ids).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422]);
@@ -459,7 +424,6 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     vi.useFakeTimers();
     const mgr = new GoFreeManager({
       keepaliveIntervalMs: 30_000,
-      dataInfoTimeoutMs: 3_000,
       WebSocketImpl: MockWebSocket as any,
     });
     await mgr.connect('127.0.0.1', 2053);
@@ -470,46 +434,39 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     // Message 0: DataListReq (discovery)
     expect(ws.sent).toHaveLength(1);
 
-    // +3 s → discovery timeout → DataInfoReq (msg 1)
+    // +3 s → discovery timeout → DataReq (msg 1)
     vi.advanceTimersByTime(3_000);
     expect(ws.sent).toHaveLength(2);
-    expect(JSON.parse(ws.sent[1]).DataInfoReq).toBeDefined();
+    expect(JSON.parse(ws.sent[1]).DataReq).toBeDefined();
 
-    // +3 s → DataInfo timeout → DataReq (msg 2)
-    vi.advanceTimersByTime(3_000);
+    // +30 s → first keepalive (message 2)
+    vi.advanceTimersByTime(30_000);
     expect(ws.sent).toHaveLength(3);
-    expect(JSON.parse(ws.sent[2]).DataReq).toBeDefined();
+    expect(JSON.parse(ws.sent[2])).toEqual({ SettingListReq: [{ groupId: 2 }] });
 
-    // +30 s → first keepalive (message 3)
+    // +30 s → second keepalive (message 3)
     vi.advanceTimersByTime(30_000);
     expect(ws.sent).toHaveLength(4);
     expect(JSON.parse(ws.sent[3])).toEqual({ SettingListReq: [{ groupId: 2 }] });
 
-    // +30 s → second keepalive (message 4)
-    vi.advanceTimersByTime(30_000);
-    expect(ws.sent).toHaveLength(5);
-    expect(JSON.parse(ws.sent[4])).toEqual({ SettingListReq: [{ groupId: 2 }] });
-
     await mgr.disconnect();
   });
 
-  it('disconnect() stops all timers (discovery, dataInfo, keepalive)', async () => {
+  it('disconnect() stops keepalive and discovery timers', async () => {
     vi.useFakeTimers();
     const mgr = new GoFreeManager({
       keepaliveIntervalMs: 30_000,
-      dataInfoTimeoutMs: 3_000,
       WebSocketImpl: MockWebSocket as any,
     });
     await mgr.connect('127.0.0.1', 2053);
     const ws = latest(MockWebSocket.instances);
     ws.simulateOpen();
 
-    // Only DataListReq sent so far
     expect(ws.sent).toHaveLength(1);
 
     await mgr.disconnect();
 
-    // Advance well past all timeout intervals — no additional sends
+    // Advance well past all intervals — no additional sends
     vi.advanceTimersByTime(120_000);
     expect(ws.sent).toHaveLength(1);
   });

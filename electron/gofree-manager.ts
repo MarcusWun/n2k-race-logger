@@ -279,21 +279,22 @@ export class GoFreeManager extends EventEmitter {
       this.discoveryTimer = null;
     }
 
-    const available = new Set(availableIds);
-    const toRequest =
-      available.size > 0
-        ? REQUIRED_CHANNEL_IDS.filter((id) => available.has(id))
-        : REQUIRED_CHANNEL_IDS;
-    const missing = REQUIRED_CHANNEL_IDS.filter((id) => !available.has(id));
-
-    if (missing.length > 0) {
-      this.emit(
-        'debug',
-        `[GoFree] Note: ${missing.length} required channel(s) absent from DataList: ${missing.join(',')}`,
-      );
+    // Log which required channels are absent from the DataList (informational only).
+    // We still poll ALL required channels regardless — the H5000 sometimes omits
+    // navigation channels from the DataList even though it responds to DataReq for
+    // them (e.g. TWA/AWA=140/141, LAT/LON=421/422 are absent on this firmware).
+    if (availableIds.length > 0) {
+      const available = new Set(availableIds);
+      const missing = REQUIRED_CHANNEL_IDS.filter((id) => !available.has(id));
+      if (missing.length > 0) {
+        this.emit(
+          'debug',
+          `[GoFree] Note: ${missing.length} required channel(s) absent from DataList (will poll anyway): ${missing.join(',')}`,
+        );
+      }
     }
 
-    this.pollChannels = toRequest.length > 0 ? toRequest : REQUIRED_CHANNEL_IDS;
+    this.pollChannels = REQUIRED_CHANNEL_IDS;
     this.emit(
       'debug',
       `[GoFree] Step 2: Polling ${this.pollChannels.length} channels every ${this.pollIntervalMs} ms (repeat:false)`,

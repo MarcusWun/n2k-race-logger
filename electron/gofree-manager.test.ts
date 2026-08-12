@@ -373,7 +373,7 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     await mgr.disconnect();
   });
 
-  it('filters poll to only required channels present in DataList', async () => {
+  it('polls all required channels even when DataList omits some', async () => {
     const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
     await mgr.connect('127.0.0.1', 2053);
 
@@ -381,20 +381,22 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     ws.simulateOpen();
     expect(ws.sent).toHaveLength(1);
 
-    // DataList missing LAT/LON (421, 422)
+    // DataList missing LAT/LON (421, 422) and TWA/AWA (141, 140) — as seen on
+    // the H5000 firmware in boat testing. We must poll all 12 regardless.
     const partialIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: partialIds } }));
 
-    // 1 DataListReq + 10 individual DataReq messages (one per filtered channel)
-    expect(ws.sent).toHaveLength(11);
+    // All 12 required channels must be polled (not just the 10 in DataList)
+    expect(ws.sent).toHaveLength(13); // 1 DataListReq + 12 individual DataReq messages
     const pollIds = ws.sent.slice(1).map((s: string) => {
       const msg = JSON.parse(s);
       expect(msg.DataReq).toHaveLength(1);
       return msg.DataReq[0].id;
     }).sort((a: number, b: number) => a - b);
-    expect(pollIds).toEqual(partialIds.slice().sort((a, b) => a - b));
-    expect(pollIds).not.toContain(421);
-    expect(pollIds).not.toContain(422);
+    expect(pollIds).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422]);
+    // 421 and 422 are included even though absent from DataList
+    expect(pollIds).toContain(421);
+    expect(pollIds).toContain(422);
 
     await mgr.disconnect();
   });

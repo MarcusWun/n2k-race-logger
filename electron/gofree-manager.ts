@@ -304,12 +304,18 @@ export class GoFreeManager extends EventEmitter {
     this.startPollTimer();
   }
 
-  /** Send one DataReq (repeat:false) for all required channels. */
+  /**
+   * Send one DataReq (repeat:false) per required channel.
+   *
+   * The H5000 only responds to single-channel DataReq — a multi-channel
+   * DataReq with repeat:false is silently dropped (confirmed by boat test:
+   * single-channel probe returned COG in ~5 ms, multi-channel poll returned
+   * nothing over 7+ minutes). Each channel gets its own message.
+   */
   private sendPoll(): void {
-    const payload = {
-      DataReq: this.pollChannels.map((id) => ({ id, repeat: false, inst: 0 })),
-    };
-    this.send(payload);
+    for (const id of this.pollChannels) {
+      this.send({ DataReq: [{ id, repeat: false, inst: 0 }] });
+    }
   }
 
   private startPollTimer(): void {

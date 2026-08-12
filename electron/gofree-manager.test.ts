@@ -359,16 +359,16 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
-    // Immediate poll sent: one DataReq with all 12 channels, repeat:false
-    expect(ws.sent).toHaveLength(2);
-    const poll = JSON.parse(ws.sent[1]);
-    expect(Array.isArray(poll.DataReq)).toBe(true);
-    const pollIds = poll.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
+    // Immediate poll: one DataReq message per channel (12 total), repeat:false
+    expect(ws.sent).toHaveLength(13); // 1 DataListReq + 12 individual DataReq messages
+    const pollIds = ws.sent.slice(1).map((s: string) => {
+      const msg = JSON.parse(s);
+      expect(msg.DataReq).toHaveLength(1);
+      expect(msg.DataReq[0].repeat).toBe(false);
+      expect(msg.DataReq[0].inst).toBe(0);
+      return msg.DataReq[0].id;
+    }).sort((a: number, b: number) => a - b);
     expect(pollIds).toEqual(allIds.slice().sort((a, b) => a - b));
-    for (const entry of poll.DataReq) {
-      expect(entry.repeat).toBe(false);
-      expect(entry.inst).toBe(0);
-    }
 
     await mgr.disconnect();
   });
@@ -385,9 +385,13 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     const partialIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: partialIds } }));
 
-    expect(ws.sent).toHaveLength(2);
-    const poll = JSON.parse(ws.sent[1]);
-    const pollIds = poll.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
+    // 1 DataListReq + 10 individual DataReq messages (one per filtered channel)
+    expect(ws.sent).toHaveLength(11);
+    const pollIds = ws.sent.slice(1).map((s: string) => {
+      const msg = JSON.parse(s);
+      expect(msg.DataReq).toHaveLength(1);
+      return msg.DataReq[0].id;
+    }).sort((a: number, b: number) => a - b);
     expect(pollIds).toEqual(partialIds.slice().sort((a, b) => a - b));
     expect(pollIds).not.toContain(421);
     expect(pollIds).not.toContain(422);
@@ -409,17 +413,17 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
-    // msg 0: DataListReq, msg 1: immediate poll
-    expect(ws.sent).toHaveLength(2);
+    // msg 0: DataListReq, msgs 1–12: immediate poll (one DataReq per channel)
+    expect(ws.sent).toHaveLength(13);
 
-    // +1 s → second poll
+    // +1 s → second poll (12 more individual DataReq messages)
     vi.advanceTimersByTime(1_000);
-    expect(ws.sent).toHaveLength(3);
-    expect(JSON.parse(ws.sent[2]).DataReq[0].repeat).toBe(false);
+    expect(ws.sent).toHaveLength(25);
+    expect(JSON.parse(ws.sent[13]).DataReq[0].repeat).toBe(false);
 
-    // +1 s → third poll
+    // +1 s → third poll (12 more individual DataReq messages)
     vi.advanceTimersByTime(1_000);
-    expect(ws.sent).toHaveLength(4);
+    expect(ws.sent).toHaveLength(37);
 
     await mgr.disconnect();
   });
@@ -438,20 +442,21 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     expect(ws.sent).toHaveLength(1);
     expect(JSON.parse(ws.sent[0]).DataListReq).toBeDefined();
 
-    // Advance past discovery timeout (3 s) — fallback polls all required channels
+    // Advance past discovery timeout (3 s) — fallback polls all 12 required channels individually
     vi.advanceTimersByTime(3_000);
-    expect(ws.sent).toHaveLength(2);
-    const poll = JSON.parse(ws.sent[1]);
-    expect(Array.isArray(poll.DataReq)).toBe(true);
-    for (const entry of poll.DataReq) {
-      expect(entry.repeat).toBe(false);
-    }
-    const ids = poll.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
+    // 1 DataListReq + 12 individual DataReq messages
+    expect(ws.sent).toHaveLength(13);
+    const ids = ws.sent.slice(1).map((s: string) => {
+      const msg = JSON.parse(s);
+      expect(msg.DataReq).toHaveLength(1);
+      expect(msg.DataReq[0].repeat).toBe(false);
+      return msg.DataReq[0].id;
+    }).sort((a: number, b: number) => a - b);
     expect(ids).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422]);
 
-    // +1 s → second poll tick
+    // +1 s → second poll tick (12 more individual DataReq messages)
     vi.advanceTimersByTime(1_000);
-    expect(ws.sent).toHaveLength(3);
+    expect(ws.sent).toHaveLength(25);
 
     await mgr.disconnect();
   });
@@ -470,14 +475,14 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     // Message 0: DataListReq (discovery)
     expect(ws.sent).toHaveLength(1);
 
-    // +3 s → discovery timeout → poll fires (msg 1: immediate poll DataReq)
+    // +3 s → discovery timeout → poll fires (12 individual DataReq messages)
     vi.advanceTimersByTime(3_000);
-    expect(ws.sent).toHaveLength(2); // DataListReq + first poll
+    expect(ws.sent).toHaveLength(13); // DataListReq + 12 individual poll messages
     expect(JSON.parse(ws.sent[1]).DataReq).toBeDefined();
 
-    // +1 s → second poll tick (from the poll interval)
+    // +1 s → second poll tick (12 more individual DataReq messages)
     vi.advanceTimersByTime(1_000);
-    expect(ws.sent).toHaveLength(3);
+    expect(ws.sent).toHaveLength(25);
 
     // +30 s → first keepalive (after the 30 s keepalive interval from connection)
     vi.advanceTimersByTime(29_000); // total = 33s from open; keepalive fires at 30s

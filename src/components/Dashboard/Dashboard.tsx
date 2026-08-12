@@ -148,25 +148,41 @@ export default function Dashboard() {
           if (speedKts != null) { setMetric('aws', speedKts); updateLastUpdated('aws'); }
           if (angleDeg != null) { setMetric('awa', angleDeg); updateLastUpdated('awa'); }
 
-          // Compute true wind from apparent wind + boat speed
+          // Only compute true wind from apparent if no direct true wind source is active.
+          // GoFree (H5000) sends ch47=TWS and ch45=TWA directly; overwriting those with
+          // the simple vector formula produces visible discrepancies vs the B&G displays.
           const state = useN2KStore.getState();
-          const aws = speedKts ?? state.aws;
-          const awa = angleDeg ?? state.awa;
-          const stw = state.stw ?? state.sog ?? 0;
-          if (aws != null && awa != null) {
-            const tw = computeTrueWind(aws, awa, stw);
-            setMetric('tws', tw.tws); updateLastUpdated('tws');
-            setMetric('twa', tw.twa); updateLastUpdated('twa');
-            const heading = state.heading;
-            if (heading != null) {
-              setMetric('twd', (heading + tw.twa) % 360);
-              updateLastUpdated('twd');
+          const now = Date.now();
+          const directTwAge = Math.max(
+            now - (state.lastUpdated['tws'] ?? 0),
+            now - (state.lastUpdated['twa'] ?? 0),
+          );
+          if (directTwAge > 3_000) {
+            const aws = speedKts ?? state.aws;
+            const awa = angleDeg ?? state.awa;
+            const stw = state.stw ?? state.sog ?? 0;
+            if (aws != null && awa != null) {
+              const tw = computeTrueWind(aws, awa, stw);
+              setMetric('tws', tw.tws); updateLastUpdated('tws');
+              setMetric('twa', tw.twa); updateLastUpdated('twa');
+              const heading = state.heading;
+              if (heading != null) {
+                setMetric('twd', (heading + tw.twa) % 360);
+                updateLastUpdated('twd');
+              }
             }
           }
         } else if (ref === 'True (boat referenced)' || ref === 'True (water referenced)') {
-          // True wind angle relative to boat bow
+          // True wind angle relative to boat bow — update TWD from direct TWA + heading
           if (speedKts != null) { setMetric('tws', speedKts); updateLastUpdated('tws'); }
-          if (angleDeg != null) { setMetric('twa', angleDeg); updateLastUpdated('twa'); }
+          if (angleDeg != null) {
+            setMetric('twa', angleDeg); updateLastUpdated('twa');
+            const heading = useN2KStore.getState().heading;
+            if (heading != null) {
+              setMetric('twd', (heading + angleDeg) % 360);
+              updateLastUpdated('twd');
+            }
+          }
         } else if (ref === 'True (ground referenced to North)' || ref === 'Magnetic (ground referenced to Magnetic North)') {
           // Wind direction (absolute) — store as TWD directly
           if (speedKts != null) { setMetric('tws', speedKts); updateLastUpdated('tws'); }

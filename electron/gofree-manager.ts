@@ -28,6 +28,9 @@ const DEG_TO_RAD = Math.PI / 180;
 const DEFAULT_KEEPALIVE_INTERVAL_MS = 30_000;
 const DEFAULT_RECONNECT_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
+// How fast to poll required channels with repeat:false.  The H5000 on Marcus's
+// boat responds within ~5 ms per DataReq but does not stream with repeat:true.
+const DEFAULT_POLL_INTERVAL_MS = 1_000;
 
 // How long to wait for DataList response before subscribing directly.
 const DISCOVERY_TIMEOUT_MS = 3_000;
@@ -86,6 +89,8 @@ export interface GoFreeStatusEvent {
 export interface GoFreeManagerOptions {
   /** Keepalive tick interval in ms (default 30000). */
   keepaliveIntervalMs?: number;
+  /** Poll interval for repeat:false DataReq requests in ms (default 1000). */
+  pollIntervalMs?: number;
   /** Reconnect delay in ms (default 5000). */
   reconnectIntervalMs?: number;
   /** Max reconnect attempts before entering the `error` state (default 3). */
@@ -110,8 +115,12 @@ export class GoFreeManager extends EventEmitter {
   private state: GoFreeState = 'disconnected';
   private ws: any = null;
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
+
+  // Channels to poll on each tick (populated after DataList discovery).
+  private pollChannels: number[] = [];
 
   // Accumulators used to pair TWA/TWS and AWA/AWS observations that arrive
   // in separate messages. Angles are stored already normalized to 0–360°.
@@ -122,11 +131,11 @@ export class GoFreeManager extends EventEmitter {
   private discoveryTimer: ReturnType<typeof setTimeout> | null = null;
   private discoveryComplete = false;
 
-
   private targetHost = '192.168.1.233';
   private targetPort = 2053;
 
   private readonly keepaliveIntervalMs: number;
+  private readonly pollIntervalMs: number;
   private readonly reconnectIntervalMs: number;
   private readonly maxReconnectAttempts: number;
   private readonly WebSocketImpl: any;
@@ -135,6 +144,8 @@ export class GoFreeManager extends EventEmitter {
     super();
     this.keepaliveIntervalMs =
       options?.keepaliveIntervalMs ?? DEFAULT_KEEPALIVE_INTERVAL_MS;
+    this.pollIntervalMs =
+      options?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.reconnectIntervalMs =
       options?.reconnectIntervalMs ?? DEFAULT_RECONNECT_INTERVAL_MS;
     this.maxReconnectAttempts =
@@ -167,6 +178,7 @@ export class GoFreeManager extends EventEmitter {
   async disconnect(): Promise<void> {
     this.clearReconnectTimer();
     this.clearKeepaliveTimer();
+    this.clearPollTimer();
     this.cleanupSocket();
     this.setState('disconnected');
   }
@@ -252,17 +264,13 @@ export class GoFreeManager extends EventEmitter {
   }
 
   /**
-   * Step 2: subscribe to all channels from the DataList.
+   * Step 2: poll required channels at 1 Hz using repeat:false DataReq.
    *
-   * Mirrors the B&G H5000-Logger (C++ reference implementation) pattern:
-   * for each batch of channels, send DataInfoReq immediately followed by
-   * DataReq — no waiting between them. We subscribe to ALL available channels
-   * and filter incoming Data client-side in handleObservation().
-   *
-   * Additionally sends one DataReq with repeat:false for a single required
-   * channel as a diagnostic probe. If the one-shot returns data but the
-   * repeat:true subscription does not, that indicates streaming requires
-   * additional authorization on this firmware.
+   * The H5000 on this firmware does not stream data with repeat:true — it
+   * returns exactly one Data message for a one-shot (repeat:false) request
+   * and then goes silent.  We work around this by polling the 12 required
+   * navigation channels every pollIntervalMs (default 1 s).  Each poll
+   * returns the current value for every requested channel within ~5 ms.
    */
   private subscribeAll(availableIds: number[]): void {
     this.discoveryComplete = true;
@@ -271,32 +279,44 @@ export class GoFreeManager extends EventEmitter {
       this.discoveryTimer = null;
     }
 
-    const ids = availableIds.length > 0 ? availableIds : REQUIRED_CHANNEL_IDS;
-    const batchSize = 33; // matches C++ H5000-Logger batch size
-    const batchCount = Math.ceil(ids.length / batchSize);
+    const available = new Set(availableIds);
+    const toRequest =
+      available.size > 0
+        ? REQUIRED_CHANNEL_IDS.filter((id) => available.has(id))
+        : REQUIRED_CHANNEL_IDS;
+    const missing = REQUIRED_CHANNEL_IDS.filter((id) => !available.has(id));
 
-    this.emit(
-      'debug',
-      `[GoFree] Step 2: Sending DataInfoReq+DataReq for all ${ids.length} channels in ${batchCount} batches`,
-    );
-
-    // Diagnostic: one-shot probe for SOG so we can see in the debug log
-    // whether repeat:false works when repeat:true doesn't.
-    const probeId = ids.find((id) => REQUIRED_CHANNEL_IDS.includes(id)) ?? ids[0];
-    this.emit('debug', `[GoFree] Diagnostic probe: DataReq repeat:false for ch ${probeId}`);
-    this.send({ DataReq: [{ id: probeId, repeat: false, inst: 0 }] });
-
-    for (let i = 0; i < ids.length; i += batchSize) {
-      const batch = ids.slice(i, i + batchSize);
-      // C++ logger pattern: DataInfoReq then DataReq sent back-to-back with no delay.
-      this.send({ DataInfoReq: batch });
-      const payload = { DataReq: batch.map((id) => ({ id, repeat: true, inst: 0 })) };
+    if (missing.length > 0) {
       this.emit(
         'debug',
-        `[GoFree OUT] batch ${Math.floor(i / batchSize) + 1}/${batchCount}: DataReq for ch ${batch[0]}…${batch[batch.length - 1]}`,
+        `[GoFree] Note: ${missing.length} required channel(s) absent from DataList: ${missing.join(',')}`,
       );
-      this.send(payload);
     }
+
+    this.pollChannels = toRequest.length > 0 ? toRequest : REQUIRED_CHANNEL_IDS;
+    this.emit(
+      'debug',
+      `[GoFree] Step 2: Polling ${this.pollChannels.length} channels every ${this.pollIntervalMs} ms (repeat:false)`,
+    );
+
+    // Poll immediately so the dashboard fills in without waiting for the first tick.
+    this.sendPoll();
+    this.startPollTimer();
+  }
+
+  /** Send one DataReq (repeat:false) for all required channels. */
+  private sendPoll(): void {
+    const payload = {
+      DataReq: this.pollChannels.map((id) => ({ id, repeat: false, inst: 0 })),
+    };
+    this.send(payload);
+  }
+
+  private startPollTimer(): void {
+    this.clearPollTimer();
+    this.pollTimer = setInterval(() => {
+      this.sendPoll();
+    }, this.pollIntervalMs);
   }
 
   private send(obj: any): void {
@@ -560,17 +580,26 @@ export class GoFreeManager extends EventEmitter {
     this.lastTwsKts = null;
     this.lastAwaDeg = null;
     this.lastAwsKts = null;
+    this.pollChannels = [];
     this.discoveryComplete = false;
     if (this.discoveryTimer !== null) {
       clearTimeout(this.discoveryTimer);
       this.discoveryTimer = null;
     }
+    this.clearPollTimer();
   }
 
   private clearKeepaliveTimer(): void {
     if (this.keepaliveTimer !== null) {
       clearInterval(this.keepaliveTimer);
       this.keepaliveTimer = null;
+    }
+  }
+
+  private clearPollTimer(): void {
+    if (this.pollTimer !== null) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
     }
   }
 

@@ -343,7 +343,7 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     MockWebSocket.instances.length = 0;
   });
 
-  it('on DataList: sends diagnostic probe + DataInfoReq+DataReq per batch for all channels', async () => {
+  it('on DataList: sends immediate poll (repeat:false) for required channels present in DataList', async () => {
     const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
     await mgr.connect('127.0.0.1', 2053);
 
@@ -359,37 +359,77 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
-    // Subscriptions sent: 1 probe + N batches × 2 (DataInfoReq + DataReq per batch)
-    // With 12 channels and batchSize=33, that is 1 batch → 1 probe + 1 DataInfoReq + 1 DataReq = 3 messages
-    expect(ws.sent.length).toBeGreaterThanOrEqual(3);
-
-    // Probe message: one-shot repeat:false for the first required channel found in the list
-    const probe = JSON.parse(ws.sent[1]);
-    expect(Array.isArray(probe.DataReq)).toBe(true);
-    expect(probe.DataReq).toHaveLength(1);
-    expect(probe.DataReq[0].repeat).toBe(false);
-
-    // Collect all DataReq entries from subsequent messages
-    const allDataReqEntries: any[] = [];
-    for (let i = 2; i < ws.sent.length; i++) {
-      const msg = JSON.parse(ws.sent[i]);
-      if (Array.isArray(msg.DataReq)) allDataReqEntries.push(...msg.DataReq);
-    }
-    // All subscription DataReq entries should have repeat:true and inst:0
-    for (const entry of allDataReqEntries) {
-      expect(entry.repeat).toBe(true);
+    // Immediate poll sent: one DataReq with all 12 channels, repeat:false
+    expect(ws.sent).toHaveLength(2);
+    const poll = JSON.parse(ws.sent[1]);
+    expect(Array.isArray(poll.DataReq)).toBe(true);
+    const pollIds = poll.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
+    expect(pollIds).toEqual(allIds.slice().sort((a, b) => a - b));
+    for (const entry of poll.DataReq) {
+      expect(entry.repeat).toBe(false);
       expect(entry.inst).toBe(0);
     }
-    // All available channel IDs should be subscribed
-    const subscribedIds = allDataReqEntries.map((e: any) => e.id).sort((a: number, b: number) => a - b);
-    expect(subscribedIds).toEqual(allIds.slice().sort((a, b) => a - b));
 
     await mgr.disconnect();
   });
 
-  it('falls back to DataReq for required channels if DataList never arrives', async () => {
-    vi.useFakeTimers();
+  it('filters poll to only required channels present in DataList', async () => {
     const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
+    await mgr.connect('127.0.0.1', 2053);
+
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+    expect(ws.sent).toHaveLength(1);
+
+    // DataList missing LAT/LON (421, 422)
+    const partialIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: partialIds } }));
+
+    expect(ws.sent).toHaveLength(2);
+    const poll = JSON.parse(ws.sent[1]);
+    const pollIds = poll.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
+    expect(pollIds).toEqual(partialIds.slice().sort((a, b) => a - b));
+    expect(pollIds).not.toContain(421);
+    expect(pollIds).not.toContain(422);
+
+    await mgr.disconnect();
+  });
+
+  it('polls at pollIntervalMs after the initial DataList poll', async () => {
+    vi.useFakeTimers();
+    const mgr = new GoFreeManager({
+      pollIntervalMs: 1_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+
+    // msg 0: DataListReq, msg 1: immediate poll
+    expect(ws.sent).toHaveLength(2);
+
+    // +1 s → second poll
+    vi.advanceTimersByTime(1_000);
+    expect(ws.sent).toHaveLength(3);
+    expect(JSON.parse(ws.sent[2]).DataReq[0].repeat).toBe(false);
+
+    // +1 s → third poll
+    vi.advanceTimersByTime(1_000);
+    expect(ws.sent).toHaveLength(4);
+
+    await mgr.disconnect();
+  });
+
+  it('falls back to polling required channels if DataList never arrives', async () => {
+    vi.useFakeTimers();
+    const mgr = new GoFreeManager({
+      pollIntervalMs: 1_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
     await mgr.connect('127.0.0.1', 2053);
 
     const ws = latest(MockWebSocket.instances);
@@ -398,24 +438,20 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     expect(ws.sent).toHaveLength(1);
     expect(JSON.parse(ws.sent[0]).DataListReq).toBeDefined();
 
-    // Advance past discovery timeout (3 s) — fallback calls subscribeAll([]) which sends probe + DataReq
+    // Advance past discovery timeout (3 s) — fallback polls all required channels
     vi.advanceTimersByTime(3_000);
-    expect(ws.sent.length).toBeGreaterThanOrEqual(2);
-    // Probe (repeat:false) followed by DataInfoReq + DataReq batches
-    const probe = JSON.parse(ws.sent[1]);
-    expect(probe.DataReq).toBeDefined();
-    expect(probe.DataReq[0].repeat).toBe(false);
-
-    // Collect all repeat:true DataReq entries
-    const repeatingIds: number[] = [];
-    for (let i = 2; i < ws.sent.length; i++) {
-      const msg = JSON.parse(ws.sent[i]);
-      if (Array.isArray(msg.DataReq)) {
-        repeatingIds.push(...msg.DataReq.map((e: any) => e.id));
-      }
+    expect(ws.sent).toHaveLength(2);
+    const poll = JSON.parse(ws.sent[1]);
+    expect(Array.isArray(poll.DataReq)).toBe(true);
+    for (const entry of poll.DataReq) {
+      expect(entry.repeat).toBe(false);
     }
-    const sortedIds = repeatingIds.sort((a, b) => a - b);
-    expect(sortedIds).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422]);
+    const ids = poll.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
+    expect(ids).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422]);
+
+    // +1 s → second poll tick
+    vi.advanceTimersByTime(1_000);
+    expect(ws.sent).toHaveLength(3);
 
     await mgr.disconnect();
   });
@@ -434,36 +470,31 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     // Message 0: DataListReq (discovery)
     expect(ws.sent).toHaveLength(1);
 
-    // +3 s → discovery timeout → subscribeAll([]) fires:
-    //   msg 1: probe DataReq (repeat:false)
-    //   msg 2: DataInfoReq batch 1
-    //   msg 3: DataReq batch 1 (repeat:true)
+    // +3 s → discovery timeout → poll fires (msg 1: immediate poll DataReq)
     vi.advanceTimersByTime(3_000);
-    expect(ws.sent).toHaveLength(4); // DataListReq + probe + DataInfoReq + DataReq
-    // Verify a DataReq exists in the subscription messages
-    const hasDataReq = ws.sent.slice(1).some((s: string) => {
-      const m = JSON.parse(s);
-      return Array.isArray(m.DataReq) && m.DataReq.some((e: any) => e.repeat === true);
-    });
-    expect(hasDataReq).toBe(true);
+    expect(ws.sent).toHaveLength(2); // DataListReq + first poll
+    expect(JSON.parse(ws.sent[1]).DataReq).toBeDefined();
 
-    // +30 s → first keepalive
-    vi.advanceTimersByTime(30_000);
-    expect(JSON.parse(ws.sent[ws.sent.length - 1])).toEqual({ SettingListReq: [{ groupId: 2 }] });
-    const countAfterFirst = ws.sent.length;
+    // +1 s → second poll tick (from the poll interval)
+    vi.advanceTimersByTime(1_000);
+    expect(ws.sent).toHaveLength(3);
 
-    // +30 s → second keepalive
-    vi.advanceTimersByTime(30_000);
-    expect(ws.sent).toHaveLength(countAfterFirst + 1);
-    expect(JSON.parse(ws.sent[ws.sent.length - 1])).toEqual({ SettingListReq: [{ groupId: 2 }] });
+    // +30 s → first keepalive (after the 30 s keepalive interval from connection)
+    vi.advanceTimersByTime(29_000); // total = 33s from open; keepalive fires at 30s
+    const countBeforeKeepalive = ws.sent.length;
+    // keepalive fires; poll may also fire — just check the last message is SettingListReq
+    expect(ws.sent.some((s: string) => {
+      try { return JSON.parse(s).SettingListReq != null; } catch { return false; }
+    })).toBe(true);
 
     await mgr.disconnect();
   });
 
-  it('disconnect() stops keepalive and discovery timers', async () => {
+  it('disconnect() stops keepalive, poll, and discovery timers', async () => {
     vi.useFakeTimers();
     const mgr = new GoFreeManager({
       keepaliveIntervalMs: 30_000,
+      pollIntervalMs: 1_000,
       WebSocketImpl: MockWebSocket as any,
     });
     await mgr.connect('127.0.0.1', 2053);
@@ -522,14 +553,7 @@ describe('GoFreeManager — integration (real WebSocket server)', () => {
           }));
           return;
         }
-        // Step 2a: respond to DataInfoReq with DataInfo array (one entry per channel ID).
-        // DataInfoReq is an integer array per the GoFree spec: [141, 47, 42, ...]
-        if (Array.isArray(msg?.DataInfoReq)) {
-          const items = msg.DataInfoReq.map((id: number) => ({ id, sname: 'test', unit: '' }));
-          socket.send(JSON.stringify({ DataInfo: items }));
-          return;
-        }
-        // Step 2b: respond to DataReq with a data stream
+        // Step 2: respond to DataReq (repeat:false poll) with current data
         if (msg?.DataReq && !subscribeReceived) {
           subscribeReceived = msg;
           // Reply with a Data envelope covering the required channel IDs

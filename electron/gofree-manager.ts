@@ -42,19 +42,23 @@ const PGN_SOG_COG = 129026;   // COG & SOG - Rapid Update
 const PGN_POSITION = 129025;  // Position - Rapid Update
 const PGN_HEADING = 127250;   // Vessel Heading
 
-// GoFree Tier 2 channel IDs (H5000).
-const CH_TWA = 141;
-const CH_TWS = 47;
-const CH_BSPD = 42;
-const CH_SOG = 41;
-const CH_COG = 9;
-const CH_HDG = 37;
-const CH_LAT = 421;
-const CH_LON = 422;
-const CH_AWA = 140;
-const CH_AWS = 46;
-const CH_VMG = 235;
-const CH_LEE = 226;
+// GoFree Tier 2 channel IDs (H5000) — confirmed by boat test (2026-08-12).
+//
+// ch44/45 are the active AWA/TWA sensor channels (raw masthead unit).
+// ch140/141 appear in DataList but never respond to DataReq — likely a
+// GPS-derived or race-mode variant inactive on this firmware.
+const CH_TWA = 45;   // True Wind Angle  (was 141 — did not respond)
+const CH_TWS = 47;   // True Wind Speed
+const CH_BSPD = 42;  // Boat Speed (water-referenced)
+const CH_SOG = 41;   // Speed Over Ground
+const CH_COG = 9;    // Course Over Ground
+const CH_HDG = 37;   // Vessel Heading
+const CH_LAT = 421;  // Latitude  (may not be exposed on this firmware)
+const CH_LON = 422;  // Longitude (may not be exposed on this firmware)
+const CH_AWA = 44;   // Apparent Wind Angle (was 140 — did not respond)
+const CH_AWS = 46;   // Apparent Wind Speed
+const CH_VMG = 235;  // VMG
+const CH_LEE = 226;  // Leeway
 
 /** Full DataReq subscription list — sent immediately on WebSocket open. */
 const REQUIRED_CHANNEL_IDS = [

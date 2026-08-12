@@ -105,8 +105,8 @@ describe('GoFreeManager — channel-ID → PGN mapping', () => {
     manager.removeAllListeners();
   });
 
-  it('channel 141 (TWA) → PGN 130306 windAngle (True), radians', () => {
-    feedRaw(manager, JSON.stringify({ Data: [{ id: 141, inst: 0, val: 45, valid: true }] }));
+  it('channel 45 (TWA) → PGN 130306 windAngle (True), radians', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 45, inst: 0, val: 45, valid: true }] }));
     const wind = emitted.find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
     );
@@ -127,7 +127,7 @@ describe('GoFreeManager — channel-ID → PGN mapping', () => {
     feedRaw(manager, JSON.stringify({
       Data: [
         { id: 47, val: 15, valid: true },
-        { id: 141, val: 60, valid: true },
+        { id: 45, val: 60, valid: true },
       ],
     }));
     const trueWinds = emitted.filter(
@@ -139,8 +139,8 @@ describe('GoFreeManager — channel-ID → PGN mapping', () => {
     expect(combined.fields.windAngle).toBeCloseTo(60 * DEG_TO_RAD, 4);
   });
 
-  it('channel 140 (AWA) → PGN 130306 windAngle (Apparent), radians', () => {
-    feedRaw(manager, JSON.stringify({ Data: [{ id: 140, val: 30, valid: true }] }));
+  it('channel 44 (AWA) → PGN 130306 windAngle (Apparent), radians', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 44, val: 30, valid: true }] }));
     const wind = emitted.find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'Apparent',
     );
@@ -262,7 +262,7 @@ describe('GoFreeManager — envelope handling and filtering', () => {
   });
 
   it('TWA normalization: negative signed degrees (port) → 0–360°', () => {
-    feedRaw(manager, JSON.stringify({ Data: [{ id: 141, val: -45, valid: true }] }));
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 45, val: -45, valid: true }] }));
     const wind = emitted.find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
     );
@@ -272,7 +272,7 @@ describe('GoFreeManager — envelope handling and filtering', () => {
   });
 
   it('AWA normalization: negative signed degrees → 0–360°', () => {
-    feedRaw(manager, JSON.stringify({ Data: [{ id: 140, val: -30, valid: true }] }));
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 44, val: -30, valid: true }] }));
     const wind = emitted.find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'Apparent',
     );
@@ -356,7 +356,7 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     expect(JSON.parse(ws.sent[0]).DataListReq).toMatchObject({ group: 40 });
 
     // H5000 responds with DataList containing all 12 required channels
-    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
     // Immediate poll: one DataReq message per channel (12 total), repeat:false
@@ -381,9 +381,9 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     ws.simulateOpen();
     expect(ws.sent).toHaveLength(1);
 
-    // DataList missing LAT/LON (421, 422) and TWA/AWA (141, 140) — as seen on
+    // DataList missing LAT/LON (421, 422) and TWA/AWA (45, 44) — as seen on
     // the H5000 firmware in boat testing. We must poll all 12 regardless.
-    const partialIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235];
+    const partialIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: partialIds } }));
 
     // All 12 required channels must be polled (not just the 10 in DataList)
@@ -393,7 +393,7 @@ describe('GoFreeManager — subscribe + keepalive', () => {
       expect(msg.DataReq).toHaveLength(1);
       return msg.DataReq[0].id;
     }).sort((a: number, b: number) => a - b);
-    expect(pollIds).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422]);
+    expect(pollIds).toEqual([9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422]);
     // 421 and 422 are included even though absent from DataList
     expect(pollIds).toContain(421);
     expect(pollIds).toContain(422);
@@ -412,7 +412,7 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     const ws = latest(MockWebSocket.instances);
     ws.simulateOpen();
 
-    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
     // msg 0: DataListReq, msgs 1–12: immediate poll (one DataReq per channel)
@@ -454,7 +454,7 @@ describe('GoFreeManager — subscribe + keepalive', () => {
       expect(msg.DataReq[0].repeat).toBe(false);
       return msg.DataReq[0].id;
     }).sort((a: number, b: number) => a - b);
-    expect(ids).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422]);
+    expect(ids).toEqual([9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422]);
 
     // +1 s → second poll tick (12 more individual DataReq messages)
     vi.advanceTimersByTime(1_000);
@@ -556,7 +556,7 @@ describe('GoFreeManager — integration (real WebSocket server)', () => {
         // Step 1: respond to DataListReq with available channel IDs
         if (msg?.DataListReq != null) {
           socket.send(JSON.stringify({
-            DataList: { groupId: 40, list: [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422] },
+            DataList: { groupId: 40, list: [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422] },
           }));
           return;
         }
@@ -566,7 +566,7 @@ describe('GoFreeManager — integration (real WebSocket server)', () => {
           // Reply with a Data envelope covering the required channel IDs
           socket.send(JSON.stringify({
             Data: [
-              { id: 141, inst: 0, val: 55, valid: true },
+              { id: 45, inst: 0, val: 55, valid: true },
               { id: 47, inst: 0, val: 12, valid: true },
               { id: 42, inst: 0, val: 6.0, valid: true },
               { id: 41, inst: 0, val: 7.5, valid: true },
@@ -574,7 +574,7 @@ describe('GoFreeManager — integration (real WebSocket server)', () => {
               { id: 37, inst: 0, val: 90, valid: true },
               { id: 421, inst: 0, val: 42.0, valid: true },
               { id: 422, inst: 0, val: -71.0, valid: true },
-              { id: 140, inst: 0, val: 30, valid: true },
+              { id: 44, inst: 0, val: 30, valid: true },
               { id: 46, inst: 0, val: 14, valid: true },
             ],
           }));

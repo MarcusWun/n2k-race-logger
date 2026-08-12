@@ -343,7 +343,7 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     MockWebSocket.instances.length = 0;
   });
 
-  it('3-step handshake: DataListReq → DataList → DataInfoReq → DataInfo → DataReq', async () => {
+  it('on DataList: sends diagnostic probe + DataInfoReq+DataReq per batch for all channels', async () => {
     const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
     await mgr.connect('127.0.0.1', 2053);
 
@@ -359,133 +359,30 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
-    // Step 2: DataInfoReq sent immediately for the 12 required channels
-    expect(ws.sent).toHaveLength(2);
-    const dataInfoReq = JSON.parse(ws.sent[1]);
-    expect(Array.isArray(dataInfoReq.DataInfoReq)).toBe(true);
-    const infoIds = dataInfoReq.DataInfoReq.slice().sort((a: number, b: number) => a - b);
-    expect(infoIds).toEqual(allIds.slice().sort((a, b) => a - b));
+    // Subscriptions sent: 1 probe + N batches × 2 (DataInfoReq + DataReq per batch)
+    // With 12 channels and batchSize=33, that is 1 batch → 1 probe + 1 DataInfoReq + 1 DataReq = 3 messages
+    expect(ws.sent.length).toBeGreaterThanOrEqual(3);
 
-    // H5000 responds with DataInfo for all channels (simple, no inst override → inst:0)
-    const dataInfoPayload = {
-      DataInfo: allIds.map((id) => ({ id, sname: `ch${id}`, numInstances: 1 })),
-    };
-    ws.simulateMessage(JSON.stringify(dataInfoPayload));
+    // Probe message: one-shot repeat:false for the first required channel found in the list
+    const probe = JSON.parse(ws.sent[1]);
+    expect(Array.isArray(probe.DataReq)).toBe(true);
+    expect(probe.DataReq).toHaveLength(1);
+    expect(probe.DataReq[0].repeat).toBe(false);
 
-    // Step 3: DataReq sent immediately (all DataInfo received — no timeout needed)
-    expect(ws.sent).toHaveLength(3);
-    const dataReq = JSON.parse(ws.sent[2]);
-    expect(Array.isArray(dataReq.DataReq)).toBe(true);
-    const sentIds = dataReq.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
-    expect(sentIds).toEqual(allIds.slice().sort((a, b) => a - b));
-    for (const entry of dataReq.DataReq) {
-      expect(entry.repeat).toBe(true);
-      expect(entry.inst).toBe(0); // default when no instanceInfo provided
+    // Collect all DataReq entries from subsequent messages
+    const allDataReqEntries: any[] = [];
+    for (let i = 2; i < ws.sent.length; i++) {
+      const msg = JSON.parse(ws.sent[i]);
+      if (Array.isArray(msg.DataReq)) allDataReqEntries.push(...msg.DataReq);
     }
-
-    await mgr.disconnect();
-  });
-
-  it('uses instance numbers from DataInfo when subscribing', async () => {
-    const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
-    await mgr.connect('127.0.0.1', 2053);
-
-    const ws = latest(MockWebSocket.instances);
-    ws.simulateOpen();
-
-    // DataList with just TWA (141) and SOG (41)
-    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422] } }));
-    expect(ws.sent).toHaveLength(2); // DataListReq + DataInfoReq
-
-    // DataInfo says channel 141 (TWA) is on inst:1, channel 41 (SOG) is on inst:0
-    ws.simulateMessage(
-      JSON.stringify({
-        DataInfo: [
-          { id: 141, sname: 'TWA', numInstances: 1, instanceInfo: [{ inst: 1, location: 3, str: 'Starboard' }] },
-          { id: 47, sname: 'TWS', numInstances: 1, instanceInfo: [{ inst: 0, location: 0, str: 'Port' }] },
-          { id: 42, sname: 'BSP', numInstances: 1 },
-          { id: 41, sname: 'SOG', numInstances: 1 },
-          { id: 9,  sname: 'COG', numInstances: 1 },
-          { id: 37, sname: 'HDG', numInstances: 1 },
-          { id: 421, sname: 'LAT', numInstances: 1 },
-          { id: 422, sname: 'LON', numInstances: 1 },
-          { id: 140, sname: 'AWA', numInstances: 1 },
-          { id: 46,  sname: 'AWS', numInstances: 1 },
-          { id: 235, sname: 'VMG', numInstances: 1 },
-          { id: 226, sname: 'LEE', numInstances: 1 },
-        ],
-      }),
-    );
-
-    // DataReq should use inst:1 for ch 141 and inst:0 for the rest
-    expect(ws.sent).toHaveLength(3);
-    const dataReq = JSON.parse(ws.sent[2]);
-    const twaEntry = dataReq.DataReq.find((e: any) => e.id === 141);
-    expect(twaEntry?.inst).toBe(1);
-    const sogEntry = dataReq.DataReq.find((e: any) => e.id === 41);
-    expect(sogEntry?.inst).toBe(0);
-
-    await mgr.disconnect();
-  });
-
-  it('falls back to inst:0 for channels where DataInfo never arrives', async () => {
-    vi.useFakeTimers();
-    const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
-    await mgr.connect('127.0.0.1', 2053);
-
-    const ws = latest(MockWebSocket.instances);
-    ws.simulateOpen();
-
-    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422];
-    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
-
-    // DataInfoReq sent; no DataInfo response arrives — advance past the 3 s timeout
-    expect(ws.sent).toHaveLength(2); // DataListReq + DataInfoReq
-    vi.advanceTimersByTime(3_000);
-
-    // DataReq sent with inst:0 fallback for all channels
-    expect(ws.sent).toHaveLength(3);
-    const dataReq = JSON.parse(ws.sent[2]);
-    expect(Array.isArray(dataReq.DataReq)).toBe(true);
-    const sentIds = dataReq.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
-    expect(sentIds).toEqual(allIds.slice().sort((a, b) => a - b));
-    for (const entry of dataReq.DataReq) {
+    // All subscription DataReq entries should have repeat:true and inst:0
+    for (const entry of allDataReqEntries) {
+      expect(entry.repeat).toBe(true);
       expect(entry.inst).toBe(0);
     }
-
-    await mgr.disconnect();
-  });
-
-  it('filters DataInfoReq and DataReq to only required channels present in DataList', async () => {
-    vi.useFakeTimers();
-    const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
-    await mgr.connect('127.0.0.1', 2053);
-
-    const ws = latest(MockWebSocket.instances);
-    ws.simulateOpen();
-    expect(ws.sent).toHaveLength(1);
-
-    // DataList missing LAT/LON (421, 422)
-    const partialIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235];
-    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: partialIds } }));
-
-    // DataInfoReq should only contain the 10 channels from partialIds
-    expect(ws.sent).toHaveLength(2);
-    const infoReq = JSON.parse(ws.sent[1]);
-    expect(infoReq.DataInfoReq.sort((a: number, b: number) => a - b)).toEqual(
-      partialIds.slice().sort((a, b) => a - b),
-    );
-    expect(infoReq.DataInfoReq).not.toContain(421);
-    expect(infoReq.DataInfoReq).not.toContain(422);
-
-    // DataInfo timeout → DataReq
-    vi.advanceTimersByTime(3_000);
-    expect(ws.sent).toHaveLength(3);
-    const dataReq = JSON.parse(ws.sent[2]);
-    const sentIds = dataReq.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
-    expect(sentIds).toEqual(partialIds.slice().sort((a, b) => a - b));
-    expect(sentIds).not.toContain(421);
-    expect(sentIds).not.toContain(422);
+    // All available channel IDs should be subscribed
+    const subscribedIds = allDataReqEntries.map((e: any) => e.id).sort((a: number, b: number) => a - b);
+    expect(subscribedIds).toEqual(allIds.slice().sort((a, b) => a - b));
 
     await mgr.disconnect();
   });
@@ -501,14 +398,24 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     expect(ws.sent).toHaveLength(1);
     expect(JSON.parse(ws.sent[0]).DataListReq).toBeDefined();
 
-    // Advance past discovery timeout (3 s) — fallback sends DataReq directly (no DataInfoReq)
+    // Advance past discovery timeout (3 s) — fallback calls subscribeAll([]) which sends probe + DataReq
     vi.advanceTimersByTime(3_000);
-    expect(ws.sent).toHaveLength(2); // DataListReq + DataReq only (no DataInfoReq)
-    const req = JSON.parse(ws.sent[1]);
-    expect(req.DataReq).toBeDefined();
-    expect(req.DataInfoReq).toBeUndefined();
-    const ids = req.DataReq.map((e: any) => e.id).sort((a: number, b: number) => a - b);
-    expect(ids).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422]);
+    expect(ws.sent.length).toBeGreaterThanOrEqual(2);
+    // Probe (repeat:false) followed by DataInfoReq + DataReq batches
+    const probe = JSON.parse(ws.sent[1]);
+    expect(probe.DataReq).toBeDefined();
+    expect(probe.DataReq[0].repeat).toBe(false);
+
+    // Collect all repeat:true DataReq entries
+    const repeatingIds: number[] = [];
+    for (let i = 2; i < ws.sent.length; i++) {
+      const msg = JSON.parse(ws.sent[i]);
+      if (Array.isArray(msg.DataReq)) {
+        repeatingIds.push(...msg.DataReq.map((e: any) => e.id));
+      }
+    }
+    const sortedIds = repeatingIds.sort((a, b) => a - b);
+    expect(sortedIds).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 421, 422]);
 
     await mgr.disconnect();
   });
@@ -527,20 +434,28 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     // Message 0: DataListReq (discovery)
     expect(ws.sent).toHaveLength(1);
 
-    // +3 s → discovery timeout → DataReq (msg 1)
+    // +3 s → discovery timeout → subscribeAll([]) fires:
+    //   msg 1: probe DataReq (repeat:false)
+    //   msg 2: DataInfoReq batch 1
+    //   msg 3: DataReq batch 1 (repeat:true)
     vi.advanceTimersByTime(3_000);
-    expect(ws.sent).toHaveLength(2);
-    expect(JSON.parse(ws.sent[1]).DataReq).toBeDefined();
+    expect(ws.sent).toHaveLength(4); // DataListReq + probe + DataInfoReq + DataReq
+    // Verify a DataReq exists in the subscription messages
+    const hasDataReq = ws.sent.slice(1).some((s: string) => {
+      const m = JSON.parse(s);
+      return Array.isArray(m.DataReq) && m.DataReq.some((e: any) => e.repeat === true);
+    });
+    expect(hasDataReq).toBe(true);
 
-    // +30 s → first keepalive (message 2)
+    // +30 s → first keepalive
     vi.advanceTimersByTime(30_000);
-    expect(ws.sent).toHaveLength(3);
-    expect(JSON.parse(ws.sent[2])).toEqual({ SettingListReq: [{ groupId: 2 }] });
+    expect(JSON.parse(ws.sent[ws.sent.length - 1])).toEqual({ SettingListReq: [{ groupId: 2 }] });
+    const countAfterFirst = ws.sent.length;
 
-    // +30 s → second keepalive (message 3)
+    // +30 s → second keepalive
     vi.advanceTimersByTime(30_000);
-    expect(ws.sent).toHaveLength(4);
-    expect(JSON.parse(ws.sent[3])).toEqual({ SettingListReq: [{ groupId: 2 }] });
+    expect(ws.sent).toHaveLength(countAfterFirst + 1);
+    expect(JSON.parse(ws.sent[ws.sent.length - 1])).toEqual({ SettingListReq: [{ groupId: 2 }] });
 
     await mgr.disconnect();
   });

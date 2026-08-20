@@ -17,6 +17,7 @@ import { EventEmitter } from 'events';
 import { WebSocketServer } from 'ws';
 import { GoFreeManager } from './gofree-manager';
 import type { ParsedPGN } from './serial-manager';
+import type { GoFreeFreshnessEvent } from './gofree-manager';
 
 // ---------------------------------------------------------------------------
 // Constants (kept in sync with gofree-manager.ts)
@@ -617,5 +618,541 @@ describe('GoFreeManager — integration (real WebSocket server)', () => {
 
     await mgr.disconnect();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BE1: Unexpected disconnect timer cleanup
+// ---------------------------------------------------------------------------
+
+describe('GoFreeManager — BE1: unexpected disconnect timer cleanup', () => {
+  beforeEach(() => {
+    MockWebSocket.instances.length = 0;
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    MockWebSocket.instances.length = 0;
+  });
+
+  it('unexpected close during discovery: discovery timer cleared, no sends on closed socket', async () => {
+    const mgr = new GoFreeManager({
+      pollIntervalMs: 1_000,
+      reconnectIntervalMs: 10_000, // long reconnect so ws2 never opens in this test
+      keepaliveIntervalMs: 30_000,
+      maxReconnectAttempts: 10,
+      watchdogTimeoutMs: 5_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+    const ws1 = latest(MockWebSocket.instances);
+    ws1.simulateOpen();
+
+    // Discovery is pending — discoveryTimer is active, no DataList received
+    expect(ws1.sent).toHaveLength(1); // just DataListReq
+    const sentAtOpen = ws1.sent.length;
+
+    // Unexpected close before discovery completes
+    ws1.simulateClose(1006);
+
+    // Advance past the discovery timeout (3 s) and well past the keepalive interval
+    // but BEFORE the 10 s reconnect timer fires (so state stays 'reconnecting').
+    // If the discoveryTimer were not cleared, subscribeAll/sendPoll would fire at 3 s.
+    vi.advanceTimersByTime(8_000);
+
+    // ws1 must receive NO additional sends after the unexpected close
+    expect(ws1.sent.length).toBe(sentAtOpen);
+    expect(mgr.getStatus().state).toBe('reconnecting');
+
+    await mgr.disconnect();
+  });
+
+  it('unexpected close during active polling: poll timer cleared, no sends on closed socket', async () => {
+    const mgr = new GoFreeManager({
+      pollIntervalMs: 500,
+      reconnectIntervalMs: 10_000,
+      keepaliveIntervalMs: 30_000,
+      maxReconnectAttempts: 10,
+      watchdogTimeoutMs: 5_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+    const ws1 = latest(MockWebSocket.instances);
+    ws1.simulateOpen();
+
+    // Complete discovery and start polling
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws1.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+    // 1 DataListReq + 12 immediate DataReq = 13
+    expect(ws1.sent).toHaveLength(13);
+    const sentAtDiscovery = ws1.sent.length;
+
+    // Unexpected close while polling is active
+    ws1.simulateClose(1006);
+
+    // Advance past poll interval (500 ms) multiple times — poll timer must not fire
+    vi.advanceTimersByTime(3_000);
+
+    // ws1 gets zero additional sends after the close
+    expect(ws1.sent.length).toBe(sentAtDiscovery);
+    expect(mgr.getStatus().state).toBe('reconnecting');
+
+    await mgr.disconnect();
+  });
+
+  it('reconnect after active polling: new socket gets fresh discovery, old socket gets nothing', async () => {
+    const mgr = new GoFreeManager({
+      pollIntervalMs: 1_000,
+      reconnectIntervalMs: 200,
+      keepaliveIntervalMs: 30_000,
+      maxReconnectAttempts: 10,
+      watchdogTimeoutMs: 5_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+    const ws1 = latest(MockWebSocket.instances);
+    ws1.simulateOpen();
+
+    // Complete discovery on ws1
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws1.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+    expect(ws1.sent).toHaveLength(13);
+    const sentAtClose = ws1.sent.length;
+
+    // Unexpected close
+    ws1.simulateClose(1006);
+
+    // Trigger reconnect (200 ms) + open new socket
+    vi.advanceTimersByTime(300);
+    const ws2 = latest(MockWebSocket.instances);
+    expect(ws2).not.toBe(ws1);
+    ws2.simulateOpen();
+
+    // ws2 must start fresh discovery (DataListReq)
+    expect(ws2.sent.length).toBeGreaterThan(0);
+    expect(JSON.parse(ws2.sent[0]).DataListReq).toBeDefined();
+
+    // ws1 gets nothing new after its close
+    expect(ws1.sent.length).toBe(sentAtClose);
+
+    await mgr.disconnect();
+  });
+
+  it('old timers cannot fire against a reconnected socket (fake-clock regression)', async () => {
+    // Concrete regression: advance clock across close → reconnect and verify
+    // that no callback fires against the new socket from old timer registrations.
+    const mgr = new GoFreeManager({
+      pollIntervalMs: 500,
+      reconnectIntervalMs: 100,
+      keepaliveIntervalMs: 30_000,
+      maxReconnectAttempts: 10,
+      watchdogTimeoutMs: 5_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+    const ws1 = latest(MockWebSocket.instances);
+    ws1.simulateOpen();
+
+    // Complete discovery so pollTimer and keepaliveTimer are both active
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws1.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+    const sentAtClose = ws1.sent.length;
+
+    // Unexpected close — all old timers must be cleared before reconnect
+    ws1.simulateClose(1006);
+
+    // Jump clock: 100 ms triggers reconnect → ws2 opens
+    vi.advanceTimersByTime(100);
+    const ws2 = latest(MockWebSocket.instances);
+    expect(ws2).not.toBe(ws1);
+    ws2.simulateOpen();
+
+    // Advance clock far beyond old poll interval and keepalive interval
+    vi.advanceTimersByTime(60_000);
+
+    // ws1 must have received zero sends after its close; all sends are ws2's own
+    expect(ws1.sent.length).toBe(sentAtClose);
+
+    await mgr.disconnect();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BE2: Data freshness watchdog
+// ---------------------------------------------------------------------------
+
+describe('GoFreeManager — BE2: data freshness watchdog', () => {
+  beforeEach(() => {
+    MockWebSocket.instances.length = 0;
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    MockWebSocket.instances.length = 0;
+  });
+
+  it('open-but-nonresponsive H5000: watchdog transitions state to stale after timeout', async () => {
+    const mgr = new GoFreeManager({
+      watchdogTimeoutMs: 3_000,
+      pollIntervalMs: 1_000,
+      maxReconnectAttempts: 10,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    const states: string[] = [];
+    mgr.on('gofree:status', (s: any) => states.push(s.state));
+
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen(); // state → connected
+
+    expect(mgr.getStatus().state).toBe('connected');
+
+    // 3 s with no valid data → watchdog fires
+    vi.advanceTimersByTime(3_000);
+
+    expect(mgr.getStatus().state).toBe('stale');
+    expect(states).toContain('stale');
+
+    await mgr.disconnect();
+  });
+
+  it('valid data within watchdog window prevents stale transition', async () => {
+    const mgr = new GoFreeManager({
+      watchdogTimeoutMs: 3_000,
+      pollIntervalMs: 1_000,
+      maxReconnectAttempts: 10,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    const states: string[] = [];
+    mgr.on('gofree:status', (s: any) => states.push(s.state));
+
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    // Feed valid data at 2 s (within 3 s window) — watchdog should reset
+    vi.advanceTimersByTime(2_000);
+    ws.simulateMessage(JSON.stringify({ Data: [{ id: 42, val: 6, valid: true }] }));
+
+    // Advance another 2 s (total 4 s, but watchdog restarted at t=2 s)
+    vi.advanceTimersByTime(2_000);
+
+    // Not yet 3 s since last data (only 2 s), so still connected
+    expect(mgr.getStatus().state).toBe('connected');
+    expect(states).not.toContain('stale');
+
+    await mgr.disconnect();
+  });
+
+  it('valid data after stale restores connected state', async () => {
+    const mgr = new GoFreeManager({
+      watchdogTimeoutMs: 2_000,
+      pollIntervalMs: 1_000,
+      maxReconnectAttempts: 10,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    const states: string[] = [];
+    mgr.on('gofree:status', (s: any) => states.push(s.state));
+
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    // Trigger stale
+    vi.advanceTimersByTime(2_000);
+    expect(mgr.getStatus().state).toBe('stale');
+
+    // Feed valid data → should flip back to connected
+    ws.simulateMessage(JSON.stringify({ Data: [{ id: 42, val: 6, valid: true }] }));
+    expect(mgr.getStatus().state).toBe('connected');
+    expect(states.filter((s) => s === 'connected').length).toBeGreaterThanOrEqual(2);
+
+    await mgr.disconnect();
+  });
+
+  it('watchdog timer is cleared by resetForReconnect on unexpected disconnect', async () => {
+    const mgr = new GoFreeManager({
+      watchdogTimeoutMs: 3_000,
+      pollIntervalMs: 1_000,
+      reconnectIntervalMs: 10_000,
+      maxReconnectAttempts: 10,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    const states: string[] = [];
+    mgr.on('gofree:status', (s: any) => states.push(s.state));
+
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    // Close unexpectedly — watchdog timer must be cleared
+    ws.simulateClose(1006);
+    const statesAfterClose = [...states];
+
+    // Advance past watchdog timeout — must NOT see 'stale' since timer was cleared
+    vi.advanceTimersByTime(5_000);
+
+    const statesAfterAdvance = states.filter((s) => s === 'stale');
+    expect(statesAfterAdvance.length).toBe(0);
+
+    await mgr.disconnect();
+  });
+
+  it('gofree:freshness: emits stale channels when values not seen within 2x pollInterval', async () => {
+    const mgr = new GoFreeManager({
+      pollIntervalMs: 500,
+      watchdogTimeoutMs: 10_000,
+      maxReconnectAttempts: 10,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    const freshnessEvents: GoFreeFreshnessEvent[] = [];
+    mgr.on('gofree:freshness', (e: GoFreeFreshnessEvent) => freshnessEvents.push(e));
+
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    // Complete discovery
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+
+    // Send data for BSPD (ch42) only
+    ws.simulateMessage(JSON.stringify({ Data: [{ id: 42, val: 6, valid: true }] }));
+
+    // Advance past 2x pollInterval (1000 ms) — poll tick fires, emits freshness
+    vi.advanceTimersByTime(1_100);
+
+    expect(freshnessEvents.length).toBeGreaterThan(0);
+    const last = freshnessEvents[freshnessEvents.length - 1];
+    // TWA and TWS not seen → stale
+    expect(last.staleChannels).toContain(45); // CH_TWA
+    expect(last.staleChannels).toContain(47); // CH_TWS
+    // BSPD was seen recently (within 2x 500ms = 1000ms) — NOT stale
+    expect(last.staleChannels).not.toContain(42); // CH_BSPD
+
+    await mgr.disconnect();
+  });
+
+  it('gofree:freshness: channel becomes fresh once observed, stale after 2x pollInterval', async () => {
+    const mgr = new GoFreeManager({
+      pollIntervalMs: 500,
+      watchdogTimeoutMs: 10_000,
+      maxReconnectAttempts: 10,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    const freshnessEvents: GoFreeFreshnessEvent[] = [];
+    mgr.on('gofree:freshness', (e: GoFreeFreshnessEvent) => freshnessEvents.push(e));
+
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+
+    // Feed TWS — fresh
+    ws.simulateMessage(JSON.stringify({ Data: [{ id: 47, val: 12, valid: true }] }));
+
+    // First poll tick — TWS should be fresh, others stale
+    vi.advanceTimersByTime(600);
+    const afterFirst = freshnessEvents[freshnessEvents.length - 1];
+    expect(afterFirst.staleChannels).not.toContain(47); // CH_TWS — just seen
+
+    // Advance another 1000ms (total 1600ms since TWS was seen, > 2x 500ms = 1000ms)
+    vi.advanceTimersByTime(1_000);
+    const afterSecond = freshnessEvents[freshnessEvents.length - 1];
+    expect(afterSecond.staleChannels).toContain(47); // CH_TWS — now stale
+
+    await mgr.disconnect();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BE3: Stale wind pairing prevention
+// ---------------------------------------------------------------------------
+
+describe('GoFreeManager — BE3: stale wind pairing prevention', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('fresh TWA + fresh TWS: both fields present in PGN 130306', () => {
+    // No fake timers needed — both arrive in the same synchronous call, ts gap ≈ 0
+    const mgr = new GoFreeManager();
+    const emitted: ParsedPGN[] = [];
+    mgr.on('pgn', (p: ParsedPGN) => emitted.push(p));
+
+    feedRaw(mgr, JSON.stringify({
+      Data: [
+        { id: 47, val: 15, valid: true }, // TWS first
+        { id: 45, val: 60, valid: true }, // TWA second — sees fresh TWS
+      ],
+    }));
+
+    const combined = [...emitted].reverse().find(
+      (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
+    );
+    expect(combined).toBeDefined();
+    expect(combined!.fields.windSpeed).toBeCloseTo(15 * KTS_TO_MS, 4);
+    expect(combined!.fields.windAngle).toBeCloseTo(60 * DEG_TO_RAD, 4);
+  });
+
+  it('stale TWS (>1500 ms old): fresh TWA emits PGN 130306 with windAngle only (no windSpeed)', async () => {
+    vi.useFakeTimers();
+    const mgr = new GoFreeManager();
+    const emitted: ParsedPGN[] = [];
+    mgr.on('pgn', (p: ParsedPGN) => emitted.push(p));
+
+    // Feed TWS at t=0
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 47, val: 12, valid: true }] }));
+
+    // Advance past MAX_WIND_PAIRING_AGE_MS (1500 ms)
+    vi.advanceTimersByTime(2_000);
+
+    // Feed fresh TWA — TWS is now 2000 ms old, beyond the 1500 ms window
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 45, val: 45, valid: true }] }));
+
+    const lastTrue = [...emitted].reverse().find(
+      (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
+    );
+    expect(lastTrue).toBeDefined();
+    expect(lastTrue!.fields.windAngle).toBeDefined();
+    expect(lastTrue!.fields.windSpeed).toBeUndefined(); // stale companion excluded
+  });
+
+  it('stale TWA (>1500 ms old): fresh TWS emits PGN 130306 with windSpeed only (no windAngle)', async () => {
+    vi.useFakeTimers();
+    const mgr = new GoFreeManager();
+    const emitted: ParsedPGN[] = [];
+    mgr.on('pgn', (p: ParsedPGN) => emitted.push(p));
+
+    // Feed TWA at t=0
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 45, val: 45, valid: true }] }));
+
+    // Advance past pairing age
+    vi.advanceTimersByTime(2_000);
+
+    // Feed fresh TWS — TWA is stale
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 47, val: 12, valid: true }] }));
+
+    const lastTrue = [...emitted].reverse().find(
+      (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
+    );
+    expect(lastTrue).toBeDefined();
+    expect(lastTrue!.fields.windSpeed).toBeDefined();
+    expect(lastTrue!.fields.windAngle).toBeUndefined(); // stale companion excluded
+  });
+
+  it('stale AWS (>1500 ms old): fresh AWA emits PGN 130306 with windAngle only (Apparent)', async () => {
+    vi.useFakeTimers();
+    const mgr = new GoFreeManager();
+    const emitted: ParsedPGN[] = [];
+    mgr.on('pgn', (p: ParsedPGN) => emitted.push(p));
+
+    // Feed AWS at t=0
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 46, val: 14, valid: true }] }));
+
+    // Advance past pairing age
+    vi.advanceTimersByTime(2_000);
+
+    // Feed fresh AWA
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 44, val: 30, valid: true }] }));
+
+    const lastApparent = [...emitted].reverse().find(
+      (p) => p.pgn === PGN_WIND && p.fields.reference === 'Apparent',
+    );
+    expect(lastApparent).toBeDefined();
+    expect(lastApparent!.fields.windAngle).toBeDefined();
+    expect(lastApparent!.fields.windSpeed).toBeUndefined(); // stale companion excluded
+  });
+
+  it('stale AWA (>1500 ms old): fresh AWS emits PGN 130306 with windSpeed only (Apparent)', async () => {
+    vi.useFakeTimers();
+    const mgr = new GoFreeManager();
+    const emitted: ParsedPGN[] = [];
+    mgr.on('pgn', (p: ParsedPGN) => emitted.push(p));
+
+    // Feed AWA at t=0
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 44, val: 30, valid: true }] }));
+
+    // Advance past pairing age
+    vi.advanceTimersByTime(2_000);
+
+    // Feed fresh AWS
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 46, val: 14, valid: true }] }));
+
+    const lastApparent = [...emitted].reverse().find(
+      (p) => p.pgn === PGN_WIND && p.fields.reference === 'Apparent',
+    );
+    expect(lastApparent).toBeDefined();
+    expect(lastApparent!.fields.windSpeed).toBeDefined();
+    expect(lastApparent!.fields.windAngle).toBeUndefined(); // stale companion excluded
+  });
+
+  it('companion exactly at MAX_WIND_PAIRING_AGE_MS boundary is included (<=, not <)', async () => {
+    vi.useFakeTimers();
+    const mgr = new GoFreeManager();
+    const emitted: ParsedPGN[] = [];
+    mgr.on('pgn', (p: ParsedPGN) => emitted.push(p));
+
+    // Feed TWS at t=0
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 47, val: 10, valid: true }] }));
+
+    // Advance exactly to the boundary (1500 ms)
+    vi.advanceTimersByTime(1_500);
+
+    // Feed TWA — companion is exactly 1500 ms old → should be included
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 45, val: 30, valid: true }] }));
+
+    const lastTrue = [...emitted].reverse().find(
+      (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
+    );
+    expect(lastTrue).toBeDefined();
+    expect(lastTrue!.fields.windSpeed).toBeDefined(); // at boundary, still included
+    expect(lastTrue!.fields.windAngle).toBeDefined();
+  });
+
+  it('wind pairing state is reset on unexpected disconnect (no stale pairs across reconnects)', async () => {
+    vi.useFakeTimers();
+    const mgr = new GoFreeManager({
+      reconnectIntervalMs: 100,
+      maxReconnectAttempts: 10,
+      watchdogTimeoutMs: 5_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    MockWebSocket.instances.length = 0;
+    const emitted: ParsedPGN[] = [];
+    mgr.on('pgn', (p: ParsedPGN) => emitted.push(p));
+
+    await mgr.connect('127.0.0.1', 2053);
+    const ws1 = latest(MockWebSocket.instances);
+    ws1.simulateOpen();
+
+    // Feed TWS on first connection
+    ws1.simulateMessage(JSON.stringify({ Data: [{ id: 47, val: 20, valid: true }] }));
+
+    // Disconnect unexpectedly — pairing state must be cleared
+    ws1.simulateClose(1006);
+
+    // Reconnect
+    vi.advanceTimersByTime(200);
+    const ws2 = latest(MockWebSocket.instances);
+    expect(ws2).not.toBe(ws1);
+    ws2.simulateOpen();
+
+    // Feed TWA on the new connection — TWS from the previous connection must NOT pair
+    ws2.simulateMessage(JSON.stringify({ Data: [{ id: 45, val: 45, valid: true }] }));
+
+    const lastTrue = [...emitted].reverse().find(
+      (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
+    );
+    expect(lastTrue).toBeDefined();
+    expect(lastTrue!.fields.windAngle).toBeDefined();
+    expect(lastTrue!.fields.windSpeed).toBeUndefined(); // pre-disconnect TWS must NOT appear
+
+    await mgr.disconnect();
+    MockWebSocket.instances.length = 0;
   });
 });

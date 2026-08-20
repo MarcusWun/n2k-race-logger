@@ -2,14 +2,30 @@
  * GoFree Ethernet Data Source Manager (GoFree Tier 2 / WebSocket)
  *
  * Connects to the B&G H5000 CPU via WebSocket (default `ws://192.168.1.233:2053`),
- * subscribes to the required channel IDs with a `DataReq` message, and streams
- * the resulting JSON observations into ParsedPGN events so the downstream
- * pipeline (Dashboard, analysis engine, recording) treats GoFree data
+ * polls the required channel IDs with one-shot `DataReq` (repeat:false) messages,
+ * and converts the resulting JSON observations into ParsedPGN events so the
+ * downstream pipeline (Dashboard, analysis engine, recording) treats GoFree data
  * identically to NGT-1 data.
  *
+ * Architecture:
+ *   H5000 → WebSocket :2053 → GoFree Tier 2 JSON → GoFreeManager → ParsedPGN → common N2K pipeline
+ *
+ * Polling model:
+ *   The H5000 on this boat does not stream with repeat:true. We poll each required
+ *   channel individually with repeat:false at 1 Hz (default). Each single-channel
+ *   DataReq returns the current value within ~5 ms.
+ *
+ * Freshness design (BE2):
+ *   We chose 'stale' state over forced reconnect when the watchdog fires. Rationale:
+ *   a silent H5000 is a data-layer problem (instrument may be off, GPS lost, etc.),
+ *   not a transport-layer problem. Tearing down a healthy TCP connection would add
+ *   reconnect overhead and mask the real cause. If data resumes we flip back to
+ *   'connected' without a reconnect cycle.
+ *
  * Emits:
- *   'pgn'            — ParsedPGN objects (same shape as SerialManager)
- *   'gofree:status'  — GoFreeStatusEvent with connection state updates
+ *   'pgn'              — ParsedPGN objects (same shape as SerialManager)
+ *   'gofree:status'    — GoFreeStatusEvent with connection state updates
+ *   'gofree:freshness' — GoFreeFreshnessEvent with per-value staleness info (BE2)
  *
  * IMPORTANT: This manager NEVER sends the NGT-1 BST initialization command
  * `[0x11, 0x02, 0x00]`. That command is specific to the Actisense NGT-1 serial
@@ -34,6 +50,15 @@ const DEFAULT_POLL_INTERVAL_MS = 1_000;
 
 // How long to wait for DataList response before subscribing directly.
 const DISCOVERY_TIMEOUT_MS = 3_000;
+
+// BE2: Watchdog — transition to 'stale' if no valid observations for this long.
+const DEFAULT_WATCHDOG_TIMEOUT_MS = 5_000;
+
+// BE3: Maximum age of a cached wind companion value before it is too old to
+// pair with a fresh reading.  1 500 ms comfortably brackets the current 1 Hz
+// poll: at 1 Hz each value arrives ~1 000 ms apart, so a companion updated one
+// poll ago is ≤ 1 000 ms old and safely within the window.
+const MAX_WIND_PAIRING_AGE_MS = 1_500;
 
 // N2K PGN numbers emitted downstream so consumers are source-agnostic.
 const PGN_WIND = 130306;      // Wind Data
@@ -79,6 +104,7 @@ const REQUIRED_CHANNEL_IDS = [
 export type GoFreeState =
   | 'connecting'
   | 'connected'
+  | 'stale'          // BE2: socket is open but no valid H5000 data for watchdogTimeoutMs
   | 'reconnecting'
   | 'error'
   | 'disconnected';
@@ -90,6 +116,18 @@ export interface GoFreeStatusEvent {
   error?: string;
 }
 
+/**
+ * BE2: Per-value freshness event emitted on every poll tick.
+ * The renderer should display '--' for any tile whose channel is in staleChannels.
+ */
+export interface GoFreeFreshnessEvent {
+  /**
+   * Channel IDs whose last valid observation is older than 2 × pollIntervalMs.
+   * The FE maps these channel IDs to the appropriate dashboard tiles.
+   */
+  staleChannels: number[];
+}
+
 export interface GoFreeManagerOptions {
   /** Keepalive tick interval in ms (default 30000). */
   keepaliveIntervalMs?: number;
@@ -99,6 +137,12 @@ export interface GoFreeManagerOptions {
   reconnectIntervalMs?: number;
   /** Max reconnect attempts before entering the `error` state (default 3). */
   maxReconnectAttempts?: number;
+  /**
+   * BE2: Watchdog timeout in ms. If no valid H5000 observations arrive for this
+   * period while the socket is open, the manager transitions to 'stale' state.
+   * Default 5000 ms. Set to 0 to disable.
+   */
+  watchdogTimeoutMs?: number;
   /**
    * Injectable WebSocket implementation — allows tests to substitute a mock
    * without touching the network. Defaults to the real `ws` client.
@@ -115,25 +159,38 @@ interface Observation {
   valid?: boolean;
 }
 
+/** BE3: Timestamped wind value for stale-pairing prevention. */
+interface WindRecord {
+  value: number;
+  ts: number;
+}
+
 export class GoFreeManager extends EventEmitter {
   private state: GoFreeState = 'disconnected';
   private ws: any = null;
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private discoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  private watchdogTimer: ReturnType<typeof setTimeout> | null = null;  // BE2
   private reconnectAttempts = 0;
 
   // Channels to poll on each tick (populated after DataList discovery).
   private pollChannels: number[] = [];
 
-  // Accumulators used to pair TWA/TWS and AWA/AWS observations that arrive
-  // in separate messages. Angles are stored already normalized to 0–360°.
-  private lastTwaDeg: number | null = null;
-  private lastTwsKts: number | null = null;
-  private lastAwaDeg: number | null = null;
-  private lastAwsKts: number | null = null;
-  private discoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  // BE3: Wind pairing accumulators with timestamps. Angles are stored
+  // already normalized to 0–360°.  We only combine angle + speed into a
+  // single PGN 130306 when the cached companion is ≤ MAX_WIND_PAIRING_AGE_MS old.
+  private lastTwa: WindRecord | null = null;
+  private lastTws: WindRecord | null = null;
+  private lastAwa: WindRecord | null = null;
+  private lastAws: WindRecord | null = null;
+
   private discoveryComplete = false;
+
+  // BE2: Freshness tracking.
+  private lastValidObservationAt: number | null = null;
+  private lastSeenAt: Map<number, number> = new Map();
 
   private targetHost = '192.168.1.233';
   private targetPort = 2053;
@@ -142,6 +199,7 @@ export class GoFreeManager extends EventEmitter {
   private readonly pollIntervalMs: number;
   private readonly reconnectIntervalMs: number;
   private readonly maxReconnectAttempts: number;
+  private readonly watchdogTimeoutMs: number;
   private readonly WebSocketImpl: any;
 
   constructor(options?: GoFreeManagerOptions) {
@@ -154,6 +212,8 @@ export class GoFreeManager extends EventEmitter {
       options?.reconnectIntervalMs ?? DEFAULT_RECONNECT_INTERVAL_MS;
     this.maxReconnectAttempts =
       options?.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS;
+    this.watchdogTimeoutMs =
+      options?.watchdogTimeoutMs ?? DEFAULT_WATCHDOG_TIMEOUT_MS;
     this.WebSocketImpl = options?.WebSocketImpl ?? WebSocket;
   }
 
@@ -174,15 +234,13 @@ export class GoFreeManager extends EventEmitter {
     if (host !== undefined) this.targetHost = host;
     if (port !== undefined) this.targetPort = port;
     this.reconnectAttempts = 0;
-    this.resetSessionState();
     this.openSocket();
   }
 
   /** Close the socket cleanly and cancel all timers. */
   async disconnect(): Promise<void> {
     this.clearReconnectTimer();
-    this.clearKeepaliveTimer();
-    this.clearPollTimer();
+    this.resetForReconnect();
     this.cleanupSocket();
     this.setState('disconnected');
   }
@@ -213,6 +271,7 @@ export class GoFreeManager extends EventEmitter {
       console.log(`[GoFreeManager] WebSocket connected to ${url}`);
       this.startDiscovery();
       this.startKeepalive();
+      this.startWatchdog();  // BE2: begin liveness monitoring
     });
 
     ws.on('message', (data: any) => {
@@ -233,7 +292,6 @@ export class GoFreeManager extends EventEmitter {
     });
 
     ws.on('close', (code?: number) => {
-      this.clearKeepaliveTimer();
       const msg = `WebSocket closed${code != null ? ` (code=${code})` : ''}`;
       this.emit('debug', `[GoFree] ${msg}`);
       this.cleanupSocket();
@@ -278,10 +336,7 @@ export class GoFreeManager extends EventEmitter {
    */
   private subscribeAll(availableIds: number[]): void {
     this.discoveryComplete = true;
-    if (this.discoveryTimer !== null) {
-      clearTimeout(this.discoveryTimer);
-      this.discoveryTimer = null;
-    }
+    this.clearDiscoveryTimer();
 
     // Log which required channels are absent from the DataList (informational only).
     // We still poll ALL required channels regardless — the H5000 sometimes omits
@@ -340,6 +395,7 @@ export class GoFreeManager extends EventEmitter {
     this.clearPollTimer();
     this.pollTimer = setInterval(() => {
       this.sendPoll();
+      this.emitFreshness();  // BE2: report per-value staleness each poll tick
     }, this.pollIntervalMs);
   }
 
@@ -417,6 +473,7 @@ export class GoFreeManager extends EventEmitter {
   }
 
   private processObservations(obs: Observation[]): void {
+    let validCount = 0;
     for (const o of obs) {
       if (!o || typeof o.id !== 'number') continue;
       if (o.valid === false) continue; // discard invalid observations
@@ -434,62 +491,80 @@ export class GoFreeManager extends EventEmitter {
         continue;
       }
 
+      validCount++;
       this.handleObservation(o, numVal);
+    }
+
+    // BE2: Update liveness tracking whenever at least one valid observation is accepted.
+    if (validCount > 0) {
+      this.lastValidObservationAt = Date.now();
+      // Only reset the watchdog when we have an active connection.
+      if (this.state === 'connected' || this.state === 'stale') {
+        this.resetWatchdog();
+      }
     }
   }
 
   private handleObservation(o: Observation, val: number): void {
-    const ts = new Date().toISOString();
+    const now = Date.now();
+    const ts = new Date(now).toISOString();
+
+    // BE2: Record when this channel was last seen for per-value freshness.
+    this.lastSeenAt.set(o.id, now);
 
     switch (o.id) {
       case CH_TWA: {
         // Signed degrees (negative = port). Normalize to 0–360° so downstream
         // normalizeWindAngle() logic matches the NGT-1 path.
         const deg360 = ((val % 360) + 360) % 360;
-        this.lastTwaDeg = deg360;
+        this.lastTwa = { value: deg360, ts: now };  // BE3: store with timestamp
         const fields: Record<string, any> = {
           windAngle: deg360 * DEG_TO_RAD,
           reference: 'True (boat referenced)',
         };
-        if (this.lastTwsKts !== null) {
-          fields.windSpeed = this.lastTwsKts * KTS_TO_MS;
+        // BE3: Only include TWS if the cached companion is fresh enough.
+        if (this.lastTws !== null && (now - this.lastTws.ts) <= MAX_WIND_PAIRING_AGE_MS) {
+          fields.windSpeed = this.lastTws.value * KTS_TO_MS;
         }
         this.emitPgn(PGN_WIND, fields, ts);
         break;
       }
       case CH_TWS: {
-        this.lastTwsKts = val;
+        this.lastTws = { value: val, ts: now };  // BE3: store with timestamp
         const fields: Record<string, any> = {
           windSpeed: val * KTS_TO_MS,
           reference: 'True (boat referenced)',
         };
-        if (this.lastTwaDeg !== null) {
-          fields.windAngle = this.lastTwaDeg * DEG_TO_RAD;
+        // BE3: Only include TWA if the cached companion is fresh enough.
+        if (this.lastTwa !== null && (now - this.lastTwa.ts) <= MAX_WIND_PAIRING_AGE_MS) {
+          fields.windAngle = this.lastTwa.value * DEG_TO_RAD;
         }
         this.emitPgn(PGN_WIND, fields, ts);
         break;
       }
       case CH_AWA: {
         const deg360 = ((val % 360) + 360) % 360;
-        this.lastAwaDeg = deg360;
+        this.lastAwa = { value: deg360, ts: now };  // BE3: store with timestamp
         const fields: Record<string, any> = {
           windAngle: deg360 * DEG_TO_RAD,
           reference: 'Apparent',
         };
-        if (this.lastAwsKts !== null) {
-          fields.windSpeed = this.lastAwsKts * KTS_TO_MS;
+        // BE3: Only include AWS if the cached companion is fresh enough.
+        if (this.lastAws !== null && (now - this.lastAws.ts) <= MAX_WIND_PAIRING_AGE_MS) {
+          fields.windSpeed = this.lastAws.value * KTS_TO_MS;
         }
         this.emitPgn(PGN_WIND, fields, ts);
         break;
       }
       case CH_AWS: {
-        this.lastAwsKts = val;
+        this.lastAws = { value: val, ts: now };  // BE3: store with timestamp
         const fields: Record<string, any> = {
           windSpeed: val * KTS_TO_MS,
           reference: 'Apparent',
         };
-        if (this.lastAwaDeg !== null) {
-          fields.windAngle = this.lastAwaDeg * DEG_TO_RAD;
+        // BE3: Only include AWA if the cached companion is fresh enough.
+        if (this.lastAwa !== null && (now - this.lastAwa.ts) <= MAX_WIND_PAIRING_AGE_MS) {
+          fields.windAngle = this.lastAwa.value * DEG_TO_RAD;
         }
         this.emitPgn(PGN_WIND, fields, ts);
         break;
@@ -541,6 +616,56 @@ export class GoFreeManager extends EventEmitter {
   }
 
   // ---------------------------------------------------------------------------
+  // BE2: Data-freshness watchdog
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Start (or restart) the watchdog timer.  If no valid observations arrive
+   * within watchdogTimeoutMs the manager transitions to 'stale'.
+   */
+  private startWatchdog(): void {
+    if (this.watchdogTimeoutMs <= 0) return;
+    this.clearWatchdogTimer();
+    this.watchdogTimer = setTimeout(() => {
+      this.watchdogTimer = null;
+      if (this.state === 'connected' || this.state === 'stale') {
+        this.setState('stale', this.targetHost, this.targetPort);
+      }
+    }, this.watchdogTimeoutMs);
+  }
+
+  /**
+   * Called whenever a valid observation arrives while connected.
+   * Transitions out of 'stale' back to 'connected' and resets the watchdog window.
+   */
+  private resetWatchdog(): void {
+    if (this.state === 'stale') {
+      this.setState('connected', this.targetHost, this.targetPort);
+    }
+    this.startWatchdog();
+  }
+
+  /**
+   * BE2: Emit a freshness snapshot on every poll tick.
+   * Channels not seen within 2 × pollIntervalMs are flagged as stale.
+   */
+  private emitFreshness(): void {
+    const now = Date.now();
+    const perValueTimeoutMs = 2 * this.pollIntervalMs;
+    const staleChannels: number[] = [];
+
+    for (const channelId of REQUIRED_CHANNEL_IDS) {
+      const lastSeen = this.lastSeenAt.get(channelId);
+      if (lastSeen === undefined || (now - lastSeen) > perValueTimeoutMs) {
+        staleChannels.push(channelId);
+      }
+    }
+
+    const event: GoFreeFreshnessEvent = { staleChannels };
+    this.emit('gofree:freshness', event);
+  }
+
+  // ---------------------------------------------------------------------------
   // Keepalive
   // ---------------------------------------------------------------------------
 
@@ -555,7 +680,14 @@ export class GoFreeManager extends EventEmitter {
   // Reconnect logic
   // ---------------------------------------------------------------------------
 
+  /**
+   * BE1: Central failure handler.  Clears ALL timers and session state
+   * (via resetForReconnect) before scheduling a reconnect attempt so that
+   * old timers can never fire against a newly opened socket.
+   */
   private handleConnectionFailure(message: string): void {
+    this.resetForReconnect();  // BE1: clear everything before reconnect
+
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       console.error(`[GoFreeManager] Max reconnect attempts reached: ${message}`);
       this.setState('error', this.targetHost, this.targetPort, message);
@@ -600,21 +732,35 @@ export class GoFreeManager extends EventEmitter {
   }
 
   // ---------------------------------------------------------------------------
-  // Cleanup helpers
+  // BE1: Cleanup helpers — resetForReconnect() is the single authority
   // ---------------------------------------------------------------------------
 
-  private resetSessionState(): void {
-    this.lastTwaDeg = null;
-    this.lastTwsKts = null;
-    this.lastAwaDeg = null;
-    this.lastAwsKts = null;
+  /**
+   * BE1: Clear ALL connection/session timers and pending state so that no
+   * timer can fire against a subsequent (re)connection's socket.
+   *
+   * Called by:
+   *   - disconnect()            — user-initiated clean shutdown
+   *   - handleConnectionFailure — unexpected close / reconnect path
+   *
+   * Does NOT clear reconnectTimer (handled separately by disconnect/connect).
+   */
+  private resetForReconnect(): void {
+    this.clearKeepaliveTimer();
+    this.clearPollTimer();
+    this.clearDiscoveryTimer();
+    this.clearWatchdogTimer();
+    // BE3: clear wind pairing state
+    this.lastTwa = null;
+    this.lastTws = null;
+    this.lastAwa = null;
+    this.lastAws = null;
+    // Session state
     this.pollChannels = [];
     this.discoveryComplete = false;
-    if (this.discoveryTimer !== null) {
-      clearTimeout(this.discoveryTimer);
-      this.discoveryTimer = null;
-    }
-    this.clearPollTimer();
+    // BE2: freshness state
+    this.lastValidObservationAt = null;
+    this.lastSeenAt.clear();
   }
 
   private clearKeepaliveTimer(): void {
@@ -635,6 +781,20 @@ export class GoFreeManager extends EventEmitter {
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+  }
+
+  private clearDiscoveryTimer(): void {
+    if (this.discoveryTimer !== null) {
+      clearTimeout(this.discoveryTimer);
+      this.discoveryTimer = null;
+    }
+  }
+
+  private clearWatchdogTimer(): void {
+    if (this.watchdogTimer !== null) {
+      clearTimeout(this.watchdogTimer);
+      this.watchdogTimer = null;
     }
   }
 

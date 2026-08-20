@@ -89,7 +89,24 @@ Loaded via spread-merge on startup (per decision #29). Missing fields in old set
 
 `connection:connect` and `connection:disconnect` continue to work for both sources. Routing is determined by `currentDataSource` in `ipc-handlers.ts`.
 
-GoFree status states: `'searching'` | `'connecting'` | `'connected'` | `'reconnecting'` | `'error'` | `'disconnected'`
+GoFree status states: `'searching'` | `'connecting'` | `'connected'` | `'stale'` | `'reconnecting'` | `'error'` | `'disconnected'`
+
+**`stale` state (added Group A / BE2):** The WebSocket is open and the socket appears connected, but no valid H5000 observations have arrived within `watchdogTimeoutMs` (default 5 000 ms). The renderer must treat `stale` the same as "no data" — tile values should display `--`. When valid data resumes, the manager transitions back to `connected` without a reconnect cycle. This is intentional: silence from the instrument network is a data-layer problem, not a transport-layer problem, and a healthy TCP connection should not be torn down to diagnose it.
+
+**`gofree:freshness` event (added Group A / BE2):** Emitted by `GoFreeManager` on every poll tick (every `pollIntervalMs`).
+
+```ts
+interface GoFreeFreshnessEvent {
+  /** Channel IDs whose last valid observation is older than 2 × pollIntervalMs. */
+  staleChannels: number[];
+}
+```
+
+The renderer maps channel IDs to dashboard tiles and renders `--` for any value whose channel ID appears in `staleChannels`. The last known value is retained in memory — only the display is suppressed.
+
+**Wind pairing timestamps (added Group A / BE3):** TWA, TWS, AWA, and AWS are stored internally as `{ value: number; ts: number }` records. When emitting PGN 130306, the companion field (e.g. windSpeed when processing TWA) is only included when the cached companion's timestamp is within `MAX_WIND_PAIRING_AGE_MS` (1 500 ms) of the current observation. This prevents pairing a fresh angle reading with an indefinitely-old speed reading (and vice versa). The `reference` strings `'True (boat referenced)'` and `'Apparent'` are unchanged.
+
+**GoFreeManagerOptions.watchdogTimeoutMs (added Group A / BE2):** New optional option; default 5 000 ms. Set to `0` to disable the watchdog. Tests should pass a short value (e.g. 2 000–3 000 ms) to avoid wall-clock waits.
 
 ### NMEA 0183 Sentence → Store Field Mapping
 

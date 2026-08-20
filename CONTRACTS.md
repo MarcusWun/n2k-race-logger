@@ -76,7 +76,7 @@ Splines are memoised per `(PolarTable, rowIndex, method)` via a `WeakMap` so the
 |---|---|---|---|
 | `dataSource` | `'ngt1' \| 'gofree'` | `'ngt1'` | Active data source |
 | `gofreeHost` | `string` | `'192.168.0.1'` | GoFree router IP (fallback when multicast discovery fails) |
-| `gofreePort` | `number` | `10110` | GoFree TCP port |
+| `gofreePort` | `number` | `2053` | H5000 GoFree WebSocket port |
 
 Loaded via spread-merge on startup (per decision #29). Missing fields in old settings.json files silently get defaults.
 
@@ -133,33 +133,14 @@ The renderer maps channel IDs to dashboard tiles and renders `--` for any value 
 
 **BE6 Reconnect model:** Indefinite reconnection with capped exponential backoff (`backoffLadderMs`, default `[1s, 2s, 5s, 10s]`). The `backoffIndex` is NOT reset when WebSocket `open` fires. It resets only after `sustainedDataResetMs` of continuous valid observations while state remains `'connected'`. The `handleConnectionFailure()` → `resetForReconnect()` path is unchanged.
 
-### NMEA 0183 Sentence → Store Field Mapping
-
-All values converted to N2K-compatible units (m/s, radians) so the downstream pipeline is source-agnostic.
-
-| Sentence | Fields | PGN emitted | Store target |
-|---|---|---|---|
-| `$WIMWV` (ref=R) | AWS (kts→m/s), AWA (°→rad, 0–2π) | 130306, ref=`'Apparent'` | AWS, AWA |
-| `$WIMWV` (ref=T) | TWS (kts→m/s), TWA (°→rad, 0–2π) | 130306, ref=`'True (boat referenced)'` | TWS, TWA |
-| `$IIVHW` | STW (kts→m/s), HDG magnetic (°→rad) | 128259 + 127250 | STW, Heading |
-| `$GPGLL` | LAT, LON (decimal °, no conversion) | 129025 | LAT, LON |
-| `$GPRMC` | LAT, LON, SOG (kts→m/s), COG (°→rad) | 129025 + 129026 | LAT, LON, SOG, COG |
-| `$GPVTG` | SOG (kts→m/s), COG true (°→rad) | 129026 | SOG, COG |
-| `$HCHDG` | HDG magnetic (°→rad) → `heading` field | 127250 | Heading |
-| `$HCHDT` | HDG true (°→rad) → `headingTrue` field | 127250 | Heading fallback |
-
-NMEA port-side AWA values (NMEA signed negative or 0–360° reflex angles) map to 0–2π radians matching N2K convention. The renderer's `normalizeWindAngle()` and analysis-engine handle side labeling identically for both sources.
-
-True wind fallback: when only `$WIMWV` ref=R (apparent) is present in a session, `GoFreeManager` computes TWS/TWA from AWA + STW using the same vector formula as the renderer Dashboard and `analysis-engine.ts`, and emits an additional PGN 130306 with `reference='True (boat referenced)'`.
-
 ### NGT-1 BST Init — NEVER Sent on GoFree Connections
 
-The BST initialization command `[0x11, 0x02, 0x00]` is Actisense NGT-1 specific. It is implemented only in `serial-manager.ts` and is **never** sent by `GoFreeManager`. GoFree connections require no handshake — NMEA sentences stream immediately on TCP connect.
+The BST initialization command `[0x11, 0x02, 0x00]` is Actisense NGT-1 specific. It is implemented only in `serial-manager.ts` and is **never** sent by `GoFreeManager`. GoFree connections use the H5000 WebSocket Tier 2 JSON protocol — no initialization handshake is required; the manager immediately sends a `DataListReq` (group 40) on WebSocket open to discover available channels.
 
 ### Architecture
 
-- `electron/gofree-manager.ts` — new file mirroring `serial-manager.ts` structure
-- `electron/ipc-handlers.ts` — `currentDataSource` routes `connection:connect`/`disconnect`; new `connection:source` handler
+- `electron/gofree-manager.ts` — GoFree Tier 2 WebSocket manager (mirrors `serial-manager.ts` public API; emits `ParsedPGN` events)
+- `electron/ipc-handlers.ts` — `currentDataSource` routes `connection:connect`/`disconnect`; `connection:source` handler
 - `electron/preload.ts` — exposes `setDataSource()` and `'gofree:status'` event channel
 - Only one manager emits data at a time (enforced by `connect()`/`disconnect()` lifecycle)
 

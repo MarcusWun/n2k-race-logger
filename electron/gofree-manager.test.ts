@@ -1325,6 +1325,86 @@ describe('GoFreeManager — BE5: fast / normal polling groups', () => {
     await mgr.disconnect();
   });
 
+  it('fast poll multi-tick: ≥3 ticks send only fast-group channels with consistent count', async () => {
+    const mgr = new GoFreeManager({
+      fastPollIntervalMs: 200,
+      normalPollIntervalMs: 10_000, // very long so it never fires
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+    const sentAfterDiscovery = ws.sent.length; // 1 DataListReq + 12 immediate = 13
+
+    // Run 3 fast ticks and verify each sends exactly 5 fast-group messages
+    for (let tick = 1; tick <= 3; tick++) {
+      const sentBefore = ws.sent.length;
+      vi.advanceTimersByTime(200);
+      const newMsgs = ws.sent.slice(sentBefore);
+      // Exactly 5 messages per fast tick (one per fast-group channel)
+      expect(newMsgs.length).toBe(5);
+      const ids = newMsgs.map((s: string) => JSON.parse(s).DataReq[0].id);
+      // All must be fast-group channels, none from normal group
+      for (const id of ids) {
+        expect(FAST_CH.has(id)).toBe(true);
+        expect(NORMAL_CH.has(id)).toBe(false);
+      }
+    }
+
+    await mgr.disconnect();
+  });
+
+  it('reconnect after active polling: both fastPollTimer and normalPollTimer run against new socket', async () => {
+    const mgr = new GoFreeManager({
+      fastPollIntervalMs: 200,
+      normalPollIntervalMs: 1_000,
+      reconnectIntervalMs: 100,
+      watchdogTimeoutMs: 30_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+    const ws1 = latest(MockWebSocket.instances);
+    ws1.simulateOpen();
+
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws1.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+    const sentAtClose = ws1.sent.length;
+
+    // Unexpected close → reconnect after 100ms
+    ws1.simulateClose(1006);
+    vi.advanceTimersByTime(150);
+
+    const ws2 = latest(MockWebSocket.instances);
+    expect(ws2).not.toBe(ws1);
+    ws2.simulateOpen();
+    ws2.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+    const sentAfterDiscovery2 = ws2.sent.length;
+
+    // Fast timer on ws2 fires at +200ms → exactly 5 fast-group sends
+    vi.advanceTimersByTime(200);
+    const afterFastTick = ws2.sent.slice(sentAfterDiscovery2);
+    expect(afterFastTick.length).toBe(5);
+    expect(afterFastTick.every((s: string) => FAST_CH.has(JSON.parse(s).DataReq[0].id))).toBe(true);
+
+    // Normal timer on ws2 fires at +1000ms; fast also fires 4 more times during this window
+    const sentBeforeNormalTick = ws2.sent.length;
+    vi.advanceTimersByTime(800); // total 1000ms from discovery
+    const afterNormalWindow = ws2.sent.slice(sentBeforeNormalTick);
+    const normalIds = afterNormalWindow
+      .map((s: string) => JSON.parse(s).DataReq[0].id)
+      .filter((id: number) => NORMAL_CH.has(id));
+    // All 7 normal channels appear on the normal tick
+    expect(normalIds.length).toBe(7);
+
+    // ws1 receives nothing new after its close
+    expect(ws1.sent.length).toBe(sentAtClose);
+
+    await mgr.disconnect();
+  });
+
   it('freshness window for fast channel is 2 × fastPollIntervalMs', async () => {
     const mgr = new GoFreeManager({
       fastPollIntervalMs: 400,      // fast stale window = 800 ms
@@ -1667,5 +1747,151 @@ describe('GoFreeManager — BE7: WebSocket readyState guard', () => {
     expect(ws.sent.length).toBe(sentAfterOpen);
 
     await mgr.disconnect();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BE9 additions: freshness event contract, watchdog-while-stale, sustainedDataTimer cleanup
+// ---------------------------------------------------------------------------
+
+describe('GoFreeManager — BE9: gofree:freshness event contract (fast vs normal stale windows)', () => {
+  beforeEach(() => {
+    MockWebSocket.instances.length = 0;
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    MockWebSocket.instances.length = 0;
+  });
+
+  it('fast stale window does not bleed into normal channels, and vice versa', async () => {
+    // fastPollIntervalMs=200 → fast stale window = 2×200 = 400ms (strict >)
+    // normalPollIntervalMs=1000 → normal stale window = 2×1000 = 2000ms (strict >)
+    const mgr = new GoFreeManager({
+      fastPollIntervalMs: 200,
+      normalPollIntervalMs: 1_000,
+      watchdogTimeoutMs: 60_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    const freshnessEvents: GoFreeFreshnessEvent[] = [];
+    mgr.on('gofree:freshness', (e: GoFreeFreshnessEvent) => freshnessEvents.push(e));
+
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+
+    // Feed BSPD (fast ch42) and SOG (normal ch41) at t=0
+    ws.simulateMessage(JSON.stringify({
+      Data: [
+        { id: 42, val: 6, valid: true }, // fast: BSPD
+        { id: 41, val: 5, valid: true }, // normal: SOG
+      ],
+    }));
+
+    // Advance to t=600ms: fast tick fires at 200, 400, 600ms.
+    // At t=600ms tick: BSPD gap=600ms > 400ms window → STALE
+    //                  SOG  gap=600ms < 2000ms window → NOT STALE
+    // This verifies fast stale does not bleed into normal channels.
+    vi.advanceTimersByTime(600);
+    const after600 = freshnessEvents[freshnessEvents.length - 1];
+    expect(after600.staleChannels).toContain(42);     // BSPD stale (fast, 600 > 400ms)
+    expect(after600.staleChannels).not.toContain(41); // SOG fresh (normal, 600 < 2000ms)
+
+    // Advance to t=2200ms: fast tick fires at 2200ms.
+    // BSPD gap=2200 > 400 → still stale.
+    // SOG  gap=2200 > 2000 → now stale (normal window exceeded).
+    // This verifies normal stale does not bleed prematurely.
+    vi.advanceTimersByTime(1_600); // total 2200ms from data observation
+    const after2200 = freshnessEvents[freshnessEvents.length - 1];
+    expect(after2200.staleChannels).toContain(42); // BSPD still stale
+    expect(after2200.staleChannels).toContain(41); // SOG now stale (2200 > 2000ms)
+
+    await mgr.disconnect();
+  });
+});
+
+describe('GoFreeManager — BE9: watchdog behaviour while stale', () => {
+  beforeEach(() => {
+    MockWebSocket.instances.length = 0;
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    MockWebSocket.instances.length = 0;
+  });
+
+  it('watchdog does not transition to error while stale — state stays stale until data or disconnect', async () => {
+    // watchdog is a one-shot setTimeout; after firing it clears itself and is not restarted
+    // while in stale state.  So state remains 'stale' — never 'error' — across many windows.
+    const mgr = new GoFreeManager({
+      watchdogTimeoutMs: 1_000,
+      pollIntervalMs: 10_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    const states: string[] = [];
+    mgr.on('gofree:status', (s: any) => states.push(s.state));
+
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    // First watchdog window: transitions connected → stale
+    vi.advanceTimersByTime(1_000);
+    expect(mgr.getStatus().state).toBe('stale');
+
+    // Advance many more watchdog-equivalent windows — state must stay stale, never reach error
+    vi.advanceTimersByTime(15_000);
+    expect(mgr.getStatus().state).toBe('stale');
+    expect(states).not.toContain('error');
+
+    await mgr.disconnect();
+  });
+});
+
+describe('GoFreeManager — BE9: sustainedDataTimer cleared on disconnect', () => {
+  beforeEach(() => {
+    MockWebSocket.instances.length = 0;
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    MockWebSocket.instances.length = 0;
+  });
+
+  it('sustainedDataTimer cleared by disconnect(): advancing past window causes no backoffIndex reset or state change', async () => {
+    const mgr = new GoFreeManager({
+      backoffLadderMs: [1_000, 2_000, 5_000, 10_000],
+      sustainedDataResetMs: 1_000,
+      watchdogTimeoutMs: 60_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    const states: string[] = [];
+    mgr.on('gofree:status', (s: any) => states.push(s.state));
+
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen(); // sustainedDataTimer starts (1000ms)
+
+    // Disconnect mid-window (500ms < sustainedDataResetMs=1000ms)
+    vi.advanceTimersByTime(500);
+    await mgr.disconnect();
+
+    expect(mgr.getStatus().state).toBe('disconnected');
+
+    // Advance past the sustained-data window — timer must be cleared, so no state transition
+    vi.advanceTimersByTime(1_000); // at 1500ms total from open; would fire at 1000ms if not cleared
+
+    // State stays 'disconnected': no spurious reconnect or state flip from stale timer callback
+    expect(mgr.getStatus().state).toBe('disconnected');
+    // No states after 'disconnected' that are NOT 'disconnected'
+    const lastDisconnectedIdx = states.lastIndexOf('disconnected');
+    const statesAfter = states.slice(lastDisconnectedIdx + 1);
+    expect(statesAfter).toHaveLength(0);
   });
 });

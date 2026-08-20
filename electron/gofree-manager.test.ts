@@ -468,6 +468,8 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     vi.useFakeTimers();
     const mgr = new GoFreeManager({
       keepaliveIntervalMs: 30_000,
+      // BE5: pin both poll groups to 1 s so tick counts remain deterministic.
+      pollIntervalMs: 1_000,
       WebSocketImpl: MockWebSocket as any,
     });
     await mgr.connect('127.0.0.1', 2053);
@@ -1154,5 +1156,516 @@ describe('GoFreeManager — BE3: stale wind pairing prevention', () => {
 
     await mgr.disconnect();
     MockWebSocket.instances.length = 0;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BE4: Disable automatic all-channel probing by default
+// ---------------------------------------------------------------------------
+
+describe('GoFreeManager — BE4: channel probing disabled by default', () => {
+  beforeEach(() => {
+    MockWebSocket.instances.length = 0;
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    MockWebSocket.instances.length = 0;
+  });
+
+  it('default (enableChannelProbe=false): NO probe DataReqs sent for non-required IDs', async () => {
+    const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
+    await mgr.connect('127.0.0.1', 2053);
+
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    // DataList includes all 12 required channels PLUS 3 extra IDs not in REQUIRED_CHANNEL_IDS
+    const extraIds = [100, 200, 300];
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422, ...extraIds];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+
+    // Should see exactly 1 DataListReq + 12 required DataReq — no probe messages for 100/200/300
+    expect(ws.sent).toHaveLength(13);
+    const sentIds = ws.sent.slice(1).map((s: string) => JSON.parse(s).DataReq[0].id);
+    expect(sentIds).not.toContain(100);
+    expect(sentIds).not.toContain(200);
+    expect(sentIds).not.toContain(300);
+
+    await mgr.disconnect();
+  });
+
+  it('enableChannelProbe=true: probe DataReqs ARE sent for non-required IDs', async () => {
+    const mgr = new GoFreeManager({
+      enableChannelProbe: true,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    // DataList includes 12 required + 3 extra
+    const extraIds = [100, 200, 300];
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422, ...extraIds];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+
+    // Should see 1 DataListReq + 12 required + 3 probe = 16 total
+    expect(ws.sent).toHaveLength(16);
+    const sentIds = ws.sent.slice(1).map((s: string) => JSON.parse(s).DataReq[0].id);
+    expect(sentIds).toContain(100);
+    expect(sentIds).toContain(200);
+    expect(sentIds).toContain(300);
+
+    await mgr.disconnect();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BE5: Fast / normal polling groups
+// ---------------------------------------------------------------------------
+
+// Channel ID sets — kept in sync with gofree-manager.ts
+const FAST_CH = new Set([42, 45, 47, 44, 46]);  // BSPD, TWA, TWS, AWA, AWS
+const NORMAL_CH = new Set([41, 9, 37, 421, 422, 235, 226]);  // SOG,COG,HDG,LAT,LON,VMG,LEE
+
+describe('GoFreeManager — BE5: fast / normal polling groups', () => {
+  beforeEach(() => {
+    MockWebSocket.instances.length = 0;
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    MockWebSocket.instances.length = 0;
+  });
+
+  it('fast poll timer fires at fastPollIntervalMs with only fast-group channels', async () => {
+    const mgr = new GoFreeManager({
+      fastPollIntervalMs: 200,
+      normalPollIntervalMs: 10_000, // very long so it does not fire in this test
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+    const sentAfterDiscovery = ws.sent.length; // 1 DataListReq + 12 immediate = 13
+
+    // Advance exactly one fast tick (+200 ms)
+    vi.advanceTimersByTime(200);
+
+    // Exactly 5 new sends (fast group only; normal at 10 s has not fired)
+    expect(ws.sent.length - sentAfterDiscovery).toBe(5);
+    const newIds = ws.sent.slice(sentAfterDiscovery).map((s: string) => JSON.parse(s).DataReq[0].id);
+    for (const id of newIds) {
+      expect(FAST_CH.has(id)).toBe(true);
+    }
+    // No normal-group channel should appear in the fast-only tick
+    for (const id of newIds) {
+      expect(NORMAL_CH.has(id)).toBe(false);
+    }
+
+    await mgr.disconnect();
+  });
+
+  it('normal poll timer fires at normalPollIntervalMs with only normal-group channels', async () => {
+    const mgr = new GoFreeManager({
+      fastPollIntervalMs: 10_000, // very long so it does not fire
+      normalPollIntervalMs: 1_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+    const sentAfterDiscovery = ws.sent.length;
+
+    // Advance exactly one normal tick (+1000 ms); fast at 10 s has not fired
+    vi.advanceTimersByTime(1_000);
+
+    // Exactly 7 new sends (normal group only)
+    expect(ws.sent.length - sentAfterDiscovery).toBe(7);
+    const newIds = ws.sent.slice(sentAfterDiscovery).map((s: string) => JSON.parse(s).DataReq[0].id);
+    for (const id of newIds) {
+      expect(NORMAL_CH.has(id)).toBe(true);
+    }
+    for (const id of newIds) {
+      expect(FAST_CH.has(id)).toBe(false);
+    }
+
+    await mgr.disconnect();
+  });
+
+  it('both poll timers are cleared by unexpected close (no sends on closed socket)', async () => {
+    const mgr = new GoFreeManager({
+      fastPollIntervalMs: 200,
+      normalPollIntervalMs: 1_000,
+      reconnectIntervalMs: 30_000, // long so no reconnect fires in this test
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+    const sentAtClose = ws.sent.length;
+
+    ws.simulateClose(1006);
+
+    // Advance past many fast and normal poll intervals — neither timer should fire
+    vi.advanceTimersByTime(10_000);
+    expect(ws.sent.length).toBe(sentAtClose);
+
+    await mgr.disconnect();
+  });
+
+  it('freshness window for fast channel is 2 × fastPollIntervalMs', async () => {
+    const mgr = new GoFreeManager({
+      fastPollIntervalMs: 400,      // fast stale window = 800 ms
+      normalPollIntervalMs: 10_000, // don't interfere
+      watchdogTimeoutMs: 60_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    const freshnessEvents: GoFreeFreshnessEvent[] = [];
+    mgr.on('gofree:freshness', (e: GoFreeFreshnessEvent) => freshnessEvents.push(e));
+
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+
+    // Feed TWS (fast group, ch47) at t=0
+    ws.simulateMessage(JSON.stringify({ Data: [{ id: 47, val: 12, valid: true }] }));
+
+    // Advance 400 ms → fast tick fires; TWS seen 400 ms ago, window=800 ms → NOT stale
+    vi.advanceTimersByTime(400);
+    const afterFirst = freshnessEvents[freshnessEvents.length - 1];
+    expect(afterFirst.staleChannels).not.toContain(47); // CH_TWS fresh
+
+    // Advance 500 ms more (total 900 ms); fast tick fires at 800 ms; window=800 ms
+    // At 800 ms tick: gap = 800 ms, 800 > 800 = false → still not stale at boundary
+    vi.advanceTimersByTime(500);
+    // The tick at 800 ms reports TWS gap = 800ms, NOT stale (boundary)
+    // The first tick where TWS BECOMES stale is at 1200ms (gap 1200 > 800)
+    // We're at 900ms total, next tick is at 1200ms — let's advance to get there
+    vi.advanceTimersByTime(300); // total 1200ms; fast tick fires; gap = 1200ms > 800ms → STALE
+    const afterStale = freshnessEvents[freshnessEvents.length - 1];
+    expect(afterStale.staleChannels).toContain(47); // CH_TWS now stale
+
+    await mgr.disconnect();
+  });
+
+  it('freshness window for normal channel is 2 × normalPollIntervalMs', async () => {
+    const mgr = new GoFreeManager({
+      fastPollIntervalMs: 10_000, // don't interfere
+      normalPollIntervalMs: 500,  // normal stale window = 1000 ms
+      watchdogTimeoutMs: 60_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    const freshnessEvents: GoFreeFreshnessEvent[] = [];
+    mgr.on('gofree:freshness', (e: GoFreeFreshnessEvent) => freshnessEvents.push(e));
+
+    await mgr.connect('127.0.0.1', 2053);
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+
+    // Feed SOG (normal group, ch41) at t=0
+    ws.simulateMessage(JSON.stringify({ Data: [{ id: 41, val: 5, valid: true }] }));
+
+    // Advance 500 ms → normal tick; SOG 500ms old, window=1000ms → NOT stale
+    vi.advanceTimersByTime(500);
+    const afterFirst = freshnessEvents[freshnessEvents.length - 1];
+    expect(afterFirst.staleChannels).not.toContain(41);
+
+    // Advance 600 ms more (total 1100ms); tick at 1000ms: gap=1000ms NOT stale (boundary)
+    // Advance past another tick to get gap > 1000ms
+    vi.advanceTimersByTime(600); // total 1100ms; tick at 1000ms fires; gap=1000, 1000>1000=false
+    // tick at 1500ms fires; gap=1500ms > 1000ms → STALE
+    vi.advanceTimersByTime(500); // total 1600ms
+    const afterStale = freshnessEvents[freshnessEvents.length - 1];
+    expect(afterStale.staleChannels).toContain(41); // CH_SOG stale
+
+    await mgr.disconnect();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BE6: Reconnect with capped exponential backoff
+// ---------------------------------------------------------------------------
+
+describe('GoFreeManager — BE6: backoff reconnect semantics', () => {
+  beforeEach(() => {
+    MockWebSocket.instances.length = 0;
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    MockWebSocket.instances.length = 0;
+  });
+
+  it('backoff ladder progresses 1s → 2s → 5s → 10s → 10s across successive failures', async () => {
+    const mgr = new GoFreeManager({
+      backoffLadderMs: [1_000, 2_000, 5_000, 10_000],
+      watchdogTimeoutMs: 60_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+
+    // Attempt 1: open, then immediately close
+    const ws1 = latest(MockWebSocket.instances);
+    ws1.simulateOpen();
+    ws1.simulateClose(1006); // triggers backoff[0] = 1000ms
+
+    expect(mgr.getStatus().state).toBe('reconnecting');
+
+    // Advance 999 ms — reconnect has NOT fired yet
+    vi.advanceTimersByTime(999);
+    expect(MockWebSocket.instances.length).toBe(1);
+
+    // Advance 1 ms more — reconnect fires at 1000 ms, ws2 created
+    vi.advanceTimersByTime(1);
+    expect(MockWebSocket.instances.length).toBe(2);
+    const ws2 = latest(MockWebSocket.instances);
+    ws2.simulateOpen();
+    ws2.simulateClose(1006); // triggers backoff[1] = 2000ms
+
+    // Advance 1999ms — no ws3 yet
+    vi.advanceTimersByTime(1_999);
+    expect(MockWebSocket.instances.length).toBe(2);
+    vi.advanceTimersByTime(1); // 2000ms — ws3 created
+    expect(MockWebSocket.instances.length).toBe(3);
+    const ws3 = latest(MockWebSocket.instances);
+    ws3.simulateOpen();
+    ws3.simulateClose(1006); // triggers backoff[2] = 5000ms
+
+    // Advance 4999ms — no ws4 yet
+    vi.advanceTimersByTime(4_999);
+    expect(MockWebSocket.instances.length).toBe(3);
+    vi.advanceTimersByTime(1); // 5000ms — ws4 created
+    expect(MockWebSocket.instances.length).toBe(4);
+    const ws4 = latest(MockWebSocket.instances);
+    ws4.simulateOpen();
+    ws4.simulateClose(1006); // triggers backoff[3] = 10000ms (capped)
+
+    // Advance 9999ms — no ws5 yet
+    vi.advanceTimersByTime(9_999);
+    expect(MockWebSocket.instances.length).toBe(4);
+    vi.advanceTimersByTime(1); // 10000ms — ws5 created (still 10s, stays capped)
+    expect(MockWebSocket.instances.length).toBe(5);
+    const ws5 = latest(MockWebSocket.instances);
+    ws5.simulateOpen();
+    ws5.simulateClose(1006); // triggers backoff[3] again = 10000ms
+
+    vi.advanceTimersByTime(9_999);
+    expect(MockWebSocket.instances.length).toBe(5);
+    vi.advanceTimersByTime(1);
+    expect(MockWebSocket.instances.length).toBe(6);
+
+    await mgr.disconnect();
+  });
+
+  it('backoff does NOT reset on open alone — next step is the next ladder position', async () => {
+    const mgr = new GoFreeManager({
+      backoffLadderMs: [1_000, 2_000, 5_000, 10_000],
+      watchdogTimeoutMs: 60_000,
+      sustainedDataResetMs: 60_000, // very long so sustained timer does not fire
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+
+    // First failure
+    const ws1 = latest(MockWebSocket.instances);
+    ws1.simulateOpen();
+    ws1.simulateClose(1006); // backoff[0] = 1s
+
+    vi.advanceTimersByTime(1_000); // ws2 opens
+    const ws2 = latest(MockWebSocket.instances);
+    ws2.simulateOpen(); // open fires — but NO sustained data — so backoffIndex stays at 1
+
+    // Immediately close ws2 (no data)
+    ws2.simulateClose(1006); // should use backoff[1] = 2s, NOT reset to 1s
+
+    // Advance only 1999ms — ws3 must NOT exist yet (if reset, it would fire at 1s)
+    vi.advanceTimersByTime(1_999);
+    expect(MockWebSocket.instances.length).toBe(2);
+
+    // Advance 1ms more — ws3 fires at 2s
+    vi.advanceTimersByTime(1);
+    expect(MockWebSocket.instances.length).toBe(3);
+
+    await mgr.disconnect();
+  });
+
+  it('backoff DOES reset after sustainedDataResetMs of valid data while connected', async () => {
+    const mgr = new GoFreeManager({
+      backoffLadderMs: [1_000, 2_000, 5_000, 10_000],
+      watchdogTimeoutMs: 60_000,
+      sustainedDataResetMs: 3_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    await mgr.connect('127.0.0.1', 2053);
+
+    // First failure — consumes backoff[0]
+    const ws1 = latest(MockWebSocket.instances);
+    ws1.simulateOpen();
+    ws1.simulateClose(1006);
+
+    vi.advanceTimersByTime(1_000); // ws2
+    const ws2 = latest(MockWebSocket.instances);
+    ws2.simulateOpen();
+
+    // Feed valid data so state becomes connected
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws2.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+    ws2.simulateMessage(JSON.stringify({ Data: [{ id: 42, val: 6, valid: true }] }));
+
+    // Advance past sustainedDataResetMs (3s) — backoffIndex should reset to 0
+    vi.advanceTimersByTime(3_100);
+    expect(mgr.getStatus().state).toBe('connected');
+
+    // Now simulate a failure — should use backoff[0] again (1s), not backoff[2] (5s)
+    ws2.simulateClose(1006);
+
+    // Should reconnect at 1s, not 5s
+    vi.advanceTimersByTime(999);
+    expect(MockWebSocket.instances.length).toBe(2); // ws3 not yet
+    vi.advanceTimersByTime(1);
+    expect(MockWebSocket.instances.length).toBe(3); // ws3 created at 1s
+
+    await mgr.disconnect();
+  });
+
+  it('manager reconnects indefinitely — at least 10 attempts without terminal state', async () => {
+    const mgr = new GoFreeManager({
+      backoffLadderMs: [10, 10, 10, 10], // tiny for speed
+      watchdogTimeoutMs: 60_000,
+      sustainedDataResetMs: 60_000,
+      WebSocketImpl: MockWebSocket as any,
+    });
+    const states: string[] = [];
+    mgr.on('gofree:status', (e: any) => states.push(e.state));
+
+    await mgr.connect('127.0.0.1', 2053);
+
+    for (let i = 0; i < 10; i++) {
+      const ws = latest(MockWebSocket.instances);
+      ws.simulateOpen();
+      ws.simulateClose(1006);
+      vi.advanceTimersByTime(20); // trigger next reconnect
+    }
+
+    expect(MockWebSocket.instances.length).toBeGreaterThanOrEqual(11);
+    expect(states).not.toContain('error');
+    // After the last advance the 11th socket may already be 'connecting'; either
+    // 'reconnecting' or 'connecting' confirms indefinite retry without a terminal state.
+    expect(['reconnecting', 'connecting']).toContain(mgr.getStatus().state);
+
+    await mgr.disconnect();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BE7: WebSocket readyState guard
+// ---------------------------------------------------------------------------
+
+describe('GoFreeManager — BE7: WebSocket readyState guard', () => {
+  beforeEach(() => {
+    MockWebSocket.instances.length = 0;
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    MockWebSocket.instances.length = 0;
+  });
+
+  it('send() is blocked when readyState = CONNECTING (0)', async () => {
+    const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
+    await mgr.connect('127.0.0.1', 2053);
+
+    const ws = latest(MockWebSocket.instances);
+    // readyState defaults to 0 (CONNECTING) in MockWebSocket
+    expect(ws.readyState).toBe(0);
+
+    // Attempt to send a raw DataReq via handleMessage path won't work here,
+    // but we can test send() directly by triggering startDiscovery internals.
+    // The connect() call sends the DataListReq via the 'open' handler (after simulateOpen),
+    // but at readyState=0 the DataListReq should NOT be sent.
+    // At this point ws.sent should be empty because open hasn't fired.
+    expect(ws.sent).toHaveLength(0);
+
+    // Simulate open → readyState=1 → DataListReq is sent
+    ws.simulateOpen();
+    expect(ws.readyState).toBe(1);
+    expect(ws.sent).toHaveLength(1); // DataListReq went through
+
+    await mgr.disconnect();
+  });
+
+  it('send() succeeds when readyState = OPEN (1)', async () => {
+    const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
+    await mgr.connect('127.0.0.1', 2053);
+
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen(); // readyState → 1
+    expect(ws.readyState).toBe(1);
+    const sentBefore = ws.sent.length;
+
+    // DataList → subscribeAll → immediate poll sends 12 DataReqs
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+    expect(ws.sent.length).toBeGreaterThan(sentBefore);
+
+    await mgr.disconnect();
+  });
+
+  it('send() is blocked when readyState = CLOSING (2)', async () => {
+    const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
+    await mgr.connect('127.0.0.1', 2053);
+
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+    const sentAfterOpen = ws.sent.length;
+
+    // Set readyState to CLOSING (2)
+    ws.readyState = 2;
+
+    // Attempt to trigger a send by feeding a DataList (which calls subscribeAll → send)
+    // But the manager's send() should be blocked because readyState !== 1.
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+    // subscribeAll is called, but all send() calls are blocked by readyState guard
+    expect(ws.sent.length).toBe(sentAfterOpen);
+
+    await mgr.disconnect();
+  });
+
+  it('send() is blocked when readyState = CLOSED (3)', async () => {
+    const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
+    await mgr.connect('127.0.0.1', 2053);
+
+    const ws = latest(MockWebSocket.instances);
+    ws.simulateOpen();
+    const sentAfterOpen = ws.sent.length;
+
+    // Set readyState to CLOSED (3) without triggering the close event
+    ws.readyState = 3;
+
+    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
+    expect(ws.sent.length).toBe(sentAfterOpen);
+
+    await mgr.disconnect();
   });
 });

@@ -10,17 +10,42 @@
  * Architecture:
  *   H5000 → WebSocket :2053 → GoFree Tier 2 JSON → GoFreeManager → ParsedPGN → common N2K pipeline
  *
- * Polling model:
- *   The H5000 on this boat does not stream with repeat:true. We poll each required
- *   channel individually with repeat:false at 1 Hz (default). Each single-channel
- *   DataReq returns the current value within ~5 ms.
+ * Polling model (BE5):
+ *   Two independent poll groups with separate timers:
+ *   - Fast group (CH_BSPD, CH_TWA, CH_TWS, CH_AWA, CH_AWS): default 200 ms / 5 Hz.
+ *   - Normal group (CH_SOG, CH_COG, CH_HDG, CH_VMG, CH_LEE, CH_LAT, CH_LON): default 1000 ms / 1 Hz.
+ *   Each channel is polled individually with repeat:false. Boat-confirmed: multi-channel
+ *   DataReq with repeat:false is silently dropped by the H5000 firmware.
  *
- * Freshness design (BE2):
+ * Freshness design (BE2 / BE5):
  *   We chose 'stale' state over forced reconnect when the watchdog fires. Rationale:
  *   a silent H5000 is a data-layer problem (instrument may be off, GPS lost, etc.),
  *   not a transport-layer problem. Tearing down a healthy TCP connection would add
  *   reconnect overhead and mask the real cause. If data resumes we flip back to
  *   'connected' without a reconnect cycle.
+ *   Per-channel stale windows are 2 × the channel's own group interval
+ *   (fast channels stale after ~400 ms, normal channels stale after ~2 000 ms).
+ *
+ * Reconnect model (BE6):
+ *   Indefinite reconnection with capped exponential backoff:
+ *     1 s → 2 s → 5 s → 10 s → 10 s → ...
+ *   Backoff resets only after `sustainedDataResetMs` (default 5 000 ms) of
+ *   continuous valid observations while state remains 'connected'. A bare WebSocket
+ *   'open' event does NOT reset the backoff index.
+ *
+ *   The `error` terminal state is reserved exclusively for a failed WebSocket
+ *   constructor (e.g. malformed URL). All transport-layer failures (unexpected close,
+ *   'error' event) are handled by indefinite backoff reconnection.
+ *
+ * Channel probing (BE4):
+ *   One-time diagnostic channel probing is disabled by default (`enableChannelProbe:
+ *   false`). Set `enableChannelProbe: true` to send a one-shot DataReq for every
+ *   channel in the DataList that is not already in REQUIRED_CHANNEL_IDS. Passive
+ *   logging of unknown channel IDs arriving in normal poll responses is always on.
+ *
+ * Send safety (BE7):
+ *   Every `send()` call checks `ws.readyState === WS_READY_STATE_OPEN` (1) before
+ *   transmitting. The try/catch below that is belt-and-braces.
  *
  * Emits:
  *   'pgn'              — ParsedPGN objects (same shape as SerialManager)
@@ -30,6 +55,11 @@
  * IMPORTANT: This manager NEVER sends the NGT-1 BST initialization command
  * `[0x11, 0x02, 0x00]`. That command is specific to the Actisense NGT-1 serial
  * device and remains entirely within serial-manager.ts.
+ *
+ * Deprecated options (kept for backward compatibility):
+ *   pollIntervalMs      — sets both fastPollIntervalMs and normalPollIntervalMs.
+ *   reconnectIntervalMs — derives a backoff ladder scaled from the supplied value.
+ *   maxReconnectAttempts — ignored; reconnection is now indefinite.
  */
 
 import { EventEmitter } from 'events';
@@ -42,11 +72,18 @@ const DEG_TO_RAD = Math.PI / 180;
 
 // Timer / reconnect defaults (PRD-specified).
 const DEFAULT_KEEPALIVE_INTERVAL_MS = 30_000;
-const DEFAULT_RECONNECT_INTERVAL_MS = 5_000;
-const DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
-// How fast to poll required channels with repeat:false.  The H5000 on Marcus's
-// boat responds within ~5 ms per DataReq but does not stream with repeat:true.
-const DEFAULT_POLL_INTERVAL_MS = 1_000;
+
+// BE5: Fast group default ~5 Hz; normal group default ~1 Hz.
+const DEFAULT_FAST_POLL_INTERVAL_MS = 200;
+const DEFAULT_NORMAL_POLL_INTERVAL_MS = 1_000;
+
+// BE6: Capped exponential backoff ladder (ms).  Last value repeats indefinitely.
+const DEFAULT_BACKOFF_LADDER_MS: readonly number[] = [1_000, 2_000, 5_000, 10_000];
+
+// BE6: Sustained-data window after which backoff index resets to 0.
+// Default matches DEFAULT_WATCHDOG_TIMEOUT_MS so one watchdog-window without a stale
+// transition counts as "reliably connected".
+const DEFAULT_SUSTAINED_DATA_RESET_MS = 5_000;
 
 // How long to wait for DataList response before subscribing directly.
 const DISCOVERY_TIMEOUT_MS = 3_000;
@@ -55,10 +92,12 @@ const DISCOVERY_TIMEOUT_MS = 3_000;
 const DEFAULT_WATCHDOG_TIMEOUT_MS = 5_000;
 
 // BE3: Maximum age of a cached wind companion value before it is too old to
-// pair with a fresh reading.  1 500 ms comfortably brackets the current 1 Hz
-// poll: at 1 Hz each value arrives ~1 000 ms apart, so a companion updated one
-// poll ago is ≤ 1 000 ms old and safely within the window.
+// pair with a fresh reading.  1 500 ms comfortably brackets the current poll
+// model: at 200 ms fast-poll each value arrives ≤ 200 ms apart.
 const MAX_WIND_PAIRING_AGE_MS = 1_500;
+
+// BE7: Numeric constant for WebSocket.OPEN so it is named rather than magic.
+const WS_READY_STATE_OPEN = 1;
 
 // N2K PGN numbers emitted downstream so consumers are source-agnostic.
 const PGN_WIND = 130306;      // Wind Data
@@ -101,12 +140,20 @@ const REQUIRED_CHANNEL_IDS = [
   CH_LEE,
 ];
 
+/**
+ * BE5: Fast-group channel IDs — polled at fastPollIntervalMs (default 200 ms).
+ * All other REQUIRED_CHANNEL_IDS belong to the normal group (default 1 000 ms).
+ */
+const FAST_CHANNEL_IDS: ReadonlySet<number> = new Set([
+  CH_BSPD, CH_TWA, CH_TWS, CH_AWA, CH_AWS,
+]);
+
 export type GoFreeState =
   | 'connecting'
   | 'connected'
   | 'stale'          // BE2: socket is open but no valid H5000 data for watchdogTimeoutMs
   | 'reconnecting'
-  | 'error'
+  | 'error'          // BE6: reserved for terminal constructor failures (malformed URL)
   | 'disconnected';
 
 export interface GoFreeStatusEvent {
@@ -122,8 +169,9 @@ export interface GoFreeStatusEvent {
  */
 export interface GoFreeFreshnessEvent {
   /**
-   * Channel IDs whose last valid observation is older than 2 × pollIntervalMs.
-   * The FE maps these channel IDs to the appropriate dashboard tiles.
+   * Channel IDs whose last valid observation is older than 2 × (their group's poll interval).
+   * Fast channels: stale after 2 × fastPollIntervalMs (~400 ms default).
+   * Normal channels: stale after 2 × normalPollIntervalMs (~2 000 ms default).
    */
   staleChannels: number[];
 }
@@ -131,11 +179,19 @@ export interface GoFreeFreshnessEvent {
 export interface GoFreeManagerOptions {
   /** Keepalive tick interval in ms (default 30000). */
   keepaliveIntervalMs?: number;
-  /** Poll interval for repeat:false DataReq requests in ms (default 1000). */
+  /**
+   * @deprecated Use fastPollIntervalMs and normalPollIntervalMs instead.
+   * When supplied, overrides both fast and normal poll intervals.
+   */
   pollIntervalMs?: number;
-  /** Reconnect delay in ms (default 5000). */
+  /**
+   * @deprecated Use backoffLadderMs instead.
+   * When supplied, a backoff ladder is derived from this value.
+   */
   reconnectIntervalMs?: number;
-  /** Max reconnect attempts before entering the `error` state (default 3). */
+  /**
+   * @deprecated Reconnection is now indefinite; this option is silently ignored.
+   */
   maxReconnectAttempts?: number;
   /**
    * BE2: Watchdog timeout in ms. If no valid H5000 observations arrive for this
@@ -143,6 +199,32 @@ export interface GoFreeManagerOptions {
    * Default 5000 ms. Set to 0 to disable.
    */
   watchdogTimeoutMs?: number;
+  /**
+   * BE4: Enable one-time diagnostic probe of all DataList channels not in
+   * REQUIRED_CHANNEL_IDS. Default false. Only enable during development/debugging.
+   */
+  enableChannelProbe?: boolean;
+  /**
+   * BE5: Poll interval for the fast group (BSPD, TWA, TWS, AWA, AWS) in ms.
+   * Default 200 ms (~5 Hz). Do not go below 100 ms on the H5000.
+   */
+  fastPollIntervalMs?: number;
+  /**
+   * BE5: Poll interval for the normal group (SOG, COG, HDG, VMG, LEE, LAT, LON) in ms.
+   * Default 1000 ms (~1 Hz).
+   */
+  normalPollIntervalMs?: number;
+  /**
+   * BE6: Backoff ladder in ms. The last value is used indefinitely.
+   * Default [1000, 2000, 5000, 10000].
+   */
+  backoffLadderMs?: number[];
+  /**
+   * BE6: How long (ms) the manager must be in 'connected' state with continuous
+   * valid observations before the backoff index resets to 0.
+   * Default matches watchdogTimeoutMs (5000 ms).
+   */
+  sustainedDataResetMs?: number;
   /**
    * Injectable WebSocket implementation — allows tests to substitute a mock
    * without touching the network. Defaults to the real `ws` client.
@@ -169,14 +251,20 @@ export class GoFreeManager extends EventEmitter {
   private state: GoFreeState = 'disconnected';
   private ws: any = null;
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  // BE5: separate fast and normal poll timers.
+  private fastPollTimer: ReturnType<typeof setInterval> | null = null;
+  private normalPollTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private discoveryTimer: ReturnType<typeof setTimeout> | null = null;
-  private watchdogTimer: ReturnType<typeof setTimeout> | null = null;  // BE2
-  private reconnectAttempts = 0;
+  private watchdogTimer: ReturnType<typeof setTimeout> | null = null;    // BE2
+  private sustainedDataTimer: ReturnType<typeof setTimeout> | null = null; // BE6
 
-  // Channels to poll on each tick (populated after DataList discovery).
-  private pollChannels: number[] = [];
+  // BE6: backoff index into backoffLadderMs; increments on each failure.
+  private backoffIndex = 0;
+
+  // BE5: channels split into fast and normal groups after DataList discovery.
+  private fastPollChannels: number[] = [];
+  private normalPollChannels: number[] = [];
 
   // BE3: Wind pairing accumulators with timestamps. Angles are stored
   // already normalized to 0–360°.  We only combine angle + speed into a
@@ -196,25 +284,50 @@ export class GoFreeManager extends EventEmitter {
   private targetPort = 2053;
 
   private readonly keepaliveIntervalMs: number;
-  private readonly pollIntervalMs: number;
-  private readonly reconnectIntervalMs: number;
-  private readonly maxReconnectAttempts: number;
+  private readonly fastPollIntervalMs: number;
+  private readonly normalPollIntervalMs: number;
+  // BE5: pre-computed stale windows per group (2 × poll interval).
+  private readonly fastStaleWindowMs: number;
+  private readonly normalStaleWindowMs: number;
+  private readonly backoffLadderMs: readonly number[];
+  private readonly sustainedDataResetMs: number;
   private readonly watchdogTimeoutMs: number;
+  private readonly enableChannelProbe: boolean;
   private readonly WebSocketImpl: any;
 
   constructor(options?: GoFreeManagerOptions) {
     super();
     this.keepaliveIntervalMs =
       options?.keepaliveIntervalMs ?? DEFAULT_KEEPALIVE_INTERVAL_MS;
-    this.pollIntervalMs =
-      options?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-    this.reconnectIntervalMs =
-      options?.reconnectIntervalMs ?? DEFAULT_RECONNECT_INTERVAL_MS;
-    this.maxReconnectAttempts =
-      options?.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS;
     this.watchdogTimeoutMs =
       options?.watchdogTimeoutMs ?? DEFAULT_WATCHDOG_TIMEOUT_MS;
     this.WebSocketImpl = options?.WebSocketImpl ?? WebSocket;
+
+    // BE4: diagnostic probe disabled by default.
+    this.enableChannelProbe = options?.enableChannelProbe ?? false;
+
+    // BE5: pollIntervalMs backward-compat — treats it as override for both groups.
+    const legacyPoll = options?.pollIntervalMs;
+    this.fastPollIntervalMs =
+      options?.fastPollIntervalMs ?? legacyPoll ?? DEFAULT_FAST_POLL_INTERVAL_MS;
+    this.normalPollIntervalMs =
+      options?.normalPollIntervalMs ?? legacyPoll ?? DEFAULT_NORMAL_POLL_INTERVAL_MS;
+    this.fastStaleWindowMs = 2 * this.fastPollIntervalMs;
+    this.normalStaleWindowMs = 2 * this.normalPollIntervalMs;
+
+    // BE6: backoffLadderMs — can be set directly, or derived from legacy reconnectIntervalMs.
+    const legacyReconnect = options?.reconnectIntervalMs;
+    if (options?.backoffLadderMs !== undefined) {
+      this.backoffLadderMs = options.backoffLadderMs;
+    } else if (legacyReconnect !== undefined) {
+      // Derive a proportional ladder so legacy test timing still works.
+      const v = legacyReconnect;
+      this.backoffLadderMs = [v, v * 2, Math.min(v * 5, 10_000), 10_000];
+    } else {
+      this.backoffLadderMs = DEFAULT_BACKOFF_LADDER_MS;
+    }
+    this.sustainedDataResetMs =
+      options?.sustainedDataResetMs ?? DEFAULT_SUSTAINED_DATA_RESET_MS;
   }
 
   // ---------------------------------------------------------------------------
@@ -233,7 +346,7 @@ export class GoFreeManager extends EventEmitter {
     await this.disconnect();
     if (host !== undefined) this.targetHost = host;
     if (port !== undefined) this.targetPort = port;
-    this.reconnectAttempts = 0;
+    this.backoffIndex = 0;
     this.openSocket();
   }
 
@@ -258,20 +371,23 @@ export class GoFreeManager extends EventEmitter {
     try {
       ws = new this.WebSocketImpl(url);
     } catch (err) {
-      this.handleConnectionFailure(
-        `WebSocket construction failed: ${(err as Error).message}`,
-      );
+      // BE6: WebSocket constructor failure is a terminal error (e.g. malformed URL).
+      // Do not schedule a reconnect for this class of failure.
+      const msg = `WebSocket construction failed: ${(err as Error).message}`;
+      console.error(`[GoFreeManager] ${msg}`);
+      this.setState('error', this.targetHost, this.targetPort, msg);
       return;
     }
     this.ws = ws;
 
     ws.on('open', () => {
-      this.reconnectAttempts = 0;
+      // BE6: do NOT reset backoffIndex here — reset only after sustained valid data.
       this.setState('connected', this.targetHost, this.targetPort);
       console.log(`[GoFreeManager] WebSocket connected to ${url}`);
       this.startDiscovery();
       this.startKeepalive();
-      this.startWatchdog();  // BE2: begin liveness monitoring
+      this.startWatchdog();          // BE2: begin liveness monitoring
+      this.startSustainedDataTimer(); // BE6: begin sustained-data window
     });
 
     ws.on('message', (data: any) => {
@@ -302,14 +418,9 @@ export class GoFreeManager extends EventEmitter {
 
   /**
    * Step 1: request the full channel list from the H5000.
-   * On success we subscribe to all available channels in batches (step 2).
+   * On success we subscribe to required channels (step 2).
    * Fallback: if no DataList arrives in time, subscribe directly to
    * REQUIRED_CHANNEL_IDS with inst=0.
-   *
-   * The C++ B-G-H5000-Logger subscribes to all ~350 available channels in
-   * batches of ~40 rather than a curated subset. We match that approach:
-   * subscribing to all available IDs ensures the H5000 starts streaming,
-   * and we filter the incoming data by channel ID on our side.
    */
   private startDiscovery(): void {
     this.discoveryComplete = false;
@@ -326,22 +437,17 @@ export class GoFreeManager extends EventEmitter {
   }
 
   /**
-   * Step 2: poll required channels at 1 Hz using repeat:false DataReq.
+   * Step 2: split channels into fast and normal groups and start two independent
+   * poll timers. Both use repeat:false DataReq — one message per channel.
    *
-   * The H5000 on this firmware does not stream data with repeat:true — it
-   * returns exactly one Data message for a one-shot (repeat:false) request
-   * and then goes silent.  We work around this by polling the 12 required
-   * navigation channels every pollIntervalMs (default 1 s).  Each poll
-   * returns the current value for every requested channel within ~5 ms.
+   * BE4: One-time diagnostic channel probe is only executed when
+   * enableChannelProbe === true. By default it is skipped.
    */
   private subscribeAll(availableIds: number[]): void {
     this.discoveryComplete = true;
     this.clearDiscoveryTimer();
 
     // Log which required channels are absent from the DataList (informational only).
-    // We still poll ALL required channels regardless — the H5000 sometimes omits
-    // navigation channels from the DataList even though it responds to DataReq for
-    // them (e.g. TWA/AWA=140/141, LAT/LON=421/422 are absent on this firmware).
     if (availableIds.length > 0) {
       const available = new Set(availableIds);
       const missing = REQUIRED_CHANNEL_IDS.filter((id) => !available.has(id));
@@ -353,17 +459,18 @@ export class GoFreeManager extends EventEmitter {
       }
     }
 
-    this.pollChannels = REQUIRED_CHANNEL_IDS;
+    // BE5: split REQUIRED_CHANNEL_IDS into fast and normal groups.
+    this.fastPollChannels = REQUIRED_CHANNEL_IDS.filter((id) => FAST_CHANNEL_IDS.has(id));
+    this.normalPollChannels = REQUIRED_CHANNEL_IDS.filter((id) => !FAST_CHANNEL_IDS.has(id));
+
     this.emit(
       'debug',
-      `[GoFree] Step 2: Polling ${this.pollChannels.length} channels every ${this.pollIntervalMs} ms (repeat:false)`,
+      `[GoFree] Step 2: Polling ${this.fastPollChannels.length} fast channels every ${this.fastPollIntervalMs} ms` +
+      ` + ${this.normalPollChannels.length} normal channels every ${this.normalPollIntervalMs} ms (repeat:false)`,
     );
 
-    // One-time diagnostic probe: send a single DataReq for every channel in the
-    // DataList that we don't already poll.  Responses appear in the debug window
-    // as [GoFree PROBE] lines so we can identify the correct channel IDs for any
-    // missing tiles (TWA, AWA, LAT, LON, etc.).
-    if (availableIds.length > 0) {
+    // BE4: One-time diagnostic probe — only when explicitly enabled.
+    if (this.enableChannelProbe && availableIds.length > 0) {
       const knownSet = new Set(REQUIRED_CHANNEL_IDS);
       const probeIds = availableIds.filter((id) => !knownSet.has(id));
       this.emit('debug', `[GoFree PROBE] Probing ${probeIds.length} additional channels once (inst=0)…`);
@@ -373,34 +480,55 @@ export class GoFreeManager extends EventEmitter {
     }
 
     // Poll immediately so the dashboard fills in without waiting for the first tick.
-    this.sendPoll();
-    this.startPollTimer();
+    this.sendFastPoll();
+    this.sendNormalPoll();
+    this.startFastPollTimer();
+    this.startNormalPollTimer();
   }
 
   /**
-   * Send one DataReq (repeat:false) per required channel.
+   * Send one DataReq (repeat:false) per fast-group channel.
    *
    * The H5000 only responds to single-channel DataReq — a multi-channel
-   * DataReq with repeat:false is silently dropped (confirmed by boat test:
-   * single-channel probe returned COG in ~5 ms, multi-channel poll returned
-   * nothing over 7+ minutes). Each channel gets its own message.
+   * DataReq with repeat:false is silently dropped (confirmed by boat test).
    */
-  private sendPoll(): void {
-    for (const id of this.pollChannels) {
+  private sendFastPoll(): void {
+    for (const id of this.fastPollChannels) {
       this.send({ DataReq: [{ id, repeat: false, inst: 0 }] });
     }
   }
 
-  private startPollTimer(): void {
-    this.clearPollTimer();
-    this.pollTimer = setInterval(() => {
-      this.sendPoll();
-      this.emitFreshness();  // BE2: report per-value staleness each poll tick
-    }, this.pollIntervalMs);
+  /** Send one DataReq (repeat:false) per normal-group channel. */
+  private sendNormalPoll(): void {
+    for (const id of this.normalPollChannels) {
+      this.send({ DataReq: [{ id, repeat: false, inst: 0 }] });
+    }
   }
 
+  private startFastPollTimer(): void {
+    this.clearFastPollTimer();
+    this.fastPollTimer = setInterval(() => {
+      this.sendFastPoll();
+      this.emitFreshness(); // BE2: freshness on every fast tick for timely stale detection
+    }, this.fastPollIntervalMs);
+  }
+
+  private startNormalPollTimer(): void {
+    this.clearNormalPollTimer();
+    this.normalPollTimer = setInterval(() => {
+      this.sendNormalPoll();
+      this.emitFreshness(); // BE2: also emit on normal tick
+    }, this.normalPollIntervalMs);
+  }
+
+  /**
+   * BE7: Transmit a JSON payload. Checks readyState before sending.
+   * WS_READY_STATE_OPEN (1) is the only state that accepts sends.
+   * The try/catch is belt-and-braces in case the socket closes between the
+   * readyState check and the actual send call.
+   */
   private send(obj: any): void {
-    if (!this.ws) return;
+    if (!this.ws || this.ws.readyState !== WS_READY_STATE_OPEN) return;
     try {
       this.ws.send(JSON.stringify(obj));
     } catch (err) {
@@ -606,7 +734,7 @@ export class GoFreeManager extends EventEmitter {
         break;
       }
       default:
-        // Unknown channel — log for diagnostic probe so we can identify missing IDs.
+        // Unknown channel — passive log for diagnostics (BE4: always on, no probing).
         this.emit(
           'debug',
           `[GoFree PROBE] ch${o.id}: val=${val.toFixed(4)} valStr="${o.valStr ?? ''}"`,
@@ -647,22 +775,43 @@ export class GoFreeManager extends EventEmitter {
 
   /**
    * BE2: Emit a freshness snapshot on every poll tick.
-   * Channels not seen within 2 × pollIntervalMs are flagged as stale.
+   * BE5: Each channel's stale window is 2 × its own group's poll interval.
    */
   private emitFreshness(): void {
     const now = Date.now();
-    const perValueTimeoutMs = 2 * this.pollIntervalMs;
     const staleChannels: number[] = [];
 
     for (const channelId of REQUIRED_CHANNEL_IDS) {
       const lastSeen = this.lastSeenAt.get(channelId);
-      if (lastSeen === undefined || (now - lastSeen) > perValueTimeoutMs) {
+      const staleWindowMs = FAST_CHANNEL_IDS.has(channelId)
+        ? this.fastStaleWindowMs
+        : this.normalStaleWindowMs;
+      if (lastSeen === undefined || (now - lastSeen) > staleWindowMs) {
         staleChannels.push(channelId);
       }
     }
 
     const event: GoFreeFreshnessEvent = { staleChannels };
     this.emit('gofree:freshness', event);
+  }
+
+  // ---------------------------------------------------------------------------
+  // BE6: Sustained-data timer — resets backoff after stable connection window
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Start the sustained-data timer. If it fires while still 'connected', the
+   * backoff index is reset to 0, treating this connection as reliably established.
+   * Cleared by resetForReconnect() if the connection drops before it fires.
+   */
+  private startSustainedDataTimer(): void {
+    this.clearSustainedDataTimer();
+    this.sustainedDataTimer = setTimeout(() => {
+      this.sustainedDataTimer = null;
+      if (this.state === 'connected') {
+        this.backoffIndex = 0;
+      }
+    }, this.sustainedDataResetMs);
   }
 
   // ---------------------------------------------------------------------------
@@ -677,31 +826,32 @@ export class GoFreeManager extends EventEmitter {
   }
 
   // ---------------------------------------------------------------------------
-  // Reconnect logic
+  // BE6: Reconnect logic with capped exponential backoff
   // ---------------------------------------------------------------------------
 
   /**
-   * BE1: Central failure handler.  Clears ALL timers and session state
+   * BE1 + BE6: Central failure handler. Clears ALL timers and session state
    * (via resetForReconnect) before scheduling a reconnect attempt so that
    * old timers can never fire against a newly opened socket.
+   *
+   * BE6: Uses the backoff ladder; increments backoffIndex on each failure.
+   * Reconnection is indefinite — no terminal state is set here.
    */
   private handleConnectionFailure(message: string): void {
     this.resetForReconnect();  // BE1: clear everything before reconnect
 
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error(`[GoFreeManager] Max reconnect attempts reached: ${message}`);
-      this.setState('error', this.targetHost, this.targetPort, message);
-      return;
-    }
-    this.reconnectAttempts++;
+    const delay =
+      this.backoffLadderMs[Math.min(this.backoffIndex, this.backoffLadderMs.length - 1)];
+    this.backoffIndex++;
+
     console.log(
-      `[GoFreeManager] Reconnecting (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${this.reconnectIntervalMs}ms`,
+      `[GoFreeManager] Reconnecting (attempt ${this.backoffIndex}, delay ${delay}ms): ${message}`,
     );
     this.setState('reconnecting', this.targetHost, this.targetPort);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.openSocket();
-    }, this.reconnectIntervalMs);
+    }, delay);
   }
 
   // ---------------------------------------------------------------------------
@@ -744,19 +894,24 @@ export class GoFreeManager extends EventEmitter {
    *   - handleConnectionFailure — unexpected close / reconnect path
    *
    * Does NOT clear reconnectTimer (handled separately by disconnect/connect).
+   * Does NOT clear backoffIndex — that is managed by handleConnectionFailure
+   * and the sustainedDataTimer callback.
    */
   private resetForReconnect(): void {
     this.clearKeepaliveTimer();
-    this.clearPollTimer();
+    this.clearFastPollTimer();
+    this.clearNormalPollTimer();
     this.clearDiscoveryTimer();
     this.clearWatchdogTimer();
+    this.clearSustainedDataTimer(); // BE6
     // BE3: clear wind pairing state
     this.lastTwa = null;
     this.lastTws = null;
     this.lastAwa = null;
     this.lastAws = null;
     // Session state
-    this.pollChannels = [];
+    this.fastPollChannels = [];
+    this.normalPollChannels = [];
     this.discoveryComplete = false;
     // BE2: freshness state
     this.lastValidObservationAt = null;
@@ -770,10 +925,17 @@ export class GoFreeManager extends EventEmitter {
     }
   }
 
-  private clearPollTimer(): void {
-    if (this.pollTimer !== null) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
+  private clearFastPollTimer(): void {
+    if (this.fastPollTimer !== null) {
+      clearInterval(this.fastPollTimer);
+      this.fastPollTimer = null;
+    }
+  }
+
+  private clearNormalPollTimer(): void {
+    if (this.normalPollTimer !== null) {
+      clearInterval(this.normalPollTimer);
+      this.normalPollTimer = null;
     }
   }
 
@@ -798,12 +960,19 @@ export class GoFreeManager extends EventEmitter {
     }
   }
 
+  private clearSustainedDataTimer(): void {
+    if (this.sustainedDataTimer !== null) {
+      clearTimeout(this.sustainedDataTimer);
+      this.sustainedDataTimer = null;
+    }
+  }
+
   private cleanupSocket(): void {
     if (this.ws !== null) {
       try {
         this.ws.removeAllListeners?.();
         const rs = this.ws.readyState;
-        if (rs === 0 /* CONNECTING */ || rs === 1 /* OPEN */) {
+        if (rs === 0 /* CONNECTING */ || rs === WS_READY_STATE_OPEN /* OPEN */) {
           this.ws.close?.();
         } else {
           this.ws.terminate?.();

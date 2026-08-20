@@ -71,6 +71,7 @@ const api = {
       'analysis:segments',
       'races:files',
       'gofree:status',
+      'gofree:freshness',
     ];
     if (validChannels.includes(channel)) {
       const listener = (_event: any, ...args: any[]) => callback(...args);

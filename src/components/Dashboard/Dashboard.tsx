@@ -1,6 +1,7 @@
 import React, { useEffect } from 'react';
 import { useN2KStore } from '../../store/useN2KStore';
 import { usePolarStore } from '../../store/usePolarStore';
+import { useFreshnessStore, METRIC_CHANNEL_MAP, CH_VMG } from '../../store/useFreshnessStore';
 import { getIPC } from '../../ipc';
 import ConnectionBar from './ConnectionBar';
 import InstrumentTile from './InstrumentTile';
@@ -8,7 +9,7 @@ import GPSTile from './GPSTile';
 import RecordingControls from '../Controls/RecordingControls';
 import { formatWindAngle } from '../../utils/angles';
 import { EMPTY_POLAR_PERFORMANCE, requestLivePolarPerformance } from '../../utils/livePolarPerformance';
-import type { AppSettings } from '../../types/ipc';
+import type { AppSettings, GoFreeFreshnessEvent } from '../../types/ipc';
 import type { BoatProfile } from '../../types/polar';
 
 // Unit conversion constants
@@ -29,6 +30,7 @@ function computeTrueWind(awsKts: number, awaDeg: number, stwKts: number): { tws:
 export default function Dashboard() {
   const setMetric = useN2KStore((s) => s.setMetric);
   const updateLastUpdated = useN2KStore((s) => s.updateLastUpdated);
+  const setStaleChannels = useFreshnessStore((s) => s.setStaleChannels);
   const setPerformance = usePolarStore((s) => s.setPerformance);
   const activeProfileId = usePolarStore((s) => s.activeProfileId);
   const setProfiles = usePolarStore((s) => s.setProfiles);
@@ -220,11 +222,18 @@ export default function Dashboard() {
       setPerformance(perf);
     });
 
+    // Subscribe to GoFree per-channel freshness events (PRD §4.2 / BE2 / BE5).
+    // Stale channel IDs are forwarded from GoFreeManager via the IPC bridge.
+    const unsubFreshness = ipc.on('gofree:freshness', (event: GoFreeFreshnessEvent) => {
+      setStaleChannels(event.staleChannels);
+    });
+
     return () => {
       unsubPgn();
       unsubPerf();
+      unsubFreshness();
     };
-  }, [setMetric, updateLastUpdated, setPerformance]);
+  }, [setMetric, updateLastUpdated, setPerformance, setStaleChannels]);
 
   return (
     <div className="flex flex-col gap-4 h-full">
@@ -232,18 +241,18 @@ export default function Dashboard() {
 
       {/* Primary instruments */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
-        <InstrumentTile label="STW" metricKey="stw" unit="kts" large />
-        <InstrumentTile label="SOG" metricKey="sog" unit="kts" large />
-        <InstrumentTile label="TWS" metricKey="tws" unit="kts" large />
-        <InstrumentTile label="TWA" metricKey="twa" unit="°" format={(v) => formatWindAngle(v)} large />
-        <InstrumentTile label="Heading" metricKey="heading" unit="°M" format={(v) => `${Math.round(v)}°M`} large />
+        <InstrumentTile label="STW" metricKey="stw" unit="kts" large channelId={METRIC_CHANNEL_MAP.stw} />
+        <InstrumentTile label="SOG" metricKey="sog" unit="kts" large channelId={METRIC_CHANNEL_MAP.sog} />
+        <InstrumentTile label="TWS" metricKey="tws" unit="kts" large channelId={METRIC_CHANNEL_MAP.tws} />
+        <InstrumentTile label="TWA" metricKey="twa" unit="°" format={(v) => formatWindAngle(v)} large channelId={METRIC_CHANNEL_MAP.twa} />
+        <InstrumentTile label="Heading" metricKey="heading" unit="°M" format={(v) => `${Math.round(v)}°M`} large channelId={METRIC_CHANNEL_MAP.heading} />
       </div>
 
       {/* Secondary instruments */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <InstrumentTile label="AWS" metricKey="aws" unit="kts" />
-        <InstrumentTile label="AWA" metricKey="awa" unit="°" format={(v) => formatWindAngle(v)} />
-        <InstrumentTile label="COG" metricKey="cog" unit="°M" format={(v) => `${Math.round(v)}°M`} />
+        <InstrumentTile label="AWS" metricKey="aws" unit="kts" channelId={METRIC_CHANNEL_MAP.aws} />
+        <InstrumentTile label="AWA" metricKey="awa" unit="°" format={(v) => formatWindAngle(v)} channelId={METRIC_CHANNEL_MAP.awa} />
+        <InstrumentTile label="COG" metricKey="cog" unit="°M" format={(v) => `${Math.round(v)}°M`} channelId={METRIC_CHANNEL_MAP.cog} />
         <InstrumentTile label="TWD" metricKey="twd" unit="°M" format={(v) => `${Math.round(v)}°M`} />
         <VmgTile />
         <PolarTile />
@@ -264,6 +273,14 @@ function VmgTile() {
   const stw = useN2KStore((s) => s.stw);
   const twa = useN2KStore((s) => s.twa);
   const isStale = useN2KStore((s) => s.isStale('stw') || s.isStale('twa'));
+  const staleChannels = useFreshnessStore((s) => s.staleChannels);
+  // VMG is derived from STW + TWA; treat it as GoFree-stale if either input is stale.
+  // CH_VMG (235) is also tracked separately; stale if 235, stw-channel, or twa-channel stale.
+  const isGoFreeChannelStale =
+    staleChannels.has(CH_VMG) ||
+    staleChannels.has(METRIC_CHANNEL_MAP.stw) ||
+    staleChannels.has(METRIC_CHANNEL_MAP.twa);
+
   const vmg = stw != null && twa != null
     ? stw * Math.cos(twa * Math.PI / 180)
     : null;
@@ -275,8 +292,8 @@ function VmgTile() {
       }`}
     >
       <span className="text-xs text-gray-500 uppercase tracking-wider mb-1">VMG</span>
-      <span className="text-2xl font-mono font-bold text-white">
-        {vmg !== null ? vmg.toFixed(2) : '—'}
+      <span className="text-2xl font-mono font-bold text-white" data-testid="tile-value-vmg">
+        {isGoFreeChannelStale ? '--' : vmg !== null ? vmg.toFixed(2) : '—'}
       </span>
       <span className="text-xs text-gray-600 mt-1">kts</span>
     </div>

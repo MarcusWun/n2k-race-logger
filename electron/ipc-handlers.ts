@@ -1,6 +1,6 @@
 import { ipcMain, dialog } from 'electron';
 import { SerialManager, ParsedPGN } from './serial-manager';
-import { GoFreeManager, GoFreeStatusEvent } from './gofree-manager';
+import { GoFreeManager, GoFreeStatusEvent, GoFreeFreshnessEvent } from './gofree-manager';
 import { N2KParser, PGNMessage } from './n2k-parser';
 import { PolarEngine } from './polar-engine';
 import { RaceDatabase, createRaceDatabase } from './database';
@@ -207,6 +207,11 @@ export function registerIPCHandlers(): void {
   goFreeManager.on('gofree:status', (status: GoFreeStatusEvent) => {
     sendDebugData(`[GoFree] Status → renderer: ${status.state}${status.error ? ` — ${status.error}` : ''}`);
     getWebContents()?.send('gofree:status', status);
+  });
+
+  // Forward GoFree per-value freshness events to renderer (BE2/BE5)
+  goFreeManager.on('gofree:freshness', (event: GoFreeFreshnessEvent) => {
+    getWebContents()?.send('gofree:freshness', event);
   });
 
   // Batch write from parser

@@ -17,6 +17,8 @@ export function getGofreeStatusLabel(status: GofreeStatusPayload | null): string
       const port = status.port ?? DEFAULT_GOFREE_PORT;
       return `GoFree — Connected (${ip}:${port})`;
     }
+    case 'stale':
+      return 'GoFree — Stale (no data)';
     case 'reconnecting':
       return 'GoFree — Reconnecting...';
     case 'error':
@@ -32,6 +34,9 @@ export function getGofreeStatusColor(state: GofreeState | undefined): string {
   switch (state) {
     case 'connected':
       return 'bg-n2k-success';
+    case 'stale':
+      // Amber/warning — connected at transport level but instrument data has gone silent.
+      return 'bg-n2k-warning';
     case 'connecting':
     case 'searching':
     case 'reconnecting':

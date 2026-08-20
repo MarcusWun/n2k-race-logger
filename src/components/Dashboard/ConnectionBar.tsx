@@ -68,8 +68,9 @@ export default function ConnectionBar() {
   const handleConnect = async () => {
     const ipc = getIPC();
     if (!ipc) return;
+    // 'stale' keeps the WebSocket open — the socket is still live at transport level.
     const connectedNow = isGoFree
-      ? gofreeStatus?.state === 'connected'
+      ? (gofreeStatus?.state === 'connected' || gofreeStatus?.state === 'stale')
       : status.status === 'connected';
     if (connectedNow) {
       await ipc.disconnect();
@@ -99,8 +100,9 @@ export default function ConnectionBar() {
   // FE3: Status chip adapts to active data source
   const isGoFree = dataSource === 'gofree';
 
+  // 'stale' is transport-connected (socket open) — disable config controls and show Disconnect.
   const isConnected = isGoFree
-    ? gofreeStatus?.state === 'connected'
+    ? (gofreeStatus?.state === 'connected' || gofreeStatus?.state === 'stale')
     : status.status === 'connected';
 
   const ngt1StatusColor = {

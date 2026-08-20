@@ -1,5 +1,6 @@
 import React from 'react';
 import { useN2KStore } from '../../store/useN2KStore';
+import { useFreshnessStore } from '../../store/useFreshnessStore';
 
 interface InstrumentTileProps {
   label: string;
@@ -8,6 +9,12 @@ interface InstrumentTileProps {
   format?: (value: number) => string;
   large?: boolean;
   colorCode?: boolean; // for % polar
+  /**
+   * Optional GoFree channel ID. When provided and the channel is in the
+   * current staleChannels set, the tile renders '--' instead of the last
+   * known value (PRD §4.2). The stored value is NOT deleted.
+   */
+  channelId?: number;
 }
 
 export default function InstrumentTile({
@@ -17,16 +24,23 @@ export default function InstrumentTile({
   format,
   large,
   colorCode,
+  channelId,
 }: InstrumentTileProps) {
   const value = useN2KStore((s) => (s as any)[metricKey] as number | null);
   const isStale = useN2KStore((s) => s.isStale(metricKey));
+  const staleChannels = useFreshnessStore((s) => s.staleChannels);
+  const isGoFreeChannelStale = channelId != null ? staleChannels.has(channelId) : false;
 
-  const displayValue = value !== null
-    ? (format ? format(value) : value.toFixed(1))
-    : '—';
+  // GoFree channel freshness takes priority: show '--' when the backend
+  // reports this channel as stale (last obs older than 2× poll interval).
+  const displayValue = isGoFreeChannelStale
+    ? '--'
+    : value !== null
+      ? (format ? format(value) : value.toFixed(1))
+      : '—';
 
   let colorClass = 'text-white';
-  if (colorCode && value !== null) {
+  if (colorCode && value !== null && !isGoFreeChannelStale) {
     if (value >= 100) colorClass = 'text-n2k-success';
     else if (value >= 90) colorClass = 'text-n2k-warning';
     else colorClass = 'text-n2k-danger';
@@ -43,6 +57,7 @@ export default function InstrumentTile({
       </span>
       <span
         className={`${large ? 'text-4xl' : 'text-2xl'} font-mono font-bold ${colorClass}`}
+        data-testid={`tile-value-${metricKey}`}
       >
         {displayValue}
       </span>

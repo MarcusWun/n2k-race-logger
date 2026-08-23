@@ -16,7 +16,10 @@ A Windows desktop application that logs racing sailboat performance data from NM
 - **Phase 2.1 (shipped 2026-07-17, build #36):** Day/night theme toggle; TWA display normalization (0–180° with port/starboard indicator).
 - **Phase 2.2 (shipped 2026-07-23, build #38):** Settings persistence fix (field migration on load); connection state persisted across tab navigation; TCP host trailing-dot sanitization.
 - **Phase 2.3 (approved 2026-07-25):** Reliability fixes — normalize AWA everywhere, make settings persistence fail-safe for data directory / active polar profile / sail inventory, and diagnose/fix TCP connection failure including malformed/truncated host handling for reported `192.168.1:2000`.
-- **Phase 2.4 (approved 2026-07-29):** Formatted Excel race-analysis export for performance summary and segment tables, while preserving existing CSV export.
+- **Phase 2.4 (shipped 2026-07-30):** Formatted Excel race-analysis export for performance summary and segment tables, while preserving existing CSV export.
+- **Phase 2.5 (shipped 2026-08-03):** Expedition polar format parser; import dialog and active-profile persistence bugfixes; `interpolateSpeed()` returns null below the polar's VMG angle (no sub-VMG extrapolation).
+- **Phase 2.7 (shipped 2026-08-20):** GoFree Ethernet data source — B&G H5000 WebSocket (GoFree Tier 2 JSON, port 2053) as an alternative acquisition path to the NGT-1. Includes stale-data watchdog, per-tile freshness display (`--` on stale channels), wind-value timestamp pairing, fast/normal polling groups (200 ms / 1 s), capped exponential reconnect backoff, and VMG tile added to the live dashboard and segment analysis.
+- **Phase 2.8 (shipped 2026-08-22):** Reliability, Correctness & Traceability — NGT-1 reconnect hardening (serial error/close + 5 s data watchdog + capped backoff), `TimedValue` freshness limits in the analysis engine, circular TWA statistics, atomic SQLite transactions for segment and sail-tag saves, segment merge guard (no unsteady-gap contamination), segment splitting at sail-change boundaries, interrupted-recording recovery, dead `pgnFilter` abstraction removed (→ `normalizeParsedPgn()`), `race_metadata` and `data_quality` tables, build-info git SHA baked at prebuild, NGT-1 stale chip, InterruptedBanner, DataQualityPanel, and ProvenanceBlock.
 
 **Target user:** Marcus — competitive harbor/offshore racer with an NMEA 2000 instrument network on board.
 
@@ -88,11 +91,26 @@ Dual-mode connection to NMEA 2000 gateways: serial (Actisense NGT-1) or TCP (net
 - Reconnect on disconnect with configurable retry (default: 5 seconds, max 3 attempts)
 - Remember last-used IP/port
 
+**GoFree mode (Phase 2.7):**
+- Connects to a B&G H5000 instrument CPU via GoFree Tier 2 WebSocket (JSON DataReq/DataRsp messages, not NMEA 0183)
+- Default target: `192.168.1.233:2053` (H5000 CPU address and port on Marcus's boat; configurable in settings)
+- Multicast discovery (UDP `239.2.1.1:2052`) attempts first; falls back to the configured manual IP/port after 5 s
+- New manager: `electron/gofree-manager.ts` — emits `ParsedPGN` events into the same downstream pipeline as the NGT-1 (recording, analysis, dashboard all unchanged)
+- Only one source (NGT-1 or GoFree) is active at a time; toggle via `dataSource` setting
+- GoFree-specific states: `connecting` | `connected` | `stale` | `reconnecting` | `error` | `disconnected`
+- `stale` state: WebSocket is open but no valid observation has arrived within 5 s (watchdog); tiles display `--`; connection is NOT torn down on staleness — it is a data-layer signal, not a transport failure
+- Per-tile freshness: `gofree:freshness` events identify stale channels; tiles show `--` for stale channel IDs
+- Wind pairing: TWA/TWS and AWA/AWS are only combined when both are fresh (maximum pairing age 1.5 s)
+- Polling groups: core sailing channels (BSP, TWA, TWS, AWA, AWS) at 200 ms; secondary channels (SOG, COG, HDG, VMG, leeway, position) at 1 000 ms
+- Capped exponential reconnect backoff: `1 s → 2 s → 5 s → 10 s → 10 s…`; backoff resets only after 5 s of continuous valid data, not just on WebSocket `open`
+- NGT-1 serial path is completely untouched when GoFree is active
+
 **Connection UI:**
-- Mode selector: Serial / TCP toggle
+- Mode selector: Serial / TCP / GoFree toggle (Phase 2.7 adds GoFree)
 - Serial mode: dropdown of detected COM ports with refresh button, baud rate selector (default 115,200)
 - TCP mode: IP address input, port input
-- Connect / Disconnect button with status indicator (disconnected / connecting / connected / error)
+- GoFree mode: IP address input (default 192.168.1.233), port input (default 2053)
+- Connect / Disconnect button with status indicator (disconnected / connecting / connected / stale / error)
 - Connection status persists visually in the header area at all times
 
 ### 4.1.1 Debug Window
@@ -229,7 +247,10 @@ Persistent settings stored in a local `settings.json` file:
 | Active polar profile | (none) | Currently selected boat polar for % of polar calculation |
 | TCP IP | `192.168.1.1` | Network gateway IP address |
 | TCP port | `2000` | Network gateway TCP port |
-| Connection mode | `serial` | Last-used mode: `serial` or `tcp` |
+| Connection mode | `serial` | Last-used mode: `serial`, `tcp`, or `gofree` |
+| Data source | `ngt1` | Active acquisition source: `ngt1` or `gofree` (Phase 2.7) |
+| GoFree host | `192.168.1.233` | H5000 CPU IP address (Phase 2.7) |
+| GoFree port | `2053` | H5000 GoFree WebSocket port (Phase 2.7) |
 
 Settings UI: a simple settings page/modal accessible from the main navigation.
 
@@ -601,6 +622,48 @@ Stored in the app-level `settings.json` (not per-race), as an array of sail conf
 
 Pre-seeded with a typical Sun Fast 3300 racing sail inventory.
 
+### 6.7 `race_metadata` table (Phase 2.8, per-race .db file)
+
+Created at recording start. Migration is idempotent (`CREATE TABLE IF NOT EXISTS` — safe on existing DBs).
+
+```sql
+CREATE TABLE race_metadata (
+    data_source TEXT NOT NULL,          -- 'ngt1' | 'gofree'
+    serial_port TEXT,                   -- NGT-1 port, null for GoFree
+    h5000_ip TEXT,                      -- GoFree IP, null for NGT-1
+    application_version TEXT NOT NULL,  -- semver from package.json
+    git_commit TEXT NOT NULL,           -- short SHA baked at build time
+    boat_profile_id INTEGER,            -- active polar profile id
+    polar_file TEXT,                    -- active polar profile name
+    recording_start TEXT NOT NULL,      -- ISO timestamp
+    recording_end TEXT                  -- set on clean stop or interrupted recovery
+);
+```
+
+Git SHA is baked at `npm prebuild` by `scripts/gen-build-info.js` into `electron/build-info.ts`. Only source-relevant fields are populated per recording.
+
+### 6.8 `data_quality` table (Phase 2.8, per-race .db file)
+
+Populated on `recording:stop`. Migration is idempotent.
+
+```sql
+CREATE TABLE data_quality (
+    bsp_availability_pct REAL,      -- % of duration with valid BSP (PGN 128259, 10 s window)
+    tws_availability_pct REAL,      -- % with wind data (PGN 130306, 2 s window)
+    twa_availability_pct REAL,      -- % with wind data (PGN 130306, 2 s window)
+    gps_availability_pct REAL,      -- % with GPS position (PGN 129025/129026/129029, 5 s window)
+    largest_bsp_gap_s REAL,         -- largest gap between consecutive BSP readings (seconds)
+    largest_wind_gap_s REAL,        -- largest gap between consecutive wind readings (seconds)
+    largest_gps_gap_s REAL,         -- largest gap between consecutive GPS readings (seconds)
+    disconnect_count INTEGER,        -- NGT-1 unexpected disconnects + GoFree reconnects
+    stale_data_events INTEGER,       -- watchdog stale state transitions
+    invalid_pgn_count INTEGER,       -- unrecognized/rejected PGN events
+    recording_duration_s REAL        -- total recording duration
+);
+```
+
+Low-quality recordings are not rejected — this table provides observability only. TWS/TWA availability uses a 2 s PGN 130306 coverage window (approximation documented in CONTRACTS.md).
+
 ---
 
 ## 7. API Requirements
@@ -639,6 +702,11 @@ No HTTP API. All communication is via Electron IPC between main and renderer pro
 | `analysis:exclude-segment` | Renderer → Main | `{ segmentId, excluded }` | Toggle segment exclusion (Phase 2) |
 | `analysis:sail-tags` | Renderer → Main | `{ raceId, tags: [{ config, start, end }] }` | Save sail tags for a race (Phase 2) |
 | `analysis:get-sail-tags` | Renderer → Main | `{ raceId }` | Load sail tags for a race (Phase 2) |
+| `connection:source` | Renderer → Main | `{ dataSource: 'ngt1' \| 'gofree' }` | Switch active data source; stops current manager, does NOT auto-connect (Phase 2.7) |
+| `gofree:status` | Main → Renderer | `{ state, ip?, port?, error? }` | GoFree connection state updates (Phase 2.7) |
+| `gofree:freshness` | Main → Renderer | `{ staleChannels: number[] }` | Channel IDs whose last observation exceeds their freshness window; renderer shows `--` for these tiles (Phase 2.7) |
+| `races:metadata` | Renderer → Main | `{ raceId }` | Fetch race_metadata record for the open race (Phase 2.8) |
+| `races:data-quality` | Renderer → Main | `{ raceId }` | Fetch data_quality record for the open race (Phase 2.8) |
 
 ---
 
@@ -778,12 +846,18 @@ All tests via Vitest.
 n2k-race-logger/
 ├── electron/
 │   ├── main.ts                # Electron main process entry
-│   ├── serial-manager.ts      # Serial/TCP connect, pipes raw bytes through FromPgn, emits parsed PGN events
-│   ├── n2k-parser.ts          # PGN filtering and batch buffering (receives pre-parsed PGN objects)
-│   ├── polar-engine.ts        # Polar file parsing, interpolation, % of polar computation
-│   ├── analysis-engine.ts     # (Phase 2) Data reconstruction, segment detection, performance aggregation
-│   ├── database.ts            # SQLite schema + write logic + batch buffer
-│   └── ipc-handlers.ts        # IPC bridge to renderer
+│   ├── serial-manager.ts      # Serial/TCP connect, pipes raw bytes through FromPgn, emits parsed PGN events; NGT-1 reconnect hardening + stale watchdog (Phase 2.8)
+│   ├── gofree-manager.ts      # (Phase 2.7) GoFree Tier 2 WebSocket manager; emits ParsedPGN events into the same pipeline as NGT-1
+│   ├── n2k-parser.ts          # PGN normalization (normalizeParsedPgn); all PGNs pass unconditionally (pgnFilter removed Phase 2.8)
+│   ├── polar-engine.ts        # Polar file parsing (including Expedition format Phase 2.5), interpolation, % of polar computation
+│   ├── analysis-engine.ts     # (Phase 2) Data reconstruction, segment detection, performance aggregation; circular TWA stats + TimedValue freshness (Phase 2.8)
+│   ├── database.ts            # SQLite schema + write logic + batch buffer; race_metadata + data_quality tables (Phase 2.8)
+│   ├── ipc-handlers.ts        # IPC bridge to renderer; routes connection:connect/disconnect by currentDataSource (Phase 2.7+)
+│   ├── timed-value.ts         # (Phase 2.8) TimedValue { value, timestamp } type + helpers for freshness-limit caching
+│   ├── wind-utils.ts          # (Phase 2.8) Circular statistics helpers: shortestAngularDiff, circularMean, circularDispersion
+│   └── build-info.ts          # (Phase 2.8) GIT_COMMIT + APP_VERSION baked at prebuild by scripts/gen-build-info.js
+├── scripts/
+│   └── gen-build-info.js      # (Phase 2.8) Prebuild script: writes electron/build-info.ts with git short SHA + package version
 ├── src/
 │   ├── components/
 │   │   ├── Dashboard/         # Live connection + real-time values + % of polar
@@ -873,3 +947,13 @@ All resolved — see §17.
 25. **Analysis runs in main process** — Segment detection, data reconstruction, and performance aggregation run in the Electron main process (not renderer). SQLite reads are synchronous via better-sqlite3, and the computation is CPU-bound. Results are sent to the renderer via IPC. For very large recordings, consider a worker thread in the future. Added 2026-06-16.
 26. **Live dashboard polar performance wiring fix** — Marcus reported that the dashboard shows correct live N2K numbers while sailing, except `% Polar` always shows `0%`. The approved bugfix is to wire the dashboard live data path to request `polar:performance` calculations from the Electron main process whenever valid STW/TWS/TWA and an active polar profile are available. The fix must normalize live TWA to the polar table's 0-180 degree range before lookup, load/confirm the active polar profile for dashboard use, render `--` when required inputs/profile are missing rather than a misleading `0%`, and add regression coverage for dashboard polar calculation wiring and TWA normalization. Approved 2026-07-29.
 27. **Formatted Excel export approved** — Marcus approved adding `.xlsx` export alongside existing CSV export for race-analysis tables because CSV cannot preserve readable table formatting. Scope is limited to Performance Summary and Segment List exports with frozen headers, filters, widths, numeric formats, `% Polar` color thresholds, and offline generation inside the Electron app. CSV export remains unchanged. Added 2026-07-29.
+28. **Expedition polar format** — Expedition polar rows have non-uniform VMG minima per TWS. Bilinear interpolation with zero-clamping below each row's VMG min produces near-zero target speeds and inflated `% Polar` (300%+). Fix: boundary-hold (use `row.points[0].bsp` for angles below VMG min) so the interpolated cell is a real speed, not zero. `interpolateSpeed()` then returns `null` for `twa < minTWA` — Marcus's explicit preference: no sub-VMG extrapolation, not even a smooth ramp. The `(0°, 0)` sentinel in the Expedition file format is discarded; no anchor is prepended. Added 2026-08-03.
+29. **Polar import via `dialog.showOpenDialog` IPC** — HTML `<input type=file>` does not expose `file.path` in Electron's sandboxed renderer (`contextIsolation: true, sandbox: true`). The bare `file.name` has no directory and `fs.readFileSync` fails silently. All polar file imports use a `polar:open-dialog` IPC handler so the main process always has the absolute path. Added 2026-08-03.
+30. **GoFree Tier 2 WebSocket protocol (not NMEA 0183)** — Original Phase 2.7 PRD specified NMEA 0183 over TCP (port 10110). Switched to GoFree Tier 2 WebSocket (port 2053) because the H5000 CPU exposes structured JSON channel data (DataList / DataInfo / DataReq / DataRsp), not raw NMEA sentences. This is more appropriate for the instrument and eliminates sentence parsing. Boat-tested with H5000 CPU at `192.168.1.233:2053` on Marcus's B&G system. Added 2026-08-06.
+31. **One data source active at a time** — `ipc-handlers.ts` maintains a `currentDataSource` field that routes `connection:connect`/`disconnect` to either `SerialManager` or `GoFreeManager`. Both managers share the same `ParsedPGN` → N2KParser → database/dashboard/analysis pipeline downstream. Only one emits data at a time. Toggle via `connection:source` IPC. Added 2026-08-06.
+32. **GoFree stale-data watchdog** — WebSocket `open` does not prove H5000 observations are flowing. A 5 s watchdog tracks `lastValidObservationAt`; silence transitions to `stale` state without tearing down the WebSocket (staleness is a data-layer signal, not a transport failure). Per-tile freshness is carried by `gofree:freshness` events emitting stale channel IDs; tiles display `--`. The same pattern was independently applied to NGT-1 in Phase 2.8. Added 2026-08-08.
+33. **VMG computation** — `VMG = STW × cos(TWA)` (positive = toward wind, negative = away). Computed in the renderer from Zustand `stw`/`twa` for the live dashboard tile. Computed in the analysis engine from stored `mean_stw`/`mean_twa` per segment for the segment list (no DB schema migration — works on all historical race files). TWA stored in DB is 0–180° normalized so upwind VMG is always positive. Added 2026-08-08.
+34. **Circular TWA statistics** — TWA is angular data. Arithmetic mean and `max − min` range produce nonsensical results near the ±180° boundary (e.g. 358° variation for perfectly stable downwind sailing). `shortestAngularDiff`, `circularMean`, and `circularDispersion` helpers in `electron/wind-utils.ts` replace all TWA range/mean/stability-metric calculations. Circular mean is stored with sign (port = negative); only band-matching and polar-table calls use `Math.abs()` at the consumption boundary. Added 2026-08-22.
+35. **TimedValue freshness limits** — The analysis engine previously carried forward cached sensor values (AWS, AWA, STW, heading, SOG) indefinitely, pairing a fresh measurement with a value that could be minutes old. `TimedValue { value: number; timestamp: number }` introduced with per-metric max ages: AWS/AWA contemporaneous ≤ 1.5–2 s; STW ≤ 10 s; heading ≤ 5 s; SOG/COG ≤ 5 s. Derived TWS/TWA are `null` if any required input exceeds its threshold — real sensor gaps remain as real gaps. Added 2026-08-22.
+36. **NGT-1 reconnect hardening** — Serial port open does not guarantee valid N2K traffic. Added `lastValidPgnAt` watchdog (5 s default → `stale` state exposed to renderer); unexpected serial `error`/`close` events trigger cleanup (clear decoder state, timers, cached PGN state) then reconnect with capped exponential backoff `1 s → 2 s → 5 s → 10 s…`; BST startup + keepalive resent after each reconnect. Same architectural pattern as Phase 2.7 GoFree watchdog. Added 2026-08-22.
+37. **Provenance metadata stored separately** — `race_metadata` table records acquisition source, connection parameters, software version, and git SHA alongside each race recording. `ParsedPGN` abstraction is unchanged — provenance is a traceability concern, not a data-pipeline concern. Git SHA is baked at `npm prebuild` by `scripts/gen-build-info.js` into `electron/build-info.ts`; committed placeholder values (`'dev'`, `'1.0.0'`) are used in development and tests. Added 2026-08-22.

@@ -106,8 +106,8 @@ describe('GoFreeManager — channel-ID → PGN mapping', () => {
     manager.removeAllListeners();
   });
 
-  it('channel 45 (TWA) → PGN 130306 windAngle (True), radians', () => {
-    feedRaw(manager, JSON.stringify({ Data: [{ id: 45, inst: 0, val: 45, valid: true }] }));
+  it('channel 141 (TWA) → PGN 130306 windAngle (True), radians', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 141, inst: 0, val: 45, valid: true }] }));
     const wind = emitted.find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
     );
@@ -128,7 +128,7 @@ describe('GoFreeManager — channel-ID → PGN mapping', () => {
     feedRaw(manager, JSON.stringify({
       Data: [
         { id: 47, val: 15, valid: true },
-        { id: 45, val: 60, valid: true },
+        { id: 141, val: 60, valid: true },
       ],
     }));
     const trueWinds = emitted.filter(
@@ -140,8 +140,8 @@ describe('GoFreeManager — channel-ID → PGN mapping', () => {
     expect(combined.fields.windAngle).toBeCloseTo(60 * DEG_TO_RAD, 4);
   });
 
-  it('channel 44 (AWA) → PGN 130306 windAngle (Apparent), radians', () => {
-    feedRaw(manager, JSON.stringify({ Data: [{ id: 44, val: 30, valid: true }] }));
+  it('channel 140 (AWA) → PGN 130306 windAngle (Apparent), radians', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 140, val: 30, valid: true }] }));
     const wind = emitted.find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'Apparent',
     );
@@ -186,15 +186,15 @@ describe('GoFreeManager — channel-ID → PGN mapping', () => {
     expect(hdg!.fields.heading).toBeCloseTo(355 * DEG_TO_RAD, 4);
   });
 
-  it('channel 421 (LAT) → PGN 129025 latitude (decimal degrees passthrough)', () => {
-    feedRaw(manager, JSON.stringify({ Data: [{ id: 421, val: 42.5, valid: true }] }));
+  it('channel 309 (LAT) → PGN 129025 latitude (decimal degrees passthrough)', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 309, val: 42.5, valid: true }] }));
     const pos = emitted.find((e) => e.pgn === PGN_POSITION && e.fields.latitude != null);
     expect(pos).toBeDefined();
     expect(pos!.fields.latitude).toBeCloseTo(42.5, 6);
   });
 
-  it('channel 422 (LON) → PGN 129025 longitude (decimal degrees passthrough)', () => {
-    feedRaw(manager, JSON.stringify({ Data: [{ id: 422, val: -71.0, valid: true }] }));
+  it('channel 310 (LON) → PGN 129025 longitude (decimal degrees passthrough)', () => {
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 310, val: -71.0, valid: true }] }));
     const pos = emitted.find((e) => e.pgn === PGN_POSITION && e.fields.longitude != null);
     expect(pos).toBeDefined();
     expect(pos!.fields.longitude).toBeCloseTo(-71, 6);
@@ -263,7 +263,7 @@ describe('GoFreeManager — envelope handling and filtering', () => {
   });
 
   it('TWA normalization: negative signed degrees (port) → 0–360°', () => {
-    feedRaw(manager, JSON.stringify({ Data: [{ id: 45, val: -45, valid: true }] }));
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 141, val: -45, valid: true }] }));
     const wind = emitted.find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
     );
@@ -273,7 +273,7 @@ describe('GoFreeManager — envelope handling and filtering', () => {
   });
 
   it('AWA normalization: negative signed degrees → 0–360°', () => {
-    feedRaw(manager, JSON.stringify({ Data: [{ id: 44, val: -30, valid: true }] }));
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 140, val: -30, valid: true }] }));
     const wind = emitted.find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'Apparent',
     );
@@ -311,7 +311,7 @@ describe('GoFreeManager — envelope handling and filtering', () => {
   });
 
   it('observation with scientific-notation valStr → parsed correctly', () => {
-    feedRaw(manager, JSON.stringify({ Data: [{ id: 421, valStr: '4.25e+01', valid: true }] }));
+    feedRaw(manager, JSON.stringify({ Data: [{ id: 309, valStr: '4.25e+01', valid: true }] }));
     const pos = emitted.find((p) => p.pgn === PGN_POSITION && p.fields.latitude != null);
     expect(pos).toBeDefined();
     expect(pos!.fields.latitude).toBeCloseTo(42.5, 4);
@@ -344,7 +344,7 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     MockWebSocket.instances.length = 0;
   });
 
-  it('on DataList: sends immediate poll (repeat:false) for required channels present in DataList', async () => {
+  it('on DataList: sends streaming (repeat:true) DataReqs for streaming channels and repeat:false for polled channels', async () => {
     const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
     await mgr.connect('127.0.0.1', 2053);
 
@@ -356,25 +356,37 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     expect(ws.sent).toHaveLength(1);
     expect(JSON.parse(ws.sent[0]).DataListReq).toMatchObject({ group: 40 });
 
-    // H5000 responds with DataList containing all 12 required channels
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    // H5000 responds with DataList containing all 12 required channels (new IDs)
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
-    // Immediate poll: one DataReq message per channel (12 total), repeat:false
-    expect(ws.sent).toHaveLength(13); // 1 DataListReq + 12 individual DataReq messages
-    const pollIds = ws.sent.slice(1).map((s: string) => {
+    // Immediate subscribe: 1 DataListReq + 12 individual DataReq messages (4 streaming + 8 polled)
+    expect(ws.sent).toHaveLength(13);
+
+    const streamingIds = new Set([140, 141, 309, 310]);
+    const msgs = ws.sent.slice(1).map((s: string) => {
       const msg = JSON.parse(s);
       expect(msg.DataReq).toHaveLength(1);
-      expect(msg.DataReq[0].repeat).toBe(false);
       expect(msg.DataReq[0].inst).toBe(0);
-      return msg.DataReq[0].id;
-    }).sort((a: number, b: number) => a - b);
-    expect(pollIds).toEqual(allIds.slice().sort((a, b) => a - b));
+      return { id: msg.DataReq[0].id, repeat: msg.DataReq[0].repeat };
+    });
+
+    // Streaming channels must have repeat:true; polled channels repeat:false
+    for (const { id, repeat } of msgs) {
+      if (streamingIds.has(id)) {
+        expect(repeat).toBe(true);
+      } else {
+        expect(repeat).toBe(false);
+      }
+    }
+
+    const sentIds = msgs.map(({ id }) => id).sort((a: number, b: number) => a - b);
+    expect(sentIds).toEqual(allIds.slice().sort((a, b) => a - b));
 
     await mgr.disconnect();
   });
 
-  it('polls all required channels even when DataList omits some', async () => {
+  it('subscribes all required channels even when DataList omits some', async () => {
     const mgr = new GoFreeManager({ WebSocketImpl: MockWebSocket as any });
     await mgr.connect('127.0.0.1', 2053);
 
@@ -382,27 +394,27 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     ws.simulateOpen();
     expect(ws.sent).toHaveLength(1);
 
-    // DataList missing LAT/LON (421, 422) and TWA/AWA (45, 44) — as seen on
-    // the H5000 firmware in boat testing. We must poll all 12 regardless.
-    const partialIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235];
+    // DataList missing LAT/LON (309, 310) and TWA/AWA (141, 140) — as seen on
+    // the H5000 firmware in boat testing. We must subscribe all 12 regardless.
+    const partialIds = [9, 37, 41, 42, 46, 47, 226, 235];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: partialIds } }));
 
-    // All 12 required channels must be polled (not just the 10 in DataList)
+    // All 12 required channels must be subscribed (not just the 8 in DataList)
     expect(ws.sent).toHaveLength(13); // 1 DataListReq + 12 individual DataReq messages
-    const pollIds = ws.sent.slice(1).map((s: string) => {
+    const sentIds = ws.sent.slice(1).map((s: string) => {
       const msg = JSON.parse(s);
       expect(msg.DataReq).toHaveLength(1);
       return msg.DataReq[0].id;
     }).sort((a: number, b: number) => a - b);
-    expect(pollIds).toEqual([9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422]);
-    // 421 and 422 are included even though absent from DataList
-    expect(pollIds).toContain(421);
-    expect(pollIds).toContain(422);
+    expect(sentIds).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310]);
+    // 309 and 310 are included even though absent from DataList
+    expect(sentIds).toContain(309);
+    expect(sentIds).toContain(310);
 
     await mgr.disconnect();
   });
 
-  it('polls at pollIntervalMs after the initial DataList poll', async () => {
+  it('polls at pollIntervalMs after the initial DataList subscribe', async () => {
     vi.useFakeTimers();
     const mgr = new GoFreeManager({
       pollIntervalMs: 1_000,
@@ -413,25 +425,26 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     const ws = latest(MockWebSocket.instances);
     ws.simulateOpen();
 
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
-    // msg 0: DataListReq, msgs 1–12: immediate poll (one DataReq per channel)
+    // msg 0: DataListReq, msgs 1–12: immediate subscribe (4 streaming repeat:true + 8 polled repeat:false)
     expect(ws.sent).toHaveLength(13);
 
-    // +1 s → second poll (12 more individual DataReq messages)
+    // +1 s → second poll tick: 3 fast + 5 normal = 8 polled channels (streaming not re-sent)
     vi.advanceTimersByTime(1_000);
-    expect(ws.sent).toHaveLength(25);
+    expect(ws.sent).toHaveLength(21); // 13 + 8 polled
+    // Poll messages are repeat:false (streaming channels are not re-sent on poll ticks)
     expect(JSON.parse(ws.sent[13]).DataReq[0].repeat).toBe(false);
 
-    // +1 s → third poll (12 more individual DataReq messages)
+    // +1 s → third poll tick (8 more polled DataReq messages)
     vi.advanceTimersByTime(1_000);
-    expect(ws.sent).toHaveLength(37);
+    expect(ws.sent).toHaveLength(29);
 
     await mgr.disconnect();
   });
 
-  it('falls back to polling required channels if DataList never arrives', async () => {
+  it('falls back to subscribing required channels if DataList never arrives', async () => {
     vi.useFakeTimers();
     const mgr = new GoFreeManager({
       pollIntervalMs: 1_000,
@@ -445,21 +458,29 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     expect(ws.sent).toHaveLength(1);
     expect(JSON.parse(ws.sent[0]).DataListReq).toBeDefined();
 
-    // Advance past discovery timeout (3 s) — fallback polls all 12 required channels individually
+    // Advance past discovery timeout (3 s) — fallback subscribes all 12 required channels:
+    // 4 streaming channels (repeat:true) + 8 polled channels (repeat:false)
     vi.advanceTimersByTime(3_000);
     // 1 DataListReq + 12 individual DataReq messages
     expect(ws.sent).toHaveLength(13);
+
+    const streamingIds = new Set([140, 141, 309, 310]);
     const ids = ws.sent.slice(1).map((s: string) => {
       const msg = JSON.parse(s);
       expect(msg.DataReq).toHaveLength(1);
-      expect(msg.DataReq[0].repeat).toBe(false);
+      // Streaming channels get repeat:true; polled channels get repeat:false
+      if (streamingIds.has(msg.DataReq[0].id)) {
+        expect(msg.DataReq[0].repeat).toBe(true);
+      } else {
+        expect(msg.DataReq[0].repeat).toBe(false);
+      }
       return msg.DataReq[0].id;
     }).sort((a: number, b: number) => a - b);
-    expect(ids).toEqual([9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422]);
+    expect(ids).toEqual([9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310]);
 
-    // +1 s → second poll tick (12 more individual DataReq messages)
+    // +1 s → second poll tick: 8 polled channels re-sent (streaming not re-polled)
     vi.advanceTimersByTime(1_000);
-    expect(ws.sent).toHaveLength(25);
+    expect(ws.sent).toHaveLength(21);
 
     await mgr.disconnect();
   });
@@ -480,14 +501,14 @@ describe('GoFreeManager — subscribe + keepalive', () => {
     // Message 0: DataListReq (discovery)
     expect(ws.sent).toHaveLength(1);
 
-    // +3 s → discovery timeout → poll fires (12 individual DataReq messages)
+    // +3 s → discovery timeout → subscribe fires (4 streaming + 8 polled = 12 DataReq messages)
     vi.advanceTimersByTime(3_000);
-    expect(ws.sent).toHaveLength(13); // DataListReq + 12 individual poll messages
+    expect(ws.sent).toHaveLength(13); // DataListReq + 12 individual subscribe messages
     expect(JSON.parse(ws.sent[1]).DataReq).toBeDefined();
 
-    // +1 s → second poll tick (12 more individual DataReq messages)
+    // +1 s → second poll tick (8 polled channels re-sent; streaming not re-polled)
     vi.advanceTimersByTime(1_000);
-    expect(ws.sent).toHaveLength(25);
+    expect(ws.sent).toHaveLength(21);
 
     // +30 s → first keepalive (after the 30 s keepalive interval from connection)
     vi.advanceTimersByTime(29_000); // total = 33s from open; keepalive fires at 30s
@@ -559,25 +580,25 @@ describe('GoFreeManager — integration (real WebSocket server)', () => {
         // Step 1: respond to DataListReq with available channel IDs
         if (msg?.DataListReq != null) {
           socket.send(JSON.stringify({
-            DataList: { groupId: 40, list: [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422] },
+            DataList: { groupId: 40, list: [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310] },
           }));
           return;
         }
-        // Step 2: respond to DataReq (repeat:false poll) with current data
+        // Step 2: respond to DataReq with current data (first message triggers this)
         if (msg?.DataReq && !subscribeReceived) {
           subscribeReceived = msg;
-          // Reply with a Data envelope covering the required channel IDs
+          // Reply with a Data envelope covering the required channel IDs (new IDs)
           socket.send(JSON.stringify({
             Data: [
-              { id: 45, inst: 0, val: 55, valid: true },
+              { id: 141, inst: 0, val: 55, valid: true },
               { id: 47, inst: 0, val: 12, valid: true },
               { id: 42, inst: 0, val: 6.0, valid: true },
               { id: 41, inst: 0, val: 7.5, valid: true },
               { id: 9, inst: 0, val: 80, valid: true },
               { id: 37, inst: 0, val: 90, valid: true },
-              { id: 421, inst: 0, val: 42.0, valid: true },
-              { id: 422, inst: 0, val: -71.0, valid: true },
-              { id: 44, inst: 0, val: 30, valid: true },
+              { id: 309, inst: 0, val: 42.0, valid: true },
+              { id: 310, inst: 0, val: -71.0, valid: true },
+              { id: 140, inst: 0, val: 30, valid: true },
               { id: 46, inst: 0, val: 14, valid: true },
             ],
           }));
@@ -684,7 +705,7 @@ describe('GoFreeManager — BE1: unexpected disconnect timer cleanup', () => {
     ws1.simulateOpen();
 
     // Complete discovery and start polling
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws1.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
     // 1 DataListReq + 12 immediate DataReq = 13
     expect(ws1.sent).toHaveLength(13);
@@ -717,7 +738,7 @@ describe('GoFreeManager — BE1: unexpected disconnect timer cleanup', () => {
     ws1.simulateOpen();
 
     // Complete discovery on ws1
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws1.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
     expect(ws1.sent).toHaveLength(13);
     const sentAtClose = ws1.sent.length;
@@ -757,7 +778,7 @@ describe('GoFreeManager — BE1: unexpected disconnect timer cleanup', () => {
     ws1.simulateOpen();
 
     // Complete discovery so pollTimer and keepaliveTimer are both active
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws1.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
     const sentAtClose = ws1.sent.length;
 
@@ -917,7 +938,7 @@ describe('GoFreeManager — BE2: data freshness watchdog', () => {
     ws.simulateOpen();
 
     // Complete discovery
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
     // Send data for BSPD (ch42) only
@@ -929,8 +950,8 @@ describe('GoFreeManager — BE2: data freshness watchdog', () => {
     expect(freshnessEvents.length).toBeGreaterThan(0);
     const last = freshnessEvents[freshnessEvents.length - 1];
     // TWA and TWS not seen → stale
-    expect(last.staleChannels).toContain(45); // CH_TWA
-    expect(last.staleChannels).toContain(47); // CH_TWS
+    expect(last.staleChannels).toContain(141); // CH_TWA
+    expect(last.staleChannels).toContain(47);  // CH_TWS
     // BSPD was seen recently (within 2x 500ms = 1000ms) — NOT stale
     expect(last.staleChannels).not.toContain(42); // CH_BSPD
 
@@ -951,7 +972,7 @@ describe('GoFreeManager — BE2: data freshness watchdog', () => {
     const ws = latest(MockWebSocket.instances);
     ws.simulateOpen();
 
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
     // Feed TWS — fresh
@@ -988,8 +1009,8 @@ describe('GoFreeManager — BE3: stale wind pairing prevention', () => {
 
     feedRaw(mgr, JSON.stringify({
       Data: [
-        { id: 47, val: 15, valid: true }, // TWS first
-        { id: 45, val: 60, valid: true }, // TWA second — sees fresh TWS
+        { id: 47, val: 15, valid: true },  // TWS first
+        { id: 141, val: 60, valid: true }, // TWA second — sees fresh TWS
       ],
     }));
 
@@ -1014,7 +1035,7 @@ describe('GoFreeManager — BE3: stale wind pairing prevention', () => {
     vi.advanceTimersByTime(2_000);
 
     // Feed fresh TWA — TWS is now 2000 ms old, beyond the 1500 ms window
-    feedRaw(mgr, JSON.stringify({ Data: [{ id: 45, val: 45, valid: true }] }));
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 141, val: 45, valid: true }] }));
 
     const lastTrue = [...emitted].reverse().find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
@@ -1031,7 +1052,7 @@ describe('GoFreeManager — BE3: stale wind pairing prevention', () => {
     mgr.on('pgn', (p: ParsedPGN) => emitted.push(p));
 
     // Feed TWA at t=0
-    feedRaw(mgr, JSON.stringify({ Data: [{ id: 45, val: 45, valid: true }] }));
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 141, val: 45, valid: true }] }));
 
     // Advance past pairing age
     vi.advanceTimersByTime(2_000);
@@ -1060,7 +1081,7 @@ describe('GoFreeManager — BE3: stale wind pairing prevention', () => {
     vi.advanceTimersByTime(2_000);
 
     // Feed fresh AWA
-    feedRaw(mgr, JSON.stringify({ Data: [{ id: 44, val: 30, valid: true }] }));
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 140, val: 30, valid: true }] }));
 
     const lastApparent = [...emitted].reverse().find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'Apparent',
@@ -1077,7 +1098,7 @@ describe('GoFreeManager — BE3: stale wind pairing prevention', () => {
     mgr.on('pgn', (p: ParsedPGN) => emitted.push(p));
 
     // Feed AWA at t=0
-    feedRaw(mgr, JSON.stringify({ Data: [{ id: 44, val: 30, valid: true }] }));
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 140, val: 30, valid: true }] }));
 
     // Advance past pairing age
     vi.advanceTimersByTime(2_000);
@@ -1106,7 +1127,7 @@ describe('GoFreeManager — BE3: stale wind pairing prevention', () => {
     vi.advanceTimersByTime(1_500);
 
     // Feed TWA — companion is exactly 1500 ms old → should be included
-    feedRaw(mgr, JSON.stringify({ Data: [{ id: 45, val: 30, valid: true }] }));
+    feedRaw(mgr, JSON.stringify({ Data: [{ id: 141, val: 30, valid: true }] }));
 
     const lastTrue = [...emitted].reverse().find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
@@ -1145,7 +1166,7 @@ describe('GoFreeManager — BE3: stale wind pairing prevention', () => {
     ws2.simulateOpen();
 
     // Feed TWA on the new connection — TWS from the previous connection must NOT pair
-    ws2.simulateMessage(JSON.stringify({ Data: [{ id: 45, val: 45, valid: true }] }));
+    ws2.simulateMessage(JSON.stringify({ Data: [{ id: 141, val: 45, valid: true }] }));
 
     const lastTrue = [...emitted].reverse().find(
       (p) => p.pgn === PGN_WIND && p.fields.reference === 'True (boat referenced)',
@@ -1182,7 +1203,7 @@ describe('GoFreeManager — BE4: channel probing disabled by default', () => {
 
     // DataList includes all 12 required channels PLUS 3 extra IDs not in REQUIRED_CHANNEL_IDS
     const extraIds = [100, 200, 300];
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422, ...extraIds];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310, ...extraIds];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
     // Should see exactly 1 DataListReq + 12 required DataReq — no probe messages for 100/200/300
@@ -1205,17 +1226,26 @@ describe('GoFreeManager — BE4: channel probing disabled by default', () => {
     const ws = latest(MockWebSocket.instances);
     ws.simulateOpen();
 
-    // DataList includes 12 required + 3 extra
-    const extraIds = [100, 200, 300];
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422, ...extraIds];
+    // DataList includes 12 required + 3 extra: ch50 (≤100, probe repeat:false),
+    // ch200 and ch300 (>100, probe repeat:true)
+    const extraIds = [50, 200, 300];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310, ...extraIds];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
     // Should see 1 DataListReq + 12 required + 3 probe = 16 total
     expect(ws.sent).toHaveLength(16);
-    const sentIds = ws.sent.slice(1).map((s: string) => JSON.parse(s).DataReq[0].id);
-    expect(sentIds).toContain(100);
+    const allSentMsgs = ws.sent.slice(1).map((s: string) => JSON.parse(s).DataReq[0]);
+    const sentIds = allSentMsgs.map((m: any) => m.id);
+    expect(sentIds).toContain(50);
     expect(sentIds).toContain(200);
     expect(sentIds).toContain(300);
+    // ch50 (≤100) gets repeat:false; ch200 and ch300 (>100) get repeat:true
+    const ch50Msg = allSentMsgs.find((m: any) => m.id === 50);
+    const ch200Msg = allSentMsgs.find((m: any) => m.id === 200);
+    const ch300Msg = allSentMsgs.find((m: any) => m.id === 300);
+    expect(ch50Msg?.repeat).toBe(false);
+    expect(ch200Msg?.repeat).toBe(true);
+    expect(ch300Msg?.repeat).toBe(true);
 
     await mgr.disconnect();
   });
@@ -1226,8 +1256,10 @@ describe('GoFreeManager — BE4: channel probing disabled by default', () => {
 // ---------------------------------------------------------------------------
 
 // Channel ID sets — kept in sync with gofree-manager.ts
-const FAST_CH = new Set([42, 45, 47, 44, 46]);  // BSPD, TWA, TWS, AWA, AWS
-const NORMAL_CH = new Set([41, 9, 37, 421, 422, 235, 226]);  // SOG,COG,HDG,LAT,LON,VMG,LEE
+// Streaming channels (140 AWA, 141 TWA, 309 LAT, 310 LON) are subscribed once with
+// repeat:true and are NOT in either poll group.
+const FAST_CH = new Set([42, 47, 46]);           // BSPD, TWS, AWS (repeat:false, polled at 200ms)
+const NORMAL_CH = new Set([41, 9, 37, 235, 226]); // SOG,COG,HDG,VMG,LEE (repeat:false, polled at 1Hz)
 
 describe('GoFreeManager — BE5: fast / normal polling groups', () => {
   beforeEach(() => {
@@ -1250,15 +1282,15 @@ describe('GoFreeManager — BE5: fast / normal polling groups', () => {
     const ws = latest(MockWebSocket.instances);
     ws.simulateOpen();
 
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
     const sentAfterDiscovery = ws.sent.length; // 1 DataListReq + 12 immediate = 13
 
     // Advance exactly one fast tick (+200 ms)
     vi.advanceTimersByTime(200);
 
-    // Exactly 5 new sends (fast group only; normal at 10 s has not fired)
-    expect(ws.sent.length - sentAfterDiscovery).toBe(5);
+    // Exactly 3 new sends (fast group only: BSPD, TWS, AWS; normal at 10 s has not fired)
+    expect(ws.sent.length - sentAfterDiscovery).toBe(3);
     const newIds = ws.sent.slice(sentAfterDiscovery).map((s: string) => JSON.parse(s).DataReq[0].id);
     for (const id of newIds) {
       expect(FAST_CH.has(id)).toBe(true);
@@ -1281,15 +1313,15 @@ describe('GoFreeManager — BE5: fast / normal polling groups', () => {
     const ws = latest(MockWebSocket.instances);
     ws.simulateOpen();
 
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
     const sentAfterDiscovery = ws.sent.length;
 
     // Advance exactly one normal tick (+1000 ms); fast at 10 s has not fired
     vi.advanceTimersByTime(1_000);
 
-    // Exactly 7 new sends (normal group only)
-    expect(ws.sent.length - sentAfterDiscovery).toBe(7);
+    // Exactly 5 new sends (normal group only: SOG, COG, HDG, VMG, LEE)
+    expect(ws.sent.length - sentAfterDiscovery).toBe(5);
     const newIds = ws.sent.slice(sentAfterDiscovery).map((s: string) => JSON.parse(s).DataReq[0].id);
     for (const id of newIds) {
       expect(NORMAL_CH.has(id)).toBe(true);
@@ -1312,7 +1344,7 @@ describe('GoFreeManager — BE5: fast / normal polling groups', () => {
     const ws = latest(MockWebSocket.instances);
     ws.simulateOpen();
 
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
     const sentAtClose = ws.sent.length;
 
@@ -1335,17 +1367,17 @@ describe('GoFreeManager — BE5: fast / normal polling groups', () => {
     const ws = latest(MockWebSocket.instances);
     ws.simulateOpen();
 
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
     const sentAfterDiscovery = ws.sent.length; // 1 DataListReq + 12 immediate = 13
 
-    // Run 3 fast ticks and verify each sends exactly 5 fast-group messages
+    // Run 3 fast ticks and verify each sends exactly 3 fast-group messages
     for (let tick = 1; tick <= 3; tick++) {
       const sentBefore = ws.sent.length;
       vi.advanceTimersByTime(200);
       const newMsgs = ws.sent.slice(sentBefore);
-      // Exactly 5 messages per fast tick (one per fast-group channel)
-      expect(newMsgs.length).toBe(5);
+      // Exactly 3 messages per fast tick (one per fast-group channel: BSPD, TWS, AWS)
+      expect(newMsgs.length).toBe(3);
       const ids = newMsgs.map((s: string) => JSON.parse(s).DataReq[0].id);
       // All must be fast-group channels, none from normal group
       for (const id of ids) {
@@ -1369,7 +1401,7 @@ describe('GoFreeManager — BE5: fast / normal polling groups', () => {
     const ws1 = latest(MockWebSocket.instances);
     ws1.simulateOpen();
 
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws1.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
     const sentAtClose = ws1.sent.length;
 
@@ -1383,10 +1415,10 @@ describe('GoFreeManager — BE5: fast / normal polling groups', () => {
     ws2.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
     const sentAfterDiscovery2 = ws2.sent.length;
 
-    // Fast timer on ws2 fires at +200ms → exactly 5 fast-group sends
+    // Fast timer on ws2 fires at +200ms → exactly 3 fast-group sends (BSPD, TWS, AWS)
     vi.advanceTimersByTime(200);
     const afterFastTick = ws2.sent.slice(sentAfterDiscovery2);
-    expect(afterFastTick.length).toBe(5);
+    expect(afterFastTick.length).toBe(3);
     expect(afterFastTick.every((s: string) => FAST_CH.has(JSON.parse(s).DataReq[0].id))).toBe(true);
 
     // Normal timer on ws2 fires at +1000ms; fast also fires 4 more times during this window
@@ -1396,8 +1428,8 @@ describe('GoFreeManager — BE5: fast / normal polling groups', () => {
     const normalIds = afterNormalWindow
       .map((s: string) => JSON.parse(s).DataReq[0].id)
       .filter((id: number) => NORMAL_CH.has(id));
-    // All 7 normal channels appear on the normal tick
-    expect(normalIds.length).toBe(7);
+    // All 5 normal channels appear on the normal tick (SOG, COG, HDG, VMG, LEE)
+    expect(normalIds.length).toBe(5);
 
     // ws1 receives nothing new after its close
     expect(ws1.sent.length).toBe(sentAtClose);
@@ -1419,7 +1451,7 @@ describe('GoFreeManager — BE5: fast / normal polling groups', () => {
     const ws = latest(MockWebSocket.instances);
     ws.simulateOpen();
 
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
     // Feed TWS (fast group, ch47) at t=0
@@ -1457,7 +1489,7 @@ describe('GoFreeManager — BE5: fast / normal polling groups', () => {
     const ws = latest(MockWebSocket.instances);
     ws.simulateOpen();
 
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
     // Feed SOG (normal group, ch41) at t=0
@@ -1607,7 +1639,7 @@ describe('GoFreeManager — BE6: backoff reconnect semantics', () => {
     ws2.simulateOpen();
 
     // Feed valid data so state becomes connected
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws2.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
     ws2.simulateMessage(JSON.stringify({ Data: [{ id: 42, val: 6, valid: true }] }));
 
@@ -1703,7 +1735,7 @@ describe('GoFreeManager — BE7: WebSocket readyState guard', () => {
     const sentBefore = ws.sent.length;
 
     // DataList → subscribeAll → immediate poll sends 12 DataReqs
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
     expect(ws.sent.length).toBeGreaterThan(sentBefore);
 
@@ -1723,7 +1755,7 @@ describe('GoFreeManager — BE7: WebSocket readyState guard', () => {
 
     // Attempt to trigger a send by feeding a DataList (which calls subscribeAll → send)
     // But the manager's send() should be blocked because readyState !== 1.
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
     // subscribeAll is called, but all send() calls are blocked by readyState guard
     expect(ws.sent.length).toBe(sentAfterOpen);
@@ -1742,7 +1774,7 @@ describe('GoFreeManager — BE7: WebSocket readyState guard', () => {
     // Set readyState to CLOSED (3) without triggering the close event
     ws.readyState = 3;
 
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
     expect(ws.sent.length).toBe(sentAfterOpen);
 
@@ -1781,7 +1813,7 @@ describe('GoFreeManager — BE9: gofree:freshness event contract (fast vs normal
     const ws = latest(MockWebSocket.instances);
     ws.simulateOpen();
 
-    const allIds = [9, 37, 41, 42, 44, 45, 46, 47, 226, 235, 421, 422];
+    const allIds = [9, 37, 41, 42, 46, 47, 140, 141, 226, 235, 309, 310];
     ws.simulateMessage(JSON.stringify({ DataList: { groupId: 40, list: allIds } }));
 
     // Feed BSPD (fast ch42) and SOG (normal ch41) at t=0

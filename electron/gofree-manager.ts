@@ -106,20 +106,37 @@ const PGN_SOG_COG = 129026;   // COG & SOG - Rapid Update
 const PGN_POSITION = 129025;  // Position - Rapid Update
 const PGN_HEADING = 127250;   // Vessel Heading
 
-// GoFree Tier 2 channel IDs (H5000) — confirmed by boat test (2026-08-12).
+// GoFree Tier 2 channel IDs (H5000) — confirmed by boat test (2026-08-23).
 //
-// ch44/45 are the active AWA/TWA sensor channels (raw masthead unit).
-// ch140/141 appear in DataList but never respond to DataReq — likely a
-// GPS-derived or race-mode variant inactive on this firmware.
-const CH_TWA = 45;   // True Wind Angle  (was 141 — did not respond)
+// IMPORTANT: Two classes of channel on this firmware:
+//
+//   repeat:false (polled)  — low-numbered channels (≤ 77) respond to one-shot
+//     DataReq. These are sent every fast/normal poll tick.
+//
+//   repeat:true (streaming) — higher-numbered channels (≥ 118) silently ignore
+//     repeat:false. Must be subscribed once with repeat:true; the H5000 then
+//     streams updates continuously. AWA/TWA calibrated values and GPS all fall
+//     in this class. See STREAMING_CHANNEL_IDS below.
+//
+// Channel mapping discovered via DataReq probe (2026-08-23 boat test):
+//   ch44/45  = raw uncalibrated masthead AWA/TWA — always returns 0.0
+//   ch140    = calibrated AWA  (~146° observed, repeat:true required)
+//   ch141    = calibrated TWA  (~146° observed, repeat:true required)
+//   ch46/47  = AWS/TWS — respond to repeat:false, values correct
+//   ch37     = Heading — repeat:false, correct
+//   ch41/42  = SOG/BSPD — repeat:false
+//   ch421/422 = not present on this firmware
+//   ch309    = GPS Latitude  (repeat:true, streams "40°042.653' N" etc.)
+//   ch310    = GPS Longitude (repeat:true, streams "074°002.760' W" etc.)
+const CH_AWA = 140;  // Calibrated Apparent Wind Angle (repeat:true)
+const CH_TWA = 141;  // Calibrated True Wind Angle     (repeat:true)
 const CH_TWS = 47;   // True Wind Speed
 const CH_BSPD = 42;  // Boat Speed (water-referenced)
 const CH_SOG = 41;   // Speed Over Ground
 const CH_COG = 9;    // Course Over Ground
 const CH_HDG = 37;   // Vessel Heading
-const CH_LAT = 421;  // Latitude  (may not be exposed on this firmware)
-const CH_LON = 422;  // Longitude (may not be exposed on this firmware)
-const CH_AWA = 44;   // Apparent Wind Angle (was 140 — did not respond)
+const CH_LAT = 309;  // GPS Latitude  (repeat:true; ch421 not on this firmware)
+const CH_LON = 310;  // GPS Longitude (repeat:true; ch422 not on this firmware)
 const CH_AWS = 46;   // Apparent Wind Speed
 const CH_VMG = 235;  // VMG
 const CH_LEE = 226;  // Leeway
@@ -144,16 +161,28 @@ const REQUIRED_CHANNEL_IDS = [
  * Channels excluded from freshness/staleness tracking.
  * These are subscribed so they work if the firmware supports them, but they
  * are NOT counted as stale when absent — the H5000 may not expose them on
- * all firmware versions (e.g. ch421/ch422 for GPS position).
+ * all firmware versions (e.g. GPS position channels).
  */
 const OPTIONAL_CHANNEL_IDS: ReadonlySet<number> = new Set([CH_LAT, CH_LON]);
 
 /**
+ * Channels that use streaming subscription (repeat:true) rather than polled
+ * DataReq (repeat:false). Subscribed once on connect; the H5000 then pushes
+ * updates continuously without further requests. These channels silently ignore
+ * repeat:false — confirmed by boat test 2026-08-23.
+ */
+const STREAMING_CHANNEL_IDS: ReadonlySet<number> = new Set([
+  CH_AWA, CH_TWA, CH_LAT, CH_LON,
+]);
+
+/**
  * BE5: Fast-group channel IDs — polled at fastPollIntervalMs (default 200 ms).
- * All other REQUIRED_CHANNEL_IDS belong to the normal group (default 1 000 ms).
+ * Streaming channels (AWA, TWA, LAT, LON) are excluded — they push data
+ * continuously and are not polled. All other REQUIRED_CHANNEL_IDS belong to
+ * the normal group (default 1 000 ms).
  */
 const FAST_CHANNEL_IDS: ReadonlySet<number> = new Set([
-  CH_BSPD, CH_TWA, CH_TWS, CH_AWA, CH_AWS,
+  CH_BSPD, CH_TWS, CH_AWS,
 ]);
 
 export type GoFreeState =
@@ -467,13 +496,31 @@ export class GoFreeManager extends EventEmitter {
       }
     }
 
-    // BE5: split REQUIRED_CHANNEL_IDS into fast and normal groups.
-    this.fastPollChannels = REQUIRED_CHANNEL_IDS.filter((id) => FAST_CHANNEL_IDS.has(id));
-    this.normalPollChannels = REQUIRED_CHANNEL_IDS.filter((id) => !FAST_CHANNEL_IDS.has(id));
+    // Subscribe streaming channels once with repeat:true. These channels
+    // (AWA, TWA, LAT, LON) silently ignore repeat:false — they must be
+    // subscribed once and then push data continuously.
+    const streamingChannels = REQUIRED_CHANNEL_IDS.filter((id) => STREAMING_CHANNEL_IDS.has(id));
+    if (streamingChannels.length > 0) {
+      this.emit(
+        'debug',
+        `[GoFree] Step 2a: Subscribing ${streamingChannels.length} streaming channels (repeat:true): ${streamingChannels.join(',')}`,
+      );
+      for (const id of streamingChannels) {
+        this.send({ DataReq: [{ id, repeat: true, inst: 0 }] });
+      }
+    }
+
+    // BE5: split non-streaming REQUIRED_CHANNEL_IDS into fast and normal poll groups.
+    this.fastPollChannels = REQUIRED_CHANNEL_IDS.filter(
+      (id) => FAST_CHANNEL_IDS.has(id) && !STREAMING_CHANNEL_IDS.has(id),
+    );
+    this.normalPollChannels = REQUIRED_CHANNEL_IDS.filter(
+      (id) => !FAST_CHANNEL_IDS.has(id) && !STREAMING_CHANNEL_IDS.has(id),
+    );
 
     this.emit(
       'debug',
-      `[GoFree] Step 2: Polling ${this.fastPollChannels.length} fast channels every ${this.fastPollIntervalMs} ms` +
+      `[GoFree] Step 2b: Polling ${this.fastPollChannels.length} fast channels every ${this.fastPollIntervalMs} ms` +
       ` + ${this.normalPollChannels.length} normal channels every ${this.normalPollIntervalMs} ms (repeat:false)`,
     );
 

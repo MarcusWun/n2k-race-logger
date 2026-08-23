@@ -155,11 +155,7 @@ function scheduleSourceUpdate(): void {
 
 export function registerIPCHandlers(): void {
   serialManager = new SerialManager();
-  // enableChannelProbe: send one-shot DataReq for every H5000 DataList channel
-  // not already in REQUIRED_CHANNEL_IDS. Results appear in the debug window as
-  // "[GoFree PROBE] ch<N>: val=..." — useful for finding the correct AWA/TWA
-  // channel IDs on this firmware. Disable once confirmed.
-  goFreeManager = new GoFreeManager({ enableChannelProbe: true });
+  goFreeManager = new GoFreeManager();
   n2kParser = new N2KParser();
   polarEngine = new PolarEngine();
   sourceDiscovery = new SourceDiscovery();

@@ -646,7 +646,7 @@ describe('QF1: aggregatePerformance uses |meanTwa| for band matching (PRD §3.3)
     expect(rows[0].cells[key]!.avgPercentPolar).toBe(92);
   });
 
-  it('starboard-tack and port-tack downwind segments both aggregate into same band', () => {
+  it('starboard-tack and port-tack downwind (same TWA magnitude) aggregate into same band', () => {
     const segments: DetectedSegmentData[] = [
       {
         startTime: 0, endTime: 120000, durationS: 120,
@@ -668,5 +668,45 @@ describe('QF1: aggregatePerformance uses |meanTwa| for band matching (PRD §3.3)
     expect(rows[0].cells[key]).not.toBeNull();
     expect(rows[0].cells[key]!.segmentCount).toBe(2);
     expect(rows[0].cells[key]!.avgPercentPolar).toBe(Math.round((88 + 90) / 2));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QF3 — Port-tack polar lookup returns null in computeSegmentPerformance
+// ---------------------------------------------------------------------------
+
+describe('QF3: computeSegmentPerformance uses |meanTwa| for polar lookup (PRD §3.3)', () => {
+  it('port-tack segment (meanTwa = -90) produces non-null percentPolar', () => {
+    const portSegment: DetectedSegmentData[] = [{
+      startTime: 0, endTime: 120000, durationS: 120,
+      meanTws: 12, meanTwa: -90, meanStw: 6.66,
+      stdTws: 0.3, stdTwa: 2, stdStw: 0.1,
+      percentPolar: null, sailConfig: null,
+    }];
+
+    const result = computeSegmentPerformance(portSegment, TEST_POLAR);
+    expect(result[0].percentPolar).not.toBeNull();
+  });
+
+  it('port-tack segment (meanTwa = -90) yields same percentPolar as starboard (meanTwa = +90) at same TWS', () => {
+    const stbdSegment: DetectedSegmentData[] = [{
+      startTime: 0, endTime: 120000, durationS: 120,
+      meanTws: 12, meanTwa: 90, meanStw: 6.66,
+      stdTws: 0.3, stdTwa: 2, stdStw: 0.1,
+      percentPolar: null, sailConfig: null,
+    }];
+    const portSegment: DetectedSegmentData[] = [{
+      startTime: 0, endTime: 120000, durationS: 120,
+      meanTws: 12, meanTwa: -90, meanStw: 6.66,
+      stdTws: 0.3, stdTwa: 2, stdStw: 0.1,
+      percentPolar: null, sailConfig: null,
+    }];
+
+    const stbdResult = computeSegmentPerformance(stbdSegment, TEST_POLAR);
+    const portResult = computeSegmentPerformance(portSegment, TEST_POLAR);
+
+    expect(stbdResult[0].percentPolar).not.toBeNull();
+    expect(portResult[0].percentPolar).not.toBeNull();
+    expect(portResult[0].percentPolar).toBe(stbdResult[0].percentPolar);
   });
 });

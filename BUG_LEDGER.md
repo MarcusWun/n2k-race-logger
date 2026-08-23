@@ -8,8 +8,21 @@
 - **Regression coverage:** `analysis-engine.test.ts` — two new QF1 tests:
   - Port-tack segment with `meanTwa ≈ −170` maps into `[150, 180]` band.
   - Starboard-tack and port-tack segments with equal absolute TWA aggregate into the same band and average is computed over both.
-- **Check for same class elsewhere:** `interpolateSpeed` in `analysis-engine.ts` guards `twa < 0` → returns null (line ~574). This is correct for polar lookup (table is defined 0..180). The `computeSegmentPerformance` path calls `interpolateSpeed(…, seg.meanTwa)` — if `seg.meanTwa` is negative (port tack), this returns null and `percentPolar` remains null. **QA should verify** that polar performance is also computed correctly for port-tack segments (may require `Math.abs` there too — left for QA Gate 2b).
+- **Check for same class elsewhere:** `interpolateSpeed` in `analysis-engine.ts` guards `twa < 0` → returns null (line ~748). This guard exists for polar-table domain safety. The `computeSegmentPerformance` path at line 704 originally called `interpolateSpeed(…, seg.meanTwa)` — if `seg.meanTwa` is negative (port tack), this returned null and `percentPolar` remained null. **Fixed in QF3** (same session).
 - **Prevention:** When circular-mean values are stored as signed but consumed by range checks, always canonicalize to absolute/[0,180] at the filter boundary. Add a linter note or comment near `TWA_BANDS` to document the expected convention.
+
+## QF3 — Port-tack polar lookup silently null in computeSegmentPerformance (2026-08-22)
+
+- **Reproduction:** Any segment with a port-tack `meanTwa` (e.g. −90°) passed through `computeSegmentPerformance` returned `percentPolar: null`. Starboard segments (positive TWA) computed correctly. This produced an asymmetric performance table where port-tack segments had no polar score.
+- **Root cause:** Same class as QF1. `computeSegmentPerformance` at `analysis-engine.ts:704` called `interpolateSpeed(polarTable, seg.meanTws, seg.meanTwa)` with the signed circular mean. `interpolateSpeed` guards `twa < 0 → null` at line 748 because the polar table is defined on `[0°, 180°]`. QF1 fixed the band-filter but did not fix this call site.
+- **Fix:** One-line change at `analysis-engine.ts:704`: `Math.abs(seg.meanTwa)` passed to `interpolateSpeed`. Signed `meanTwa` is retained in storage and in `DetectedSegmentData`; only the polar-table lookup boundary converts to absolute value.
+- **Regression coverage:** `analysis-engine.test.ts` — two new QF3 tests:
+  - Port-tack segment with `meanTwa = −90` produces non-null `percentPolar`.
+  - Port-tack segment (`meanTwa = −90`) and starboard (`meanTwa = +90`) with equal TWS/STW produce identical `percentPolar`.
+- **Audit — other signed-TWA → [0,180] call sites (main-process):**
+  - `polar-engine.ts:594` (`computePerformance`) is called from `ipc-handlers.ts` live polar IPC path. This path receives `twa` from the renderer, which normalizes TWA to `[0,180]` before dispatch (fixed in the "Dashboard polar performance stuck at 0%" bug 2026-07-29). No additional fix required.
+  - No heatmap or export call sites pass signed `meanTwa` directly to `interpolateSpeed`. The `saveSegments` path in `database.ts` stores signed `meanTwa` as-is (correct — display layer handles sign). No further fixes required.
+- **Prevention rule:** Any function taking TWA for a polar-table lookup operating on `[0°, 180°]` **must** call `Math.abs(twa)` at the consumption boundary. The `interpolateSpeed` guard (`twa < 0 → null`) is a safety net, not a normalization step — callers must not rely on it for sign-handling. Audit any new callers of `interpolateSpeed` in code review.
 
 Track recurring defects, root causes, regression coverage, and verification evidence.
 

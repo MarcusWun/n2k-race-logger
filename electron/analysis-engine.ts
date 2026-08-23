@@ -701,7 +701,7 @@ export function computeSegmentPerformance(
   if (!polarTable) return segments;
 
   return segments.map((seg) => {
-    const targetSpeed = interpolateSpeed(polarTable, seg.meanTws, seg.meanTwa);
+    const targetSpeed = interpolateSpeed(polarTable, seg.meanTws, Math.abs(seg.meanTwa));
     if (targetSpeed == null || targetSpeed === 0) {
       return { ...seg, percentPolar: null };
     }

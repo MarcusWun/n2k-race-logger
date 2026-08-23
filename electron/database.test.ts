@@ -416,4 +416,30 @@ describe('BE7: Interrupted-recording recovery (PRD §3.7)', () => {
     expect(info!.wasInterrupted).toBe(true);
     expect(info!.recoveredEndTime).toBeNull();
   });
+
+  it('BE7-idem: detectInterruptedRecording is idempotent — second call returns wasInterrupted:false, no re-mutation', () => {
+    const race = raceDb.createRace('interrupted-idem');
+    const raceId = race.id;
+
+    raceDb.batchInsertPoints([
+      { raceId, timestamp: '2026-08-22T19:00:00.000Z', pgn: 128259, data: '{"speedWaterReferenced":4.0}' },
+      { raceId, timestamp: '2026-08-22T19:05:00.000Z', pgn: 130306, data: '{"windSpeed":6.0}' },
+    ]);
+    // Do NOT call finalizeRace() — simulate crash
+
+    // First call: should detect and recover
+    const first = raceDb.detectInterruptedRecording(raceId);
+    expect(first).not.toBeNull();
+    expect(first!.wasInterrupted).toBe(true);
+    expect(first!.recoveredEndTime).toBe('2026-08-22T19:05:00.000Z');
+
+    // Second call: race already has end_time set, should not re-fire
+    const second = raceDb.detectInterruptedRecording(raceId);
+    expect(second).not.toBeNull();
+    expect(second!.wasInterrupted).toBe(false);
+
+    // recovered_end_time must not be mutated by the second call
+    const recovered = raceDb.getRaceById(raceId);
+    expect(recovered!.recovered_end_time).toBe('2026-08-22T19:05:00.000Z');
+  });
 });

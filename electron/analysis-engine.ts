@@ -436,14 +436,56 @@ export function detectSegments(
 
   if (qualifying.length === 0) return [];
 
-  // Step 2: Merge overlapping/adjacent qualifying windows
+  // Step 2: Merge adjacent/overlapping qualifying windows (PRD §3.5).
+  //
+  // Merging policy: two windows may merge only when:
+  //   (a) directly adjacent or overlapping (no gap samples at all), OR
+  //   (b) the gap is ≤ 10 s AND every gap sample passes a secondary stability
+  //       check at SECONDARY_STABILITY_MULT × the primary thresholds.
+  //
+  // This prevents maneuver/unsteady intervals from being silently absorbed
+  // into a segment and contaminating its statistics.
+  const SECONDARY_STABILITY_MULT = 2;
   const merged: QualifyingWindow[] = [{ ...qualifying[0] }];
   for (let i = 1; i < qualifying.length; i++) {
     const last = merged[merged.length - 1];
     const curr = qualifying[i];
-    // Merge if overlapping or gap < 10 seconds (10 indices on 1s grid)
-    if (curr.startIdx <= last.endIdx + 10) {
+
+    if (curr.startIdx <= last.endIdx + 1) {
+      // Directly adjacent or overlapping — always merge (no unsteady gap exists)
       last.endIdx = Math.max(last.endIdx, curr.endIdx);
+    } else if (curr.startIdx <= last.endIdx + 10) {
+      // Short gap: merge only if intervening samples are sufficiently stable
+      const gapTwsVals: number[] = [];
+      const gapTwaVals: number[] = [];
+      const gapStwVals: number[] = [];
+      let gapHasNull = false;
+
+      for (let g = last.endIdx + 1; g < curr.startIdx; g++) {
+        if (tws[g].value == null || twa[g].value == null || stw[g].value == null) {
+          gapHasNull = true;
+          break;
+        }
+        gapTwsVals.push(tws[g].value!);
+        gapTwaVals.push(twa[g].value!);
+        gapStwVals.push(stw[g].value!);
+      }
+
+      let gapIsStable = false;
+      if (!gapHasNull && gapTwsVals.length > 0) {
+        const gapTwsRange = Math.max(...gapTwsVals) - Math.min(...gapTwsVals);
+        const gapStwRange = Math.max(...gapStwVals) - Math.min(...gapStwVals);
+        gapIsStable =
+          gapTwsRange <= twsThresh * SECONDARY_STABILITY_MULT &&
+          isCircularlyStable(gapTwaVals, twaHalfRange * SECONDARY_STABILITY_MULT) &&
+          gapStwRange <= stwThresh * SECONDARY_STABILITY_MULT;
+      }
+
+      if (gapIsStable) {
+        last.endIdx = Math.max(last.endIdx, curr.endIdx);
+      } else {
+        merged.push({ ...curr });
+      }
     } else {
       merged.push({ ...curr });
     }
@@ -495,6 +537,138 @@ export function detectSegments(
   }
 
   return segments;
+}
+
+// --- Sail-Change Segment Splitting (PRD §3.6) ---
+
+/**
+ * Compute mean/std statistics for the slice of the time series within
+ * [startTime, endTime] (inclusive, ms epoch).  Returns null if no valid
+ * samples exist in the range.  Statistics use circular helpers for TWA.
+ */
+/**
+ * `endTime` is EXCLUSIVE — points at exactly `endTime` are NOT included.
+ * Callers should pass `segEnd + 1` for the final sub-segment so the last
+ * grid point (at t = segEnd) is included.
+ */
+function computeSegmentStats(
+  startTime: number,
+  endTime: number,
+  tws: TimeSeriesPoint[],
+  twa: TimeSeriesPoint[],
+  stw: TimeSeriesPoint[],
+): {
+  meanTws: number; meanTwa: number; meanStw: number;
+  stdTws: number; stdTwa: number; stdStw: number;
+} | null {
+  const twsVals: number[] = [];
+  const twaVals: number[] = [];
+  const stwVals: number[] = [];
+
+  const n = Math.min(tws.length, twa.length, stw.length);
+  for (let i = 0; i < n; i++) {
+    const t = tws[i].time;
+    if (t < startTime || t >= endTime) continue; // endTime is exclusive
+    if (tws[i].value != null && twa[i].value != null && stw[i].value != null) {
+      twsVals.push(tws[i].value!);
+      twaVals.push(twa[i].value!);
+      stwVals.push(stw[i].value!);
+    }
+  }
+
+  if (twsVals.length === 0) return null;
+
+  const meanTws = mean(twsVals);
+  const meanTwa = circularMean(twaVals);
+  const meanStw = mean(stwVals);
+  return {
+    meanTws,
+    meanTwa,
+    meanStw,
+    stdTws: stddev(twsVals, meanTws),
+    stdTwa: circularStdDev(twaVals),
+    stdStw: stddev(stwVals, meanStw),
+  };
+}
+
+/**
+ * Split segments at sail-change boundaries (PRD §3.6).
+ *
+ * After segment detection, call this function to check each segment for
+ * sail-tag start times that fall strictly inside it.  For each such boundary:
+ *   1. The segment is split at the boundary.
+ *   2. Statistics are recalculated for each sub-segment from the raw time series.
+ *   3. The correct sail config is assigned to each piece.
+ *   4. Sub-segments shorter than `minDurationS` seconds are discarded.
+ *
+ * Segments with no sail-change boundary inside them are passed through unchanged.
+ *
+ * @param segments     Detected segments (e.g., from detectSegments())
+ * @param sailTags     Active sail tags
+ * @param tws          Resampled TWS time series (used to recompute stats)
+ * @param twa          Resampled TWA time series
+ * @param stw          Resampled STW time series
+ * @param minDurationS Minimum sub-segment duration in seconds
+ */
+export function splitSegmentsAtSailChanges(
+  segments: DetectedSegmentData[],
+  sailTags: SailTagData[],
+  tws: TimeSeriesPoint[],
+  twa: TimeSeriesPoint[],
+  stw: TimeSeriesPoint[],
+  minDurationS: number,
+): DetectedSegmentData[] {
+  const result: DetectedSegmentData[] = [];
+
+  for (const seg of segments) {
+    // Sail-tag start times that fall strictly inside this segment (not at edges)
+    const boundaries = sailTags
+      .map((tag) => tag.startTime)
+      .filter((t) => t > seg.startTime && t < seg.endTime)
+      .sort((a, b) => a - b);
+
+    if (boundaries.length === 0) {
+      // No sail-change boundary inside this segment — pass through unchanged
+      result.push(seg);
+      continue;
+    }
+
+    // Build split points: [segStart, boundary1, ..., segEnd]
+    const splitPoints = [seg.startTime, ...boundaries, seg.endTime];
+
+    for (let i = 0; i < splitPoints.length - 1; i++) {
+      const subStart = splitPoints[i];
+      const subEnd = splitPoints[i + 1];
+      const durationS = (subEnd - subStart) / 1000;
+
+      // Discard sub-segments shorter than the minimum duration (PRD §3.6 step 4)
+      if (durationS < minDurationS) continue;
+
+      // Recalculate statistics — do NOT inherit from parent segment (PRD §3.6 step 2).
+      // computeSegmentStats uses an exclusive end boundary; pass subEnd+1 for the
+      // last piece so the final grid point at t=subEnd is included.
+      const isLast = i === splitPoints.length - 2;
+      const statsEnd = isLast ? subEnd + 1 : subEnd;
+      const stats = computeSegmentStats(subStart, statsEnd, tws, twa, stw);
+      if (stats == null || stats.meanStw < 1.0) continue;
+
+      // Assign the sail tag whose interval contains this sub-segment (PRD §3.6 step 3)
+      const tag = sailTags.find(
+        (t) => t.startTime <= subStart && t.endTime >= subEnd,
+      );
+
+      result.push({
+        startTime: subStart,
+        endTime: subEnd,
+        durationS,
+        ...stats,
+        percentPolar: null,
+        sailConfig: tag?.sailConfig ?? null,
+      });
+    }
+  }
+
+  return result;
 }
 
 // --- Sail Tag Assignment ---
@@ -680,10 +854,13 @@ export function aggregatePerformance(
     for (const twsBand of TWS_BANDS) {
       for (const twaBand of TWA_BANDS) {
         const key = bandKey(twsBand, twaBand);
+        // Use Math.abs(meanTwa) so that port-tack segments (negative signed TWA)
+        // map into the same downwind bands as starboard-tack segments (QF1 / PRD §3.3).
+        // meanTwa is stored as signed (port = negative) but bands are defined as 0..180.
         const matching = segs.filter(
           (s) =>
             s.meanTws >= twsBand[0] && s.meanTws < twsBand[1] &&
-            s.meanTwa >= twaBand[0] && s.meanTwa < twaBand[1] &&
+            Math.abs(s.meanTwa) >= twaBand[0] && Math.abs(s.meanTwa) < twaBand[1] &&
             s.percentPolar != null,
         );
 

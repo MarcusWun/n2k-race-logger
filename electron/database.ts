@@ -23,6 +23,18 @@ interface RaceMeta {
   end_time: string | null;
   boat_profile: string | null;
   total_points: number;
+  /** 0 = cleanly stopped; 1 = process was killed/crashed before end_time was written (PRD §3.7). */
+  was_interrupted: number;
+  /** ISO timestamp of the last persisted N2K sample when the recording was interrupted. */
+  recovered_end_time: string | null;
+}
+
+/** Payload exposed to the renderer for interrupted-recording recovery (PRD §3.7). */
+export interface InterruptedRecordingInfo {
+  raceId: number;
+  wasInterrupted: boolean;
+  /** ISO timestamp of the last N2K sample stored before the interruption, or null if no samples exist. */
+  recoveredEndTime: string | null;
 }
 
 interface N2KPoint {
@@ -78,7 +90,9 @@ export class RaceDatabase {
         start_time TEXT,
         end_time TEXT,
         boat_profile TEXT,
-        total_points INTEGER DEFAULT 0
+        total_points INTEGER DEFAULT 0,
+        was_interrupted INTEGER NOT NULL DEFAULT 0,
+        recovered_end_time TEXT
       );
 
       CREATE TABLE IF NOT EXISTS n2k_points (
@@ -100,6 +114,15 @@ export class RaceDatabase {
       CREATE INDEX IF NOT EXISTS idx_n2k_race_timestamp ON n2k_points(race_id, timestamp);
       CREATE INDEX IF NOT EXISTS idx_n2k_pgn ON n2k_points(pgn);
     `);
+
+    // Migration: add interrupted-recording columns to existing databases (PRD §3.7).
+    // SQLite does not support ADD COLUMN IF NOT EXISTS; try/catch each ALTER.
+    try {
+      this.db.exec('ALTER TABLE race_meta ADD COLUMN was_interrupted INTEGER NOT NULL DEFAULT 0');
+    } catch { /* column already exists */ }
+    try {
+      this.db.exec('ALTER TABLE race_meta ADD COLUMN recovered_end_time TEXT');
+    } catch { /* column already exists */ }
   }
 
   /**
@@ -124,6 +147,8 @@ export class RaceDatabase {
       end_time: null,
       boat_profile: boatProfile || null,
       total_points: 0,
+      was_interrupted: 0,
+      recovered_end_time: null,
     };
   }
 
@@ -186,6 +211,49 @@ export class RaceDatabase {
     stmt.run(endTime, raceId, raceId);
 
     return this.getRaceById(raceId);
+  }
+
+  /**
+   * Detect and mark an interrupted recording (PRD §3.7).
+   *
+   * A race is interrupted when its `end_time` is NULL at open time, indicating
+   * the process was killed or crashed before `finalizeRace()` could run.
+   *
+   * On detection:
+   *  - Sets `was_interrupted = 1`.
+   *  - Sets `recovered_end_time` to the ISO timestamp of the last persisted N2K sample.
+   *  - Sets `end_time = recovered_end_time` so the race is no longer treated as active.
+   *
+   * Returns an `InterruptedRecordingInfo` payload suitable for IPC delivery to the renderer.
+   * Returns `null` if the race does not exist.
+   * If `end_time` is already set (clean stop), returns `{ wasInterrupted: false }`.
+   */
+  detectInterruptedRecording(raceId: number): InterruptedRecordingInfo | null {
+    const race = this.getRaceById(raceId);
+    if (!race) return null;
+
+    if (race.end_time !== null) {
+      // Cleanly stopped — not interrupted
+      return { raceId, wasInterrupted: false, recoveredEndTime: null };
+    }
+
+    // Find the last N2K sample timestamp
+    const lastRow = this.db.prepare(
+      'SELECT MAX(timestamp) AS last_ts FROM n2k_points WHERE race_id = ?',
+    ).get(raceId) as { last_ts: string | null } | undefined;
+
+    const recoveredEndTime = lastRow?.last_ts ?? null;
+
+    // Mark as interrupted and close the race at the recovered end time
+    this.db.prepare(`
+      UPDATE race_meta
+      SET was_interrupted = 1,
+          recovered_end_time = ?,
+          end_time = ?
+      WHERE id = ?
+    `).run(recoveredEndTime, recoveredEndTime, raceId);
+
+    return { raceId, wasInterrupted: true, recoveredEndTime };
   }
 
   /**
@@ -308,7 +376,7 @@ export class RaceDatabase {
     percentPolar: number | null; sailConfig: string | null;
     thresholds: string;
   }>): void {
-    this.db.prepare('DELETE FROM detected_segments WHERE race_id = ?').run(raceId);
+    const deleteStmt = this.db.prepare('DELETE FROM detected_segments WHERE race_id = ?');
     const insert = this.db.prepare(`
       INSERT INTO detected_segments (
         race_id, start_time, end_time, duration_s,
@@ -317,7 +385,10 @@ export class RaceDatabase {
         percent_polar, sail_config, excluded, thresholds
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
     `);
+    // DELETE and all INSERTs are wrapped in a single transaction (PRD §3.4).
+    // If any INSERT fails the DELETE is rolled back, preserving existing records.
     const txn = this.db.transaction((segs: typeof segments) => {
+      deleteStmt.run(raceId);
       for (const s of segs) {
         insert.run(
           raceId, s.startTime, s.endTime, s.durationS,
@@ -350,11 +421,14 @@ export class RaceDatabase {
    * Save sail tags (replaces all existing for the race).
    */
   saveSailTags(raceId: number, tags: Array<{ sailConfig: string; startTime: string; endTime: string }>): void {
-    this.db.prepare('DELETE FROM sail_tags WHERE race_id = ?').run(raceId);
+    const deleteStmt = this.db.prepare('DELETE FROM sail_tags WHERE race_id = ?');
     const insert = this.db.prepare(
       'INSERT INTO sail_tags (race_id, sail_config, start_time, end_time) VALUES (?, ?, ?, ?)',
     );
+    // DELETE and all INSERTs are wrapped in a single transaction (PRD §3.4).
+    // If any INSERT fails the DELETE is rolled back, preserving existing records.
     const txn = this.db.transaction((ts: typeof tags) => {
+      deleteStmt.run(raceId);
       for (const t of ts) {
         insert.run(raceId, t.sailConfig, t.startTime, t.endTime);
       }

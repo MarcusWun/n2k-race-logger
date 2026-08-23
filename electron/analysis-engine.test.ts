@@ -7,6 +7,7 @@ import {
   computeSegmentPerformance,
   interpolateSpeed,
   aggregatePerformance,
+  splitSegmentsAtSailChanges,
 } from './analysis-engine';
 import type { TimeSeriesPoint, SegmentThresholds, DetectedSegmentData, SailTagData } from './analysis-engine';
 import type { PolarTable } from './polar-engine';
@@ -173,18 +174,20 @@ describe('Analysis Engine', () => {
       expect(segments[0].durationS).toBeGreaterThanOrEqual(59); // At least 60s minus rounding
     });
 
-    // Test 4: Merge
-    it('merges two qualifying windows separated by 8s', () => {
+    // Test 4: No unsteady-gap merge (PRD §3.5)
+    // An 8s window with clearly unsteady data (high variation) must NOT be merged
+    // even though the gap is < 10 s.  The secondary stability check should reject it.
+    it('keeps two steady windows separate when the 8s gap contains clearly unsteady data (PRD §3.5)', () => {
       const startMs = 0;
-      // Steady 70s, then 8s unsteady, then steady 70s
+      // Steady 70s, then 8s with very high variation (maneuver), then steady 70s
       const tws = makeCompositeSeries(startMs, [
         { durationS: 70, base: 12, variation: 0.3 },
-        { durationS: 8, base: 12, variation: 5 }, // unsteady
+        { durationS: 8, base: 12, variation: 5 }, // ±5 kts — far exceeds any stability threshold
         { durationS: 70, base: 12, variation: 0.3 },
       ], 1);
       const twa = makeCompositeSeries(startMs, [
         { durationS: 70, base: 90, variation: 2 },
-        { durationS: 8, base: 90, variation: 30 },
+        { durationS: 8, base: 90, variation: 30 }, // ±30° — clearly a maneuver
         { durationS: 70, base: 90, variation: 2 },
       ], 2);
       const stw = makeCompositeSeries(startMs, [
@@ -196,8 +199,8 @@ describe('Analysis Engine', () => {
       const thresholds: SegmentThresholds = { tws: 1.5, twa: 10, stw: 0.5, minDuration: 60 };
       const segments = detectSegments(tws, twa, stw, thresholds);
 
-      // Should merge into one segment since gap < 10s
-      expect(segments.length).toBe(1);
+      // Must produce two separate segments — unsteady gap must not be absorbed (PRD §3.5)
+      expect(segments.length).toBe(2);
     });
 
     // Test 5: No merge
@@ -380,5 +383,290 @@ describe('Analysis Engine', () => {
       const speed = interpolateSpeed(TEST_POLAR, 9, 90);
       expect(speed).toBeCloseTo(5.15, 1);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BE5 — Prevent unsteady-gap segment merging (PRD §3.5)
+// ---------------------------------------------------------------------------
+
+describe('BE5: Prevent unsteady-gap segment merging (PRD §3.5)', () => {
+  const thresholds: SegmentThresholds = { tws: 1.5, twa: 10, stw: 0.5, minDuration: 40 };
+
+  it('two steady windows separated by an unsteady 8s gap → two segments', () => {
+    const startMs = 0;
+    // 40s steady → 8s maneuver-level noise → 40s steady
+    const tws = makeCompositeSeries(startMs, [
+      { durationS: 40, base: 12, variation: 0.3 },
+      { durationS: 8, base: 12, variation: 5 }, // ±5 kts — clearly unsteady
+      { durationS: 40, base: 12, variation: 0.3 },
+    ], 7);
+    const twa = makeCompositeSeries(startMs, [
+      { durationS: 40, base: 90, variation: 2 },
+      { durationS: 8, base: 90, variation: 30 }, // ±30° — clearly unsteady
+      { durationS: 40, base: 90, variation: 2 },
+    ], 8);
+    const stw = makeCompositeSeries(startMs, [
+      { durationS: 40, base: 6.5, variation: 0.1 },
+      { durationS: 8, base: 6.5, variation: 3 }, // clearly unsteady
+      { durationS: 40, base: 6.5, variation: 0.1 },
+    ], 9);
+
+    const segs = detectSegments(tws, twa, stw, thresholds);
+    expect(segs.length).toBe(2);
+  });
+
+  it('two directly adjacent steady windows → may merge into one', () => {
+    const startMs = 0;
+    // 80s of continuous steady data — all qualifying windows overlap/are adjacent
+    const tws = makeSeries(startMs, 80, 12, 0.3, 10);
+    const twa = makeSeries(startMs, 80, 90, 2, 11);
+    const stw = makeSeries(startMs, 80, 6.5, 0.1, 12);
+
+    const segs = detectSegments(tws, twa, stw, thresholds);
+    expect(segs.length).toBe(1);
+  });
+
+  it('segment statistics contain only samples from the steady region', () => {
+    const startMs = 0;
+    // 40s at TWS=12 → 8s at TWS=22 (unsteady spike) → 40s at TWS=12
+    const tws = makeCompositeSeries(startMs, [
+      { durationS: 40, base: 12, variation: 0.3 },
+      { durationS: 8, base: 22, variation: 5 },
+      { durationS: 40, base: 12, variation: 0.3 },
+    ], 13);
+    const twa = makeCompositeSeries(startMs, [
+      { durationS: 40, base: 90, variation: 2 },
+      { durationS: 8, base: 90, variation: 30 },
+      { durationS: 40, base: 90, variation: 2 },
+    ], 14);
+    const stw = makeCompositeSeries(startMs, [
+      { durationS: 40, base: 6.5, variation: 0.1 },
+      { durationS: 8, base: 6.5, variation: 3 },
+      { durationS: 40, base: 6.5, variation: 0.1 },
+    ], 15);
+
+    const segs = detectSegments(tws, twa, stw, thresholds);
+    expect(segs.length).toBe(2);
+    // Both segments should have meanTws ≈ 12, NOT contaminated by the 22-kts spike
+    for (const seg of segs) {
+      expect(seg.meanTws).toBeCloseTo(12, 0);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BE6 — Split segments at sail-change boundaries (PRD §3.6)
+// ---------------------------------------------------------------------------
+
+describe('BE6: Split segments at sail-change boundaries (PRD §3.6)', () => {
+  const BASE_MS = 1_700_000_000_000;
+
+  function makeSteadySegment(
+    startMs: number,
+    durationMs: number,
+    twaBase = 90,
+  ): DetectedSegmentData {
+    return {
+      startTime: startMs,
+      endTime: startMs + durationMs,
+      durationS: durationMs / 1000,
+      meanTws: 12,
+      meanTwa: twaBase,
+      meanStw: 6.5,
+      stdTws: 0.3,
+      stdTwa: 2,
+      stdStw: 0.1,
+      percentPolar: null,
+      sailConfig: null,
+    };
+  }
+
+  function makeTimeSeries(
+    startMs: number,
+    durationMs: number,
+    tws = 12,
+    twa = 90,
+    stw = 6.5,
+  ): { tws: TimeSeriesPoint[]; twa: TimeSeriesPoint[]; stw: TimeSeriesPoint[] } {
+    const twsSeries: TimeSeriesPoint[] = [];
+    const twaSeries: TimeSeriesPoint[] = [];
+    const stwSeries: TimeSeriesPoint[] = [];
+    for (let t = startMs; t <= startMs + durationMs; t += 1000) {
+      twsSeries.push({ time: t, value: tws });
+      twaSeries.push({ time: t, value: twa });
+      stwSeries.push({ time: t, value: stw });
+    }
+    return { tws: twsSeries, twa: twaSeries, stw: stwSeries };
+  }
+
+  it('one sail change inside a segment → two correctly tagged sub-segments', () => {
+    const segStart = BASE_MS;
+    const sailChange = BASE_MS + 30_000; // 30 s into a 60 s segment
+    const segEnd = BASE_MS + 60_000;
+
+    const segment = makeSteadySegment(segStart, segEnd - segStart);
+    const sailTags: SailTagData[] = [
+      { sailConfig: 'A2', startTime: segStart, endTime: sailChange },
+      { sailConfig: 'A3', startTime: sailChange, endTime: segEnd },
+    ];
+    const ts = makeTimeSeries(segStart, segEnd - segStart);
+    const minDuration = 20; // 20-second minimum — both pieces are 30 s
+
+    const result = splitSegmentsAtSailChanges(
+      [segment], sailTags, ts.tws, ts.twa, ts.stw, minDuration,
+    );
+
+    expect(result.length).toBe(2);
+    expect(result[0].sailConfig).toBe('A2');
+    expect(result[0].startTime).toBe(segStart);
+    expect(result[0].endTime).toBe(sailChange);
+    expect(result[1].sailConfig).toBe('A3');
+    expect(result[1].startTime).toBe(sailChange);
+    expect(result[1].endTime).toBe(segEnd);
+  });
+
+  it('multiple sail changes inside a segment → multiple correctly tagged sub-segments', () => {
+    const segStart = BASE_MS;
+    const change1 = BASE_MS + 60_000;
+    const change2 = BASE_MS + 120_000;
+    const segEnd = BASE_MS + 180_000;
+
+    const segment = makeSteadySegment(segStart, segEnd - segStart);
+    const sailTags: SailTagData[] = [
+      { sailConfig: 'J1', startTime: segStart, endTime: change1 },
+      { sailConfig: 'J2', startTime: change1, endTime: change2 },
+      { sailConfig: 'J3', startTime: change2, endTime: segEnd },
+    ];
+    const ts = makeTimeSeries(segStart, segEnd - segStart);
+
+    const result = splitSegmentsAtSailChanges(
+      [segment], sailTags, ts.tws, ts.twa, ts.stw, 30,
+    );
+
+    expect(result.length).toBe(3);
+    expect(result[0].sailConfig).toBe('J1');
+    expect(result[1].sailConfig).toBe('J2');
+    expect(result[2].sailConfig).toBe('J3');
+  });
+
+  it('sub-segment below minimum duration after split → discarded', () => {
+    const segStart = BASE_MS;
+    const sailChange = BASE_MS + 3_000; // Creates a 3-second first piece
+    const segEnd = BASE_MS + 60_000;
+
+    const segment = makeSteadySegment(segStart, segEnd - segStart);
+    const sailTags: SailTagData[] = [
+      { sailConfig: 'A2', startTime: segStart, endTime: sailChange },
+      { sailConfig: 'A3', startTime: sailChange, endTime: segEnd },
+    ];
+    const ts = makeTimeSeries(segStart, segEnd - segStart);
+
+    const result = splitSegmentsAtSailChanges(
+      [segment], sailTags, ts.tws, ts.twa, ts.stw, 30, // 30s minimum
+    );
+
+    // First piece is 3s → discarded; second piece is 57s → kept
+    expect(result.length).toBe(1);
+    expect(result[0].sailConfig).toBe('A3');
+  });
+
+  it('statistics recalculated per sub-segment (not inherited from parent)', () => {
+    const segStart = BASE_MS;
+    const sailChange = BASE_MS + 60_000;
+    const segEnd = BASE_MS + 120_000;
+
+    // Parent segment has inherited meanTwa=90 from before splitting
+    const segment = makeSteadySegment(segStart, segEnd - segStart, 90);
+
+    // But the actual data has different TWA in each half
+    const tws: TimeSeriesPoint[] = [];
+    const twa: TimeSeriesPoint[] = [];
+    const stw: TimeSeriesPoint[] = [];
+    for (let t = segStart; t <= segEnd; t += 1000) {
+      tws.push({ time: t, value: 12 });
+      // First 60s at TWA=60°, second 60s at TWA=120°
+      twa.push({ time: t, value: t < sailChange ? 60 : 120 });
+      stw.push({ time: t, value: 6.5 });
+    }
+
+    const sailTags: SailTagData[] = [
+      { sailConfig: 'Upwind', startTime: segStart, endTime: sailChange },
+      { sailConfig: 'Downwind', startTime: sailChange, endTime: segEnd },
+    ];
+
+    const result = splitSegmentsAtSailChanges([segment], sailTags, tws, twa, stw, 30);
+
+    expect(result.length).toBe(2);
+    // Sub-segment 1: samples where t < sailChange → meanTwa ≈ 60
+    expect(result[0].meanTwa).toBeCloseTo(60, 0);
+    // Sub-segment 2: samples where t >= sailChange → meanTwa ≈ 120
+    expect(result[1].meanTwa).toBeCloseTo(120, 0);
+    // Not the parent's inherited value of 90
+    expect(result[0].meanTwa).not.toBeCloseTo(90, 0);
+  });
+
+  it('segment with no sail-change boundary inside → passed through unchanged', () => {
+    const segStart = BASE_MS;
+    const segEnd = BASE_MS + 120_000;
+    const segment = makeSteadySegment(segStart, segEnd - segStart);
+    const sailTags: SailTagData[] = [
+      { sailConfig: 'J1', startTime: segStart - 10_000, endTime: segEnd + 10_000 },
+    ];
+    const ts = makeTimeSeries(segStart, segEnd - segStart);
+
+    const result = splitSegmentsAtSailChanges([segment], sailTags, ts.tws, ts.twa, ts.stw, 30);
+    expect(result.length).toBe(1);
+    // Unchanged pass-through: same start/end
+    expect(result[0].startTime).toBe(segStart);
+    expect(result[0].endTime).toBe(segEnd);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QF1 — Circular-aware TWA band matching in aggregatePerformance (§3.3)
+// ---------------------------------------------------------------------------
+
+describe('QF1: aggregatePerformance uses |meanTwa| for band matching (PRD §3.3)', () => {
+  it('port-tack downwind segment (meanTwa ≈ -170) maps into [150,180] band', () => {
+    const segments: DetectedSegmentData[] = [
+      {
+        startTime: 0, endTime: 120000, durationS: 120,
+        meanTws: 16, meanTwa: -170, meanStw: 8.0,
+        stdTws: 0.3, stdTwa: 2, stdStw: 0.1,
+        percentPolar: 92, sailConfig: 'A5',
+      },
+    ];
+
+    const rows = aggregatePerformance(segments);
+    expect(rows.length).toBe(1);
+    const key = '16-20:150-180';
+    expect(rows[0].cells[key]).not.toBeNull();
+    expect(rows[0].cells[key]!.segmentCount).toBe(1);
+    expect(rows[0].cells[key]!.avgPercentPolar).toBe(92);
+  });
+
+  it('starboard-tack and port-tack downwind segments both aggregate into same band', () => {
+    const segments: DetectedSegmentData[] = [
+      {
+        startTime: 0, endTime: 120000, durationS: 120,
+        meanTws: 10, meanTwa: 165, meanStw: 7.0,  // starboard tack
+        stdTws: 0.3, stdTwa: 2, stdStw: 0.1,
+        percentPolar: 88, sailConfig: 'A2',
+      },
+      {
+        startTime: 200000, endTime: 320000, durationS: 120,
+        meanTws: 10, meanTwa: -165, meanStw: 7.2, // port tack (same angle, opposite sign)
+        stdTws: 0.3, stdTwa: 2, stdStw: 0.1,
+        percentPolar: 90, sailConfig: 'A2',
+      },
+    ];
+
+    const rows = aggregatePerformance(segments);
+    expect(rows.length).toBe(1);
+    const key = '10-12:150-180';
+    expect(rows[0].cells[key]).not.toBeNull();
+    expect(rows[0].cells[key]!.segmentCount).toBe(2);
+    expect(rows[0].cells[key]!.avgPercentPolar).toBe(Math.round((88 + 90) / 2));
   });
 });

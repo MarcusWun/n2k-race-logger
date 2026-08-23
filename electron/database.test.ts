@@ -3,6 +3,7 @@ import Database from 'better-sqlite3';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { RaceDatabase } from './database';
 
 // --- Test helpers ---
 
@@ -235,5 +236,184 @@ describe('Race lifecycle', () => {
     const finalized = db.prepare('SELECT * FROM race_meta WHERE id = ?').get(raceId);
     expect((finalized as any).end_time).toBe(endTime);
     expect((finalized as any).total_points).toBe(2);
+  });
+});
+
+// ===================================================================
+// BE4 — Atomic segment & sail-tag replacement (PRD §3.4)
+// ===================================================================
+
+describe('BE4: Atomic segment & sail-tag replacement (PRD §3.4)', () => {
+  let tmpDir: string;
+  let raceDb: RaceDatabase;
+
+  beforeEach(() => {
+    tmpDir = path.join(os.tmpdir(), 'n2k-be4-' + Date.now());
+    fs.mkdirSync(tmpDir, { recursive: true });
+    raceDb = new RaceDatabase(path.join(tmpDir, 'test.db'), tmpDir);
+    raceDb.ensureAnalysisTables();
+  });
+
+  afterEach(() => {
+    raceDb.close();
+    cleanupDir(tmpDir);
+  });
+
+  const THRESHOLDS = JSON.stringify({ tws: 1.5, twa: 10, stw: 0.5, minDuration: 60 });
+
+  function makeSegments(n: number): Parameters<RaceDatabase['saveSegments']>[1] {
+    return Array.from({ length: n }, (_, i) => ({
+      startTime: `2026-01-01T10:0${i}:00Z`,
+      endTime: `2026-01-01T10:0${i}:59Z`,
+      durationS: 59,
+      meanTws: 12,
+      meanTwa: 90,
+      meanStw: 6.5,
+      stdTws: 0.3,
+      stdTwa: 2,
+      stdStw: 0.1,
+      percentPolar: 95,
+      sailConfig: 'J1',
+      thresholds: THRESHOLDS,
+    }));
+  }
+
+  it('normal replacement succeeds — new records present, old records gone', () => {
+    const race = raceDb.createRace('test');
+    const raceId = race.id;
+
+    // Save 2 segments, then replace with 3 different ones
+    raceDb.saveSegments(raceId, makeSegments(2));
+    expect(raceDb.getSegments(raceId).length).toBe(2);
+
+    raceDb.saveSegments(raceId, makeSegments(3));
+    expect(raceDb.getSegments(raceId).length).toBe(3);
+  });
+
+  it('INSERT failure mid-transaction → original records remain intact (DELETE rolled back)', () => {
+    const race = raceDb.createRace('test');
+    const raceId = race.id;
+
+    // Seed 2 original segments
+    raceDb.saveSegments(raceId, makeSegments(2));
+    expect(raceDb.getSegments(raceId).length).toBe(2);
+
+    // Try to save a batch where one entry has a value that will cause an
+    // sqlite UNIQUE/NOT NULL constraint violation.  We do this by passing a
+    // segment whose raceId doesn't exist (foreign-key violation when FK
+    // enforcement is on), or by pushing a null into a NOT NULL column.
+    // The simplest portable approach: break a NOT NULL column via the raw DB.
+    const raw = raceDb.getRaw();
+    raw.pragma('foreign_keys = ON');
+
+    expect(() => {
+      // Mix valid segments with one that has null thresholds (NOT NULL column) — forces INSERT failure
+      const badSegs = [
+        ...makeSegments(1),
+        { ...makeSegments(1)[0], thresholds: null },
+      ] as Parameters<RaceDatabase['saveSegments']>[1];
+      raceDb.saveSegments(raceId, badSegs);
+    }).toThrow();
+
+    // Original 2 segments must still be present (transaction was rolled back)
+    expect(raceDb.getSegments(raceId).length).toBe(2);
+  });
+
+  it('saveSailTags normal replacement — new tags present, old tags gone', () => {
+    const race = raceDb.createRace('test');
+    const raceId = race.id;
+
+    raceDb.saveSailTags(raceId, [{ sailConfig: 'J1', startTime: '2026-01-01T10:00:00Z', endTime: '2026-01-01T10:30:00Z' }]);
+    expect(raceDb.getSailTags(raceId).length).toBe(1);
+
+    raceDb.saveSailTags(raceId, [
+      { sailConfig: 'A2', startTime: '2026-01-01T10:00:00Z', endTime: '2026-01-01T10:15:00Z' },
+      { sailConfig: 'A3', startTime: '2026-01-01T10:15:00Z', endTime: '2026-01-01T10:30:00Z' },
+    ]);
+    expect(raceDb.getSailTags(raceId).length).toBe(2);
+    expect((raceDb.getSailTags(raceId)[0] as any).sail_config).toBe('A2');
+  });
+});
+
+// ===================================================================
+// BE7 — Interrupted-recording recovery (PRD §3.7)
+// ===================================================================
+
+describe('BE7: Interrupted-recording recovery (PRD §3.7)', () => {
+  let tmpDir: string;
+  let raceDb: RaceDatabase;
+
+  beforeEach(() => {
+    tmpDir = path.join(os.tmpdir(), 'n2k-be7-' + Date.now());
+    fs.mkdirSync(tmpDir, { recursive: true });
+    raceDb = new RaceDatabase(path.join(tmpDir, 'test.db'), tmpDir);
+  });
+
+  afterEach(() => {
+    raceDb.close();
+    cleanupDir(tmpDir);
+  });
+
+  it('race with end_time IS NULL → detected as interrupted, not discarded', () => {
+    const race = raceDb.createRace('interrupted');
+    const raceId = race.id;
+
+    // Simulate some N2K data arriving
+    raceDb.batchInsertPoints([
+      { raceId, timestamp: '2026-08-22T18:42:10.000Z', pgn: 128259, data: '{"speedWaterReferenced":3.0}' },
+      { raceId, timestamp: '2026-08-22T18:42:17.000Z', pgn: 130306, data: '{"windSpeed":5.0}' },
+    ]);
+
+    // Do NOT call finalizeRace() — simulate crash
+
+    const info = raceDb.detectInterruptedRecording(raceId);
+    expect(info).not.toBeNull();
+    expect(info!.wasInterrupted).toBe(true);
+    expect(info!.recoveredEndTime).toBe('2026-08-22T18:42:17.000Z');
+  });
+
+  it('recovered recording remains accessible for analysis (race has end_time after recovery)', () => {
+    const race = raceDb.createRace('interrupted');
+    const raceId = race.id;
+
+    raceDb.batchInsertPoints([
+      { raceId, timestamp: '2026-08-22T18:42:17.000Z', pgn: 128259, data: '{}' },
+    ]);
+
+    raceDb.detectInterruptedRecording(raceId);
+
+    // Race should now have an end_time (derived from last sample) so it is
+    // no longer "active" but is accessible via getRaceById
+    const recovered = raceDb.getRaceById(raceId);
+    expect(recovered).not.toBeUndefined();
+    expect(recovered!.end_time).toBe('2026-08-22T18:42:17.000Z');
+    expect(recovered!.was_interrupted).toBe(1);
+    expect(recovered!.recovered_end_time).toBe('2026-08-22T18:42:17.000Z');
+  });
+
+  it('clean stop → not flagged as interrupted', () => {
+    const race = raceDb.createRace('clean');
+    const raceId = race.id;
+
+    raceDb.batchInsertPoints([
+      { raceId, timestamp: '2026-08-22T18:00:00.000Z', pgn: 128259, data: '{}' },
+    ]);
+    raceDb.finalizeRace(raceId); // clean stop
+
+    const info = raceDb.detectInterruptedRecording(raceId);
+    expect(info).not.toBeNull();
+    expect(info!.wasInterrupted).toBe(false);
+    expect(info!.recoveredEndTime).toBeNull();
+  });
+
+  it('interrupted recording with no N2K samples → recoveredEndTime is null', () => {
+    const race = raceDb.createRace('empty');
+    const raceId = race.id;
+    // No points inserted at all
+
+    const info = raceDb.detectInterruptedRecording(raceId);
+    expect(info).not.toBeNull();
+    expect(info!.wasInterrupted).toBe(true);
+    expect(info!.recoveredEndTime).toBeNull();
   });
 });

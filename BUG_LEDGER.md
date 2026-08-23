@@ -1,5 +1,16 @@
 # Bug Ledger — n2k-race-logger
 
+## QF1 — Linear TWA band filter over circular-mean value (2026-08-22)
+
+- **Reproduction:** Port-tack downwind segments (e.g., TWA ≈ −170°) never appeared in the `[150, 180]` performance band. `aggregatePerformance` returned null for the downwind cell despite valid port-tack data being present. The mirror starboard cell (positive TWA ≈ +170) correctly matched, producing an asymmetric and misleading performance table.
+- **Root cause:** `aggregatePerformance` filtered segments with `s.meanTwa >= twaBand[0] && s.meanTwa < twaBand[1]` — a linear inequality. Since P0 (Phase 2.8) introduced circular mean for TWA, port-tack `meanTwa` is now stored as a *signed* value (negative = port). The TWA bands are defined as `[0, 180]` (absolute angles). A linear filter cannot match negative values against a positive band: −170 is never ≥ 150.
+- **Fix:** Changed filter to `Math.abs(s.meanTwa) >= twaBand[0] && Math.abs(s.meanTwa) < twaBand[1]`. Per-segment `meanTwa` retains its sign (port = negative) in storage and in `DetectedSegmentData`; only the band-matching step uses the absolute value. This is the minimal correct fix: it preserves stored sign for display while making band aggregation sign-agnostic as the band definitions intend.
+- **Regression coverage:** `analysis-engine.test.ts` — two new QF1 tests:
+  - Port-tack segment with `meanTwa ≈ −170` maps into `[150, 180]` band.
+  - Starboard-tack and port-tack segments with equal absolute TWA aggregate into the same band and average is computed over both.
+- **Check for same class elsewhere:** `interpolateSpeed` in `analysis-engine.ts` guards `twa < 0` → returns null (line ~574). This is correct for polar lookup (table is defined 0..180). The `computeSegmentPerformance` path calls `interpolateSpeed(…, seg.meanTwa)` — if `seg.meanTwa` is negative (port tack), this returns null and `percentPolar` remains null. **QA should verify** that polar performance is also computed correctly for port-tack segments (may require `Math.abs` there too — left for QA Gate 2b).
+- **Prevention:** When circular-mean values are stored as signed but consumed by range checks, always canonicalize to absolute/[0,180] at the filter boundary. Add a linter note or comment near `TWA_BANDS` to document the expected convention.
+
 Track recurring defects, root causes, regression coverage, and verification evidence.
 
 ## Phase 2.4 Excel export production audit failure (2026-07-30)

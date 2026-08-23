@@ -70,8 +70,8 @@ const RAD_TO_DEG = 180 / Math.PI;
  * Result is in [−180, 180]: positive = clockwise, negative = counter-clockwise.
  *
  * Correctly handles the ±180° boundary, e.g.
- *   shortestAngularDiff(179, -179) → -2   (2° counter-clockwise)
- *   shortestAngularDiff(-179, 179) →  2   (2° clockwise)
+ *   shortestAngularDiff(179, -179) →  2   (2° clockwise)
+ *   shortestAngularDiff(-179, 179) → -2   (2° counter-clockwise)
  */
 export function shortestAngularDiff(a: number, b: number): number {
   let diff = ((b - a) % 360 + 360) % 360;

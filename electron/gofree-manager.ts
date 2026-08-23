@@ -576,7 +576,11 @@ export class GoFreeManager extends EventEmitter {
       const available: number[] = Array.isArray(parsed.DataList.list)
         ? parsed.DataList.list
         : [];
-      this.emit('debug', `[GoFree] DataList received — ${available.length} channels available`);
+      // Log the full channel list so we can identify unknown channels.
+      this.emit(
+        'debug',
+        `[GoFree] DataList received — ${available.length} channels: [${available.join(',')}]`,
+      );
       this.subscribeAll(available.length > 0 ? available : []);
       return;
     }

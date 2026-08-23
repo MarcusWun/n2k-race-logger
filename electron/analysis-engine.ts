@@ -10,11 +10,29 @@ import type { PolarTable } from './polar-engine';
 import type { InterpolationMethod } from './polar-engine';
 export type { InterpolationMethod };
 import { pchip, akima } from './spline';
-import { normalizeWindAngle, type WindSide } from './wind-utils';
+import { normalizeWindAngle, shortestAngularDiff, circularMean, type WindSide } from './wind-utils';
+import { type TimedValue, getFreshValue } from './timed-value';
 
 // Unit conversion constants (same as Dashboard.tsx)
 const MS_TO_KTS = 1.94384;
 const RAD_TO_DEG = 180 / Math.PI;
+
+// ---------------------------------------------------------------------------
+// Freshness thresholds — PRD §3.2 (P0)
+// A cached value older than its threshold produces null rather than a stale
+// carry-forward, preserving gap detection in the resampler downstream.
+// ---------------------------------------------------------------------------
+
+/** AWS and AWA must be within this window of each other for TWS/TWA calculation. */
+const AWS_AWA_PAIR_MS = 1_500;
+/** Maximum age of AWS or AWA before it is too stale for carry-forward display. */
+const AWS_AWA_FRESHNESS_MS = 2_000;
+/** Maximum age of STW before it is dropped from carry-forward. */
+const STW_FRESHNESS_MS = 10_000;
+/** Maximum age of Heading before it is dropped from carry-forward. */
+const HDG_FRESHNESS_MS = 5_000;
+/** Maximum age of SOG before it is dropped from carry-forward. */
+const SOG_FRESHNESS_MS = 5_000;
 
 // --- Types ---
 
@@ -182,36 +200,39 @@ export function reconstructTimeSeries(rows: RawPGNRow[]): TimeSeries {
     aws: [], awa: [], awaSide: [], heading: [], sog: [], cog: [],
   };
 
-  // Track last known values for interpolation of computed fields
-  let lastAws: number | null = null;
-  let lastAwa: number | null = null;
-  let lastStw: number | null = null;
-  let lastHeading: number | null = null;
-  let lastSog: number | null = null;
+  // Track last known values for freshness-limited carry-forward (PRD §3.2).
+  // Each field now carries its observation timestamp so stale values produce
+  // null rather than silently substituting for missing sensor data.
+  let lastAws: TimedValue | null = null;
+  let lastAwa: TimedValue | null = null;
+  let lastStw: TimedValue | null = null;
+  let lastHeading: TimedValue | null = null;
+  let lastSog: TimedValue | null = null;
 
   for (const ts of sortedTimes) {
     const p = rawPoints.get(ts)!;
 
-    // Update last known values
-    if (p.aws != null) lastAws = p.aws;
-    if (p.awa != null) lastAwa = p.awa;
-    if (p.stw != null) lastStw = p.stw;
-    if (p.heading != null) lastHeading = p.heading;
-    if (p.sog != null) lastSog = p.sog;
+    // Update last known values (with current row's timestamp)
+    if (p.aws != null) lastAws = { value: p.aws, timestamp: ts };
+    if (p.awa != null) lastAwa = { value: p.awa, timestamp: ts };
+    if (p.stw != null) lastStw = { value: p.stw, timestamp: ts };
+    if (p.heading != null) lastHeading = { value: p.heading, timestamp: ts };
+    if (p.sog != null) lastSog = { value: p.sog, timestamp: ts };
 
-    // STW, SOG, COG, heading — direct from PGN
-    result.stw.push({ time: ts, value: p.stw ?? lastStw });
-    result.sog.push({ time: ts, value: p.sog ?? lastSog });
-    result.cog.push({ time: ts, value: p.cog ?? null });
-    result.heading.push({ time: ts, value: p.heading ?? lastHeading });
-    result.aws.push({ time: ts, value: p.aws ?? lastAws });
+    // STW, SOG, COG, heading — carry forward only within freshness window.
+    // Stale carry-forwards produce null, preserving gap detection in the resampler.
+    result.stw.push({ time: ts, value: p.stw ?? getFreshValue(lastStw, ts, STW_FRESHNESS_MS) });
+    result.sog.push({ time: ts, value: p.sog ?? getFreshValue(lastSog, ts, SOG_FRESHNESS_MS) });
+    result.cog.push({ time: ts, value: p.cog ?? null }); // COG was never carried forward
+    result.heading.push({ time: ts, value: p.heading ?? getFreshValue(lastHeading, ts, HDG_FRESHNESS_MS) });
+    result.aws.push({ time: ts, value: p.aws ?? getFreshValue(lastAws, ts, AWS_AWA_FRESHNESS_MS) });
 
-    const rawAwa = p.awa ?? lastAwa;
+    const rawAwaFresh = p.awa ?? getFreshValue(lastAwa, ts, AWS_AWA_FRESHNESS_MS);
     // Store signed angle: negative = port, positive = starboard. StripCharts uses
     // Math.abs() for Y-axis and the sign for port/starboard display.
-    const signedAwa = rawAwa != null ? normalizeWindAngle(rawAwa).signedAngle : null;
+    const signedAwa = rawAwaFresh != null ? normalizeWindAngle(rawAwaFresh).signedAngle : null;
     result.awa.push({ time: ts, value: signedAwa });
-    result.awaSide.push({ time: ts, value: rawAwa != null ? normalizeWindAngle(rawAwa).side : null });
+    result.awaSide.push({ time: ts, value: rawAwaFresh != null ? normalizeWindAngle(rawAwaFresh).side : null });
 
     // True wind: prefer direct PGN values, fall back to computed
     let tws: number | null = p.tws_direct ?? null;
@@ -219,21 +240,36 @@ export function reconstructTimeSeries(rows: RawPGNRow[]): TimeSeries {
     let twd: number | null = p.twd_direct ?? null;
 
     if (tws == null || twa == null) {
-      // Compute from apparent wind
-      const aws = p.aws ?? lastAws;
-      const awa = p.awa ?? lastAwa;
-      const stw = p.stw ?? lastStw ?? lastSog ?? 0;
-      if (aws != null && awa != null) {
-        // computeTrueWind needs the raw 0..360 angle to preserve side before
-        // final normalization.
-        const tw = computeTrueWind(aws, awa, stw);
-        if (tws == null) tws = tw.tws;
-        if (twa == null) twa = tw.twa;
+      // Compute from apparent wind with freshness + contemporaneous pairing (PRD §3.2).
+      // AWS and AWA must both be within AWS_AWA_FRESHNESS_MS of the current row AND
+      // within AWS_AWA_PAIR_MS of each other.  If either is stale, skip TWS/TWA.
+      const awsFresh = p.aws != null
+        ? { value: p.aws, ts }
+        : (lastAws && ts - lastAws.timestamp <= AWS_AWA_FRESHNESS_MS ? { value: lastAws.value, ts: lastAws.timestamp } : null);
+      const awaFresh = p.awa != null
+        ? { value: p.awa, ts }
+        : (lastAwa && ts - lastAwa.timestamp <= AWS_AWA_FRESHNESS_MS ? { value: lastAwa.value, ts: lastAwa.timestamp } : null);
+
+      if (awsFresh !== null && awaFresh !== null) {
+        // Contemporaneous check: the two readings must be within AWS_AWA_PAIR_MS of each other
+        const pairAgeDiff = Math.abs(awsFresh.ts - awaFresh.ts);
+        if (pairAgeDiff <= AWS_AWA_PAIR_MS) {
+          const stw =
+            p.stw ??
+            getFreshValue(lastStw, ts, STW_FRESHNESS_MS) ??
+            getFreshValue(lastSog, ts, SOG_FRESHNESS_MS) ??
+            0;
+          // computeTrueWind needs the raw 0..360 angle to preserve side before
+          // final normalization.
+          const tw = computeTrueWind(awsFresh.value, awaFresh.value, stw);
+          if (tws == null) tws = tw.tws;
+          if (twa == null) twa = tw.twa;
+        }
       }
     }
 
     if (twd == null && twa != null) {
-      const heading = p.heading ?? lastHeading;
+      const heading = p.heading ?? getFreshValue(lastHeading, ts, HDG_FRESHNESS_MS);
       if (heading != null) {
         twd = (heading + twa) % 360;
       }
@@ -312,6 +348,30 @@ function stddev(values: number[], avg: number): number {
   return Math.sqrt(variance);
 }
 
+/**
+ * Angular standard deviation for signed TWA angles (degrees).
+ * Uses deviations from the circular mean via shortestAngularDiff so that
+ * the ±180° boundary does not inflate spread (PRD §3.3).
+ */
+function circularStdDev(angles: number[]): number {
+  if (angles.length < 2) return 0;
+  const mu = circularMean(angles);
+  const diffs = angles.map((a) => shortestAngularDiff(mu, a));
+  const variance = diffs.reduce((s, d) => s + d * d, 0) / (diffs.length - 1);
+  return Math.sqrt(variance);
+}
+
+/**
+ * Returns true if all `angles` (degrees, signed TWA convention) lie within
+ * `halfRangeDeg` of the circular mean.  Replaces the old `max − min` range
+ * check so that values near the ±180° boundary are handled correctly (PRD §3.3).
+ */
+function isCircularlyStable(angles: number[], halfRangeDeg: number): boolean {
+  if (angles.length === 0) return false;
+  const mu = circularMean(angles);
+  return angles.every((a) => Math.abs(shortestAngularDiff(mu, a)) <= halfRangeDeg);
+}
+
 interface QualifyingWindow {
   startIdx: number;
   endIdx: number;
@@ -334,15 +394,20 @@ export function detectSegments(
 
   // Step 1: Find all qualifying windows of minDuration length
   const qualifying: QualifyingWindow[] = [];
+  // TWS and STW use linear range checks; TWA uses circular stability (PRD §3.3)
+  // so that downwind angles near ±180° are not incorrectly penalised.
   const twsThresh = thresholds.tws * 2; // range threshold (±threshold → total spread = 2×)
-  const twaThresh = thresholds.twa * 2;
   const stwThresh = thresholds.stw * 2;
+  // twa half-range for circular check: angles must stay within thresholds.twa of the mean.
+  // This is semantically equivalent to the old (twaMax - twaMin ≤ thresholds.twa * 2) check
+  // for symmetric distributions, but remains correct near the ±180° wrap.
+  const twaHalfRange = thresholds.twa;
 
   for (let start = 0; start <= n - minWindowSize; start++) {
     // Check if window [start, start+minWindowSize) qualifies
     let twsMin = Infinity, twsMax = -Infinity;
-    let twaMin = Infinity, twaMax = -Infinity;
     let stwMin = Infinity, stwMax = -Infinity;
+    const twaWindowVals: number[] = [];
     let valid = true;
 
     for (let i = start; i < start + minWindowSize; i++) {
@@ -355,8 +420,7 @@ export function detectSegments(
       const sv = stw[i].value!;
       if (tv < twsMin) twsMin = tv;
       if (tv > twsMax) twsMax = tv;
-      if (av < twaMin) twaMin = av;
-      if (av > twaMax) twaMax = av;
+      twaWindowVals.push(av);
       if (sv < stwMin) stwMin = sv;
       if (sv > stwMax) stwMax = sv;
     }
@@ -364,7 +428,7 @@ export function detectSegments(
     if (!valid) continue;
 
     if (twsMax - twsMin <= twsThresh &&
-        twaMax - twaMin <= twaThresh &&
+        isCircularlyStable(twaWindowVals, twaHalfRange) &&
         stwMax - stwMin <= stwThresh) {
       qualifying.push({ startIdx: start, endIdx: start + minWindowSize - 1 });
     }
@@ -409,7 +473,10 @@ export function detectSegments(
     if (meanStw < 1.0) continue;
 
     const meanTws = mean(twsVals);
-    const meanTwa = mean(twaVals);
+    // Use circular mean for TWA so that downwind angles near ±180° are handled
+    // correctly (PRD §3.3).  circularStdDev uses shortestAngularDiff from the
+    // circular mean, so it is also immune to the ±180° wrap.
+    const meanTwa = circularMean(twaVals);
     const durationS = (tws[win.endIdx].time - tws[win.startIdx].time) / 1000;
 
     segments.push({
@@ -420,7 +487,7 @@ export function detectSegments(
       meanTwa,
       meanStw,
       stdTws: stddev(twsVals, meanTws),
-      stdTwa: stddev(twaVals, meanTwa),
+      stdTwa: circularStdDev(twaVals),
       stdStw: stddev(stwVals, meanStw),
       percentPolar: null,
       sailConfig: null,

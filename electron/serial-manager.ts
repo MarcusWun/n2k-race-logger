@@ -65,6 +65,15 @@ try {
   console.warn('[SerialManager] canboatjs unavailable:', (err as Error).message);
 }
 
+// ---------------------------------------------------------------------------
+// BE1 — Capped exponential backoff ladder (PRD §3.1)
+// Matches the H5000 GoFree pattern: 1 s → 2 s → 5 s → 10 s → 10 s …
+// ---------------------------------------------------------------------------
+const DEFAULT_BACKOFF_LADDER_MS: readonly number[] = [1_000, 2_000, 5_000, 10_000];
+
+/** Default watchdog timeout in ms.  No valid PGN for this long → 'stale'. */
+const DEFAULT_WATCHDOG_TIMEOUT_MS = 5_000;
+
 export interface SerialSettings {
   port: string;
   baud: number;
@@ -78,7 +87,11 @@ export interface ConnectionStatusEvent {
   baud?: number;
   host?: string;
   tcpPort?: number;
-  status: 'disconnected' | 'connecting' | 'connected' | 'error';
+  /**
+   * 'stale'        — serial port is open but no valid PGN received for watchdogTimeoutMs.
+   * 'reconnecting' — unexpected close/error; waiting before retry.
+   */
+  status: 'disconnected' | 'connecting' | 'connected' | 'error' | 'stale' | 'reconnecting';
   error?: string;
 }
 
@@ -100,6 +113,48 @@ export interface SanitizedTcpTarget {
   tcpPort: number;
   corrected: boolean;
   warning?: string;
+}
+
+/**
+ * Injectable dependencies and configuration for SerialManager.
+ * All options are optional; production code uses defaults.
+ * Tests inject SerialPortImpl / canboatImpl to avoid needing real hardware.
+ *
+ * PRD §3.1 — NGT-1 Disconnect/Error Hardening (P0)
+ */
+export interface SerialManagerOptions {
+  /** Injectable SerialPort constructor (default: runtime require('serialport').SerialPort). */
+  SerialPortImpl?: any;
+  /**
+   * Injectable canboatjs implementation.
+   * Pass `null` to disable canboat decoding (raw bytes only).
+   * Pass `{ FromPgn, serial }` to use a custom/mock implementation.
+   * Default: runtime require('@canboat/canboatjs').
+   */
+  canboatImpl?: { FromPgn: any; serial: any } | null;
+  /**
+   * BE1: Backoff ladder in ms.  The last value repeats indefinitely.
+   * Default: [1000, 2000, 5000, 10000]
+   */
+  backoffLadderMs?: number[];
+  /**
+   * BE1: Watchdog timeout in ms.  If no valid PGN is received for this period
+   * while the serial port is open, the manager transitions to 'stale'.
+   * Default: 5000.  Set to 0 to disable the watchdog.
+   */
+  watchdogTimeoutMs?: number;
+  /**
+   * Override the baud rates to probe during auto-detection.
+   * Pass a single-element array to skip detection and treat it as the last
+   * (i.e. only) attempt — useful in unit tests.
+   * Default: [115200, 230400]
+   */
+  baudRatesToTry?: number[];
+  /**
+   * Delay in ms after sendNGTStartup() before setting up the decoder pipeline.
+   * Default: 200.  Set to 0 in tests to avoid real timer waits.
+   */
+  initDelayMs?: number;
 }
 
 const DEFAULT_TCP_HOST = '192.168.1.1';
@@ -167,9 +222,83 @@ export class SerialManager extends EventEmitter {
     tcpPort: DEFAULT_TCP_PORT,
   };
 
-  constructor() {
+  // ---------------------------------------------------------------------------
+  // BE1: Reconnect / watchdog state (PRD §3.1)
+  // ---------------------------------------------------------------------------
+
+  /** Watchdog fires if no valid PGN arrives within watchdogTimeoutMs. */
+  private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Scheduled reconnect after unexpected disconnect/error. */
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Index into backoffLadderMs; increments on each failure, caps at last entry. */
+  private backoffIndex = 0;
+  /** Epoch ms of the most recent valid PGN; null until first PGN received. */
+  lastValidPgnAt: number | null = null;
+  /** True while inside a user-initiated disconnect so close events are ignored. */
+  private userInitiatedStop = false;
+  /** Tracked serial connection status for state-transition logic. */
+  private _currentSerialStatus: ConnectionStatusEvent['status'] = 'disconnected';
+
+  // Configurable options (set in constructor from SerialManagerOptions)
+  private readonly _watchdogTimeoutMs: number;
+  private readonly _backoffLadderMs: readonly number[];
+  private readonly _baudRatesToTry: number[] | null;
+  private readonly _initDelayMs: number;
+
+  // Per-instance injectable implementations (for testing without real hardware)
+  private readonly _SerialPortImpl: any;
+  private readonly _serialAvailable: boolean;
+  private readonly _FromPgnImpl: any;
+  private readonly _ActisenseStreamImpl: any;
+  private readonly _canboatAvailable: boolean;
+
+  constructor(options?: SerialManagerOptions) {
     super();
+
+    this._watchdogTimeoutMs = options?.watchdogTimeoutMs ?? DEFAULT_WATCHDOG_TIMEOUT_MS;
+    this._backoffLadderMs = options?.backoffLadderMs ?? DEFAULT_BACKOFF_LADDER_MS;
+    this._baudRatesToTry = options?.baudRatesToTry ?? null;
+    this._initDelayMs = options?.initDelayMs ?? 200;
+
+    // Resolve injectable implementations
+    if (options?.SerialPortImpl !== undefined) {
+      this._SerialPortImpl = options.SerialPortImpl;
+      this._serialAvailable = true;
+    } else {
+      this._SerialPortImpl = SerialPort;
+      this._serialAvailable = serialAvailable;
+    }
+
+    if (options?.canboatImpl !== undefined) {
+      if (options.canboatImpl === null) {
+        this._FromPgnImpl = null;
+        this._ActisenseStreamImpl = null;
+        this._canboatAvailable = false;
+      } else {
+        this._FromPgnImpl = options.canboatImpl.FromPgn;
+        this._ActisenseStreamImpl = options.canboatImpl.serial;
+        this._canboatAvailable = true;
+      }
+    } else {
+      this._FromPgnImpl = FromPgn;
+      this._ActisenseStreamImpl = ActisenseStream;
+      this._canboatAvailable = canboatAvailable;
+    }
+
     this.loadSettings();
+
+    // BE1: Listen to own 'pgn' events to drive watchdog and liveness tracking.
+    // This lets tests inject PGN events directly on the manager instance without
+    // needing to wire through the full BST → canboatjs decoder chain.
+    this.on('pgn', () => {
+      if (this.activeMode !== 'serial') return;
+      this.lastValidPgnAt = Date.now();
+      if (this._currentSerialStatus === 'stale') {
+        // Transition back to 'connected' — data has resumed
+        this._emitSerialStatus('connected');
+      }
+      this._resetWatchdog();
+    });
   }
 
   private loadSettings(): void {
@@ -208,20 +337,24 @@ export class SerialManager extends EventEmitter {
   }
 
   isAvailable(): boolean {
-    return serialAvailable;
+    return this._serialAvailable;
   }
 
+  /**
+   * Returns true only if the port is open AND valid PGN data has been received.
+   * An open-but-silent port returns false (PRD §3.1 — port alone not sufficient).
+   */
   isConnected(): boolean {
     if (this.activeMode === 'serial') {
-      return this.port?.isOpen === true;
+      return this._currentSerialStatus === 'connected';
     }
     return this.tcpSocket !== null && !this.tcpSocket.destroyed;
   }
 
   async listPorts(): Promise<Array<{ path: string; manufacturer?: string; productId?: string; vendorId?: string }>> {
-    if (!serialAvailable) return [];
+    if (!this._serialAvailable) return [];
     try {
-      const ports = await SerialPort.list();
+      const ports = await this._SerialPortImpl.list();
       return ports.map((p: any) => ({
         path: p.path,
         manufacturer: p.manufacturer || undefined,
@@ -239,9 +372,9 @@ export class SerialManager extends EventEmitter {
    * Listens for 'pgn' events (parsed PGN objects) and 'warning' events.
    */
   private createPgnParser(): any {
-    if (!canboatAvailable) return null;
+    if (!this._canboatAvailable || !this._FromPgnImpl) return null;
 
-    const parser = new FromPgn({ url: '' });
+    const parser = new this._FromPgnImpl({ url: '' });
 
     // canboatjs FromPgn emits 'pgn' events with parsed PGN data
     parser.on('pgn', (pgn: any) => {
@@ -297,7 +430,7 @@ export class SerialManager extends EventEmitter {
   private static readonly BAUD_DETECT_TIMEOUT_MS = 5000;
 
   private async connectSerial(options?: { port?: string; baud?: number }): Promise<void> {
-    if (!serialAvailable) {
+    if (!this._serialAvailable) {
       throw new Error('Serial port modules are not available. Reinstall the app or check native module bindings.');
     }
 
@@ -305,14 +438,20 @@ export class SerialManager extends EventEmitter {
     const portPath = options?.port || this.settings.port;
     const requestedBaud = options?.baud || this.settings.baud;
 
-    // Try the requested/saved baud rate first, then fall back to alternatives
-    const baudOrder = [requestedBaud, ...SerialManager.BAUD_RATES.filter(b => b !== requestedBaud)];
+    // Use injected baud rate list if provided (allows tests to use a single rate),
+    // otherwise try the requested/saved rate first, then fall back to alternatives.
+    let baudOrder: number[];
+    if (this._baudRatesToTry) {
+      baudOrder = this._baudRatesToTry;
+    } else {
+      baudOrder = [requestedBaud, ...SerialManager.BAUD_RATES.filter(b => b !== requestedBaud)];
+    }
 
     for (let i = 0; i < baudOrder.length; i++) {
       const baudRate = baudOrder[i];
       const isLastAttempt = i === baudOrder.length - 1;
 
-      this.emit('status', { mode: 'serial', port: portPath, baud: baudRate, status: 'connecting' });
+      this._emitSerialStatus('connecting');
 
       try {
         const connected = await this.tryConnectAtBaud(portPath, baudRate, isLastAttempt);
@@ -320,13 +459,7 @@ export class SerialManager extends EventEmitter {
         // No data at this baud rate — try the next one
         console.log(`[SerialManager] No data at ${baudRate} baud, trying next rate...`);
       } catch (err: any) {
-        this.emit('status', {
-          mode: 'serial',
-          port: portPath,
-          baud: baudRate,
-          status: 'error',
-          error: err?.message || 'Unknown connection error',
-        });
+        this._emitSerialStatus('error', err?.message || 'Unknown connection error');
         this.port = null;
         this.pgnParser = null;
         return;
@@ -340,7 +473,7 @@ export class SerialManager extends EventEmitter {
    * On the last attempt, connects without waiting for data confirmation.
    */
   private async tryConnectAtBaud(portPath: string, baudRate: number, isLastAttempt: boolean): Promise<boolean> {
-    this.port = new SerialPort({
+    this.port = new this._SerialPortImpl({
       path: portPath,
       baudRate,
       parity: 'none',
@@ -357,14 +490,16 @@ export class SerialManager extends EventEmitter {
     // Send NGT-1 initialization command, wait for device to respond,
     // then decode BST framing and parse PGN data.
     this.sendNGTStartup();
-    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+    if (this._initDelayMs > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, this._initDelayMs));
+    }
 
     this.pgnParser = this.createPgnParser();
-    if (this.pgnParser && ActisenseStream) {
+    if (this.pgnParser && this._ActisenseStreamImpl) {
       // ActisenseStream is a proper Transform stream that decodes BST framing
       // (DLE/STX/ETX with byte stuffing) and pushes decoded N2K binary frames.
       // FromPgn is NOT a stream — feed decoded frames via parseBuffer().
-      this.bstDecoder = new ActisenseStream({ fromFile: true, reconnect: false, app: new EventEmitter() });
+      this.bstDecoder = new this._ActisenseStreamImpl({ fromFile: true, reconnect: false, app: new EventEmitter() });
       // Mark output as available so ActisenseStream doesn't try to configure
       // transmit PGNs via this.serial (which is null in fromFile mode).
       this.bstDecoder.outAvailable = true;
@@ -392,10 +527,7 @@ export class SerialManager extends EventEmitter {
 
       if (!gotData) {
         // Clean up this attempt before trying next baud rate
-        if (this.keepaliveInterval) {
-          clearInterval(this.keepaliveInterval);
-          this.keepaliveInterval = null;
-        }
+        this._clearKeepalive();
         if (this.bstDecoder) {
           this.bstDecoder.removeAllListeners();
           this.bstDecoder = null;
@@ -425,8 +557,152 @@ export class SerialManager extends EventEmitter {
     this.settings.baud = baudRate;
     this.saveSettings();
 
-    this.emit('status', { mode: 'serial', port: portPath, baud: baudRate, status: 'connected' });
+    // BE1: Attach persistent error/close handlers to detect unexpected disconnects.
+    // These are set up AFTER port open so they only fire during an active session.
+    this.port.on('error', (err: Error) => {
+      if (this.userInitiatedStop) return;
+      console.error('[SerialManager] Serial port error:', err.message);
+      this._handleSerialDisconnect(`Serial error: ${err.message}`);
+    });
+
+    this.port.on('close', () => {
+      if (this.userInitiatedStop) return;
+      console.warn('[SerialManager] Serial port closed unexpectedly');
+      this._handleSerialDisconnect('Port closed unexpectedly');
+    });
+
+    // BE1: Port being open is not sufficient for 'connected'.
+    // Emit 'connected' now so the renderer knows the physical link is up, then
+    // start the watchdog — if no PGN arrives within watchdogTimeoutMs the state
+    // transitions to 'stale'.  The 'pgn' listener in the constructor handles
+    // watchdog resets and the stale → connected recovery.
+    this._emitSerialStatus('connected');
+    this._startWatchdog();
+
     return true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // BE1: Watchdog helpers (PRD §3.1)
+  // ---------------------------------------------------------------------------
+
+  private _startWatchdog(): void {
+    if (this._watchdogTimeoutMs <= 0) return;
+    this._clearWatchdog();
+    this.watchdogTimer = setTimeout(() => {
+      this.watchdogTimer = null;
+      if (this._currentSerialStatus === 'connected' || this._currentSerialStatus === 'stale') {
+        console.warn(`[SerialManager] Watchdog: no valid PGN for ${this._watchdogTimeoutMs} ms → stale`);
+        this._emitSerialStatus('stale');
+      }
+    }, this._watchdogTimeoutMs);
+  }
+
+  private _clearWatchdog(): void {
+    if (this.watchdogTimer !== null) {
+      clearTimeout(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
+  private _resetWatchdog(): void {
+    this._startWatchdog();
+  }
+
+  // ---------------------------------------------------------------------------
+  // BE1: Unexpected disconnect / reconnect with capped exponential backoff (PRD §3.1)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Central failure handler for unexpected serial disconnects and errors.
+   *
+   * 1. Clears ALL session state (keepalive, watchdog, decoder, parser, port)
+   *    so that no stale timer or state can fire against a subsequent session.
+   * 2. Schedules a reconnect using the capped exponential backoff ladder.
+   *
+   * NOT called on user-initiated disconnects.
+   */
+  private _handleSerialDisconnect(reason: string): void {
+    // Guard: if a reconnect is already scheduled, do not stack another one.
+    if (this.reconnectTimer !== null) return;
+
+    // Clear all per-session resources before scheduling reconnect
+    this._clearAllSerialSession();
+
+    const delay = this._backoffLadderMs[Math.min(this.backoffIndex, this._backoffLadderMs.length - 1)];
+    this.backoffIndex++;
+
+    console.log(`[SerialManager] Unexpected disconnect (${reason}). Reconnecting in ${delay} ms (attempt ${this.backoffIndex})`);
+    this._emitSerialStatus('reconnecting');
+
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      try {
+        await this.connectSerial({ port: this.settings.port, baud: this.settings.baud });
+      } catch (err) {
+        // connectSerial failed — schedule another reconnect
+        this._handleSerialDisconnect(`Reconnect attempt failed: ${(err as Error).message}`);
+      }
+    }, delay);
+  }
+
+  /**
+   * Clear all per-session serial resources: keepalive, watchdog, BST decoder,
+   * PGN parser, and the serial port itself.  Safe to call multiple times.
+   * Does NOT clear the reconnect timer or backoffIndex.
+   */
+  private _clearAllSerialSession(): void {
+    this._clearKeepalive();
+    this._clearWatchdog();
+    if (this.bstDecoder) {
+      this.bstDecoder.removeAllListeners();
+      this.bstDecoder = null;
+    }
+    if (this.pgnParser) {
+      this.pgnParser.removeAllListeners();
+      this.pgnParser = null;
+    }
+    // Close port without triggering the unexpected-close handler
+    const portRef = this.port;
+    this.port = null;
+    this.lastValidPgnAt = null;
+    if (portRef && portRef.isOpen) {
+      const wasUserStop = this.userInitiatedStop;
+      this.userInitiatedStop = true; // suppress re-entrant close events
+      try {
+        portRef.close(() => { /* ignore */ });
+      } catch {
+        // ignore errors during cleanup
+      }
+      this.userInitiatedStop = wasUserStop;
+    }
+  }
+
+  private _clearKeepalive(): void {
+    if (this.keepaliveInterval) {
+      clearInterval(this.keepaliveInterval);
+      this.keepaliveInterval = null;
+    }
+  }
+
+  private _clearReconnectTimer(): void {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  /** Emit a serial-mode status event and update internal state tracker. */
+  private _emitSerialStatus(status: ConnectionStatusEvent['status'], error?: string): void {
+    this._currentSerialStatus = status;
+    const evt: ConnectionStatusEvent = {
+      mode: 'serial',
+      port: this.settings.port,
+      baud: this.settings.baud,
+      status,
+    };
+    if (error !== undefined) evt.error = error;
+    this.emit('status', evt);
   }
 
   private connectTcp(host?: string, tcpPort?: number): Promise<void> {
@@ -520,10 +796,12 @@ export class SerialManager extends EventEmitter {
   }
 
   async disconnect(): Promise<void> {
-    if (this.keepaliveInterval) {
-      clearInterval(this.keepaliveInterval);
-      this.keepaliveInterval = null;
-    }
+    // BE1: Mark stop as user-initiated so the 'close' handler does not trigger reconnect.
+    this.userInitiatedStop = true;
+    this._clearReconnectTimer();
+    this.backoffIndex = 0; // reset backoff on explicit user disconnect
+    this._clearWatchdog();
+    this._clearKeepalive();
     if (this.bstDecoder) {
       this.bstDecoder.removeAllListeners();
       this.bstDecoder = null;
@@ -542,9 +820,12 @@ export class SerialManager extends EventEmitter {
       }
     }
     this.port = null;
+    this.lastValidPgnAt = null;
 
     this.cleanupTcp();
 
+    this.userInitiatedStop = false;
+    this._currentSerialStatus = 'disconnected';
     this.emit('status', {
       mode: this.activeMode,
       port: this.settings.port,
@@ -556,6 +837,14 @@ export class SerialManager extends EventEmitter {
   }
 
   getStatus(): ConnectionStatusEvent {
+    if (this.activeMode === 'serial') {
+      return {
+        mode: 'serial',
+        port: this.settings.port,
+        baud: this.settings.baud,
+        status: this._currentSerialStatus,
+      };
+    }
     return {
       mode: this.activeMode,
       port: this.settings.port,

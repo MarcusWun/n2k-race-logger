@@ -9,43 +9,26 @@ export interface PGNMessage {
 }
 
 export interface N2KParserConfig {
-  pgnFilter: number[];
   batchIntervalMs: number;
 }
 
 export class N2KParser extends EventEmitter {
-  private pgnFilter: number[];
   private buffer: PGNMessage[] = [];
   private batchTimer: NodeJS.Timeout | null = null;
   private batchIntervalMs: number;
 
   constructor(config?: Partial<N2KParserConfig>) {
     super();
-    this.pgnFilter = config?.pgnFilter ?? [
-      128259, 129025, 129026, 129029, 127250, 130306, 130310, 127257, 129284,
-    ];
     this.batchIntervalMs = config?.batchIntervalMs ?? 250;
   }
 
   /**
-   * Set the PGN filter list.
+   * Normalize a pre-parsed PGN object from serial-manager into PGNMessage format.
+   * All PGNs pass through unconditionally — filtering is not performed here.
+   * Returns null only if the input is missing required fields.
    */
-  setPGNFilter(pgnFilter: number[]): void {
-    this.pgnFilter = [...pgnFilter];
-  }
-
-  /**
-   * Get the current PGN filter list.
-   */
-  getPGNFilter(): number[] {
-    return [...this.pgnFilter];
-  }
-
-  /**
-   * Apply the PGN filter to a pre-parsed PGN object from serial-manager.
-   * Returns a PGNMessage if the PGN is in the filter, or null if filtered out.
-   */
-  filter(parsed: ParsedPGN): PGNMessage | null {
+  normalizeParsedPgn(parsed: ParsedPGN): PGNMessage | null {
+    if (parsed.pgn == null) return null;
     return {
       pgn: parsed.pgn,
       src: parsed.src,

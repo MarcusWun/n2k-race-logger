@@ -12,6 +12,7 @@ import {
   assignSailTags,
   computeSegmentPerformance,
   aggregatePerformance,
+  computeDataQuality,
 } from './analysis-engine';
 import type { SegmentThresholds, SailTagData } from './analysis-engine';
 import { sendDebugData, getMainWebContents } from './main';
@@ -19,6 +20,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
 import { loadAppSettings, saveAppSettings, DEFAULT_SOURCE_PREFERENCES } from './settings-store';
+import { GIT_COMMIT, APP_VERSION } from './build-info';
 
 // PGN names for debug display (extended set — includes PGNs beyond the default filter)
 const PGN_DISPLAY_NAMES: Record<number, string> = {
@@ -110,6 +112,14 @@ let isRecording = false;
 let recordingStartTime: number | null = null;
 let recordingRecordCount = 0;
 
+// BE9/BE10: Per-recording session counters — reset on recording:start.
+// These accumulate events that occur while isRecording is true.
+let sessionSerialDisconnectCountAtStart = 0; // snapshot of serial manager counter at start
+let sessionGoFreeReconnectCount = 0;         // gofree reconnects counted from status events
+let sessionStaleDataEvents = 0;              // 'stale' state transitions during recording
+let sessionInvalidPgnCount = 0;             // pgn-unknown events during recording
+let recordingActiveRaceId: number | null = null; // raceId for the active recording
+
 // Active data source — tracks which manager handles connect/disconnect.
 // Initialized from settings at startup; updated via 'connection:source' IPC.
 let currentDataSource: 'ngt1' | 'gofree' = 'ngt1';
@@ -177,7 +187,7 @@ export function registerIPCHandlers(): void {
     }
 
     // Forward to renderer and (if recording) the recording pipeline
-    const message = n2kParser.filter(parsed);
+    const message = n2kParser.normalizeParsedPgn(parsed);
     if (message) {
       getWebContents()?.send('pgn:data', message);
 
@@ -199,12 +209,19 @@ export function registerIPCHandlers(): void {
   });
 
   // Unknown/unparseable data from serial manager
+  // BE10: count invalid PGNs during active recording
   serialManager.on('pgn-unknown', (msg: any) => {
     sendDebugData(`Unknown N2K data: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`);
+    if (isRecording) sessionInvalidPgnCount++;
   });
 
   // Forward GoFree connection state to renderer
+  // BE10: count GoFree reconnect and stale events during recording
   goFreeManager.on('gofree:status', (status: GoFreeStatusEvent) => {
+    if (isRecording) {
+      if (status.state === 'reconnecting') sessionGoFreeReconnectCount++;
+      if (status.state === 'stale') sessionStaleDataEvents++;
+    }
     sendDebugData(`[GoFree] Status → renderer: ${status.state}${status.error ? ` — ${status.error}` : ''}`);
     getWebContents()?.send('gofree:status', status);
   });
@@ -230,7 +247,9 @@ export function registerIPCHandlers(): void {
 
   // --- connection:status ---
   // Main → Renderer: emitted by serialManager events
+  // BE10: track stale events during recording
   serialManager.on('status', (status: any) => {
+    if (isRecording && status.status === 'stale') sessionStaleDataEvents++;
     getWebContents()?.send('connection:status', status);
   });
 
@@ -312,12 +331,37 @@ export function registerIPCHandlers(): void {
     // Create race meta record
     const activeProfile = polarEngine!.listProfiles()[0];
     const profileName = activeProfile?.name || null;
-    db.createRace(payload?.label || '', profileName ?? undefined);
+    const race = db.createRace(payload?.label || '', profileName ?? undefined);
 
     raceDb = db;
     isRecording = true;
     recordingStartTime = Date.now();
     recordingRecordCount = 0;
+    recordingActiveRaceId = race.id;
+
+    // BE9: Populate race_metadata with acquisition provenance
+    const recordingStart = new Date(recordingStartTime).toISOString();
+    const isGofree = currentDataSource === 'gofree';
+    const serialPort = !isGofree ? (serialManager?.getSettings().port ?? null) : null;
+    const h5000Ip = isGofree ? (settings.gofreeHost || '192.168.0.1') : null;
+
+    db.insertRaceMetadata({
+      race_id: race.id,
+      data_source: currentDataSource,
+      serial_port: serialPort,
+      h5000_ip: h5000Ip,
+      application_version: APP_VERSION,
+      git_commit: GIT_COMMIT,
+      boat_profile_id: activeProfile?.id ?? null,
+      polar_file: activeProfile?.name ?? null,
+      recording_start: recordingStart,
+    });
+
+    // BE10: reset session counters
+    sessionSerialDisconnectCountAtStart = serialManager?.getDisconnectCount() ?? 0;
+    sessionGoFreeReconnectCount = 0;
+    sessionStaleDataEvents = 0;
+    sessionInvalidPgnCount = 0;
 
     n2kParser!.startBatching();
 
@@ -348,14 +392,42 @@ export function registerIPCHandlers(): void {
     }
 
     const active = raceDb.getActiveRace();
+    const stopTime = new Date().toISOString();
+    const stopTimeMs = Date.now();
+
     if (active) {
       raceDb.finalizeRace(active.id);
+
+      // BE9: persist recording_end on clean stop
+      raceDb.updateRecordingEnd(active.id, stopTime);
+
+      // BE10: compute and persist data-quality metrics
+      try {
+        const rawPoints = raceDb.getRacePoints(active.id).map((r: any) => ({
+          timestamp: r.timestamp,
+          pgn: r.pgn,
+        }));
+        const serialDisconnects = (serialManager?.getDisconnectCount() ?? 0) - sessionSerialDisconnectCountAtStart;
+        const totalDisconnects = serialDisconnects + sessionGoFreeReconnectCount;
+        const dq = computeDataQuality(
+          rawPoints,
+          recordingStartTime ?? stopTimeMs,
+          stopTimeMs,
+          totalDisconnects,
+          sessionStaleDataEvents,
+          sessionInvalidPgnCount,
+        );
+        raceDb.saveDataQuality(active.id, dq);
+      } catch (err) {
+        console.error('[IPC] recording:stop — data quality computation failed:', err);
+      }
     }
 
     raceDb.close();
     raceDb = null;
     isRecording = false;
     recordingStartTime = null;
+    recordingActiveRaceId = null;
 
     return { success: true };
   });
@@ -573,6 +645,12 @@ export function registerIPCHandlers(): void {
         return { success: false, error: 'No race metadata found in file' };
       }
       analysisRaceId = race.id;
+
+      // BE9: detect interrupted recording and update recording_end in race_metadata
+      const interrupted = analysisDb.detectInterruptedRecording(race.id);
+      if (interrupted?.wasInterrupted && interrupted.recoveredEndTime) {
+        analysisDb.updateRecordingEnd(race.id, interrupted.recoveredEndTime);
+      }
 
       // Reconstruct time series
       const rows = analysisDb.getRacePoints(race.id);

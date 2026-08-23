@@ -14,7 +14,7 @@ function makeActisense(pgn: number, data: Buffer): string {
   return `${ts},2,${pgn},0,255,${data.length},${hexBytes}`;
 }
 
-// Helper: create a ParsedPGN object for testing the filter
+// Helper: create a ParsedPGN object for testing normalizeParsedPgn
 function makeParsedPGN(pgn: number, fields: Record<string, any> = {}, src?: number): ParsedPGN {
   return {
     pgn,
@@ -73,64 +73,70 @@ describe('canboatjs parser', () => {
 });
 
 // ===================================================================
-// Test: PGN filtering — only configured PGNs pass through
+// Test: PGN normalization — normalizeParsedPgn passes all PGNs through
+// (PRD §3.8 — pgnFilter abstraction removed; all PGNs are accepted)
 // ===================================================================
-describe('PGN filtering', () => {
+describe('PGN normalization (BE8 — PRD §3.8)', () => {
   let parser: N2KParser;
 
-  const ALLOWED_PGNS = [128259, 130306, 127250];
-
   beforeEach(() => {
-    parser = new N2KParser({ pgnFilter: ALLOWED_PGNS });
+    parser = new N2KParser();
   });
 
-  it('passes through allowed PGNs (Speed 128259)', () => {
+  it('normalizes Speed (PGN 128259) into PGNMessage format', () => {
     const parsed = makeParsedPGN(128259, { speedWaterReferenced: 2.5 });
-    const result = parser.filter(parsed);
+    const result = parser.normalizeParsedPgn(parsed);
     expect(result).not.toBeNull();
     expect(result!.pgn).toBe(128259);
+    expect(result!.fields.speedWaterReferenced).toBe(2.5);
   });
 
-  it('passes through wind data (130306)', () => {
+  it('normalizes Wind Data (PGN 130306)', () => {
     const parsed = makeParsedPGN(130306, { windSpeed: 5.5, windAngle: 0.6, windReference: 'Apparent' });
-    const result = parser.filter(parsed);
+    const result = parser.normalizeParsedPgn(parsed);
     expect(result).not.toBeNull();
     expect(result!.pgn).toBe(130306);
   });
 
-  it('passes through heading (127250)', () => {
+  it('normalizes Heading (PGN 127250)', () => {
     const parsed = makeParsedPGN(127250, { heading: 3.14 });
-    const result = parser.filter(parsed);
+    const result = parser.normalizeParsedPgn(parsed);
     expect(result).not.toBeNull();
     expect(result!.pgn).toBe(127250);
   });
 
-  it('passes through PGNs not in the default filter list', () => {
-    const parsed = makeParsedPGN(129029, { latitude: 42.0, longitude: -71.0 });
-    const result = parser.filter(parsed);
-    expect(result).not.toBeNull();
-    expect(result!.pgn).toBe(129029);
-  });
-
-  it('passes through all PGNs regardless of filter updates', () => {
-    const parsed = makeParsedPGN(129029, { latitude: 42.0 });
-    expect(parser.filter(parsed)).not.toBeNull();
-
-    parser.setPGNFilter([128259]);
-    expect(parser.filter(parsed)).not.toBeNull();
+  it('passes through any PGN regardless of PGN number', () => {
+    // Arbitrary PGNs that were previously "outside a filter" still pass through
+    for (const pgn of [129029, 60928, 99999, 1, 999999]) {
+      const parsed = makeParsedPGN(pgn, { latitude: 42.0 });
+      expect(parser.normalizeParsedPgn(parsed)).not.toBeNull();
+    }
   });
 
   it('passes through src when present', () => {
     const parsed = makeParsedPGN(130306, { windSpeed: 5.5 }, 16);
-    const result = parser.filter(parsed);
+    const result = parser.normalizeParsedPgn(parsed);
     expect(result).not.toBeNull();
     expect(result!.src).toBe(16);
   });
 
   it('src is undefined when not provided', () => {
     const parsed = makeParsedPGN(128259, { speedWaterReferenced: 2.5 });
-    const result = parser.filter(parsed);
+    const result = parser.normalizeParsedPgn(parsed);
     expect(result).not.toBeNull();
     expect(result!.src).toBeUndefined();
+  });
+
+  it('returns null for a parsed PGN with a null pgn field', () => {
+    const parsed = { pgn: null as any, fields: {}, timestamp: new Date().toISOString() };
+    expect(parser.normalizeParsedPgn(parsed)).toBeNull();
+  });
+
+  it('uses current time as timestamp fallback when timestamp is missing', () => {
+    const parsed = { pgn: 128259, fields: {}, src: undefined } as ParsedPGN;
+    const result = parser.normalizeParsedPgn(parsed);
+    expect(result).not.toBeNull();
+    expect(result!.timestamp).toBeTruthy();
+    expect(() => new Date(result!.timestamp)).not.toThrow();
   });
 });

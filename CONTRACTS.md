@@ -144,6 +144,70 @@ The BST initialization command `[0x11, 0x02, 0x00]` is Actisense NGT-1 specific.
 - `electron/preload.ts` — exposes `setDataSource()` and `'gofree:status'` event channel
 - Only one manager emits data at a time (enforced by `connect()`/`disconnect()` lifecycle)
 
+## N2KParser — PGN Normalization (Phase 2.8 / BE8)
+
+`N2KParser` in `electron/n2k-parser.ts` normalizes `ParsedPGN` objects from either acquisition manager into `PGNMessage` format. All PGNs pass through unconditionally.
+
+**Removed API (PRD §3.8):** `pgnFilter`, `setPGNFilter()`, `getPGNFilter()`, `filter()` are **gone**. Any caller previously using `filter()` must use `normalizeParsedPgn()` instead.
+
+**Current public normalization method:**
+
+```ts
+normalizeParsedPgn(parsed: ParsedPGN): PGNMessage | null
+```
+
+Returns `null` only if `parsed.pgn` is null/undefined. Otherwise always returns a `PGNMessage`.
+
+`N2KParserConfig` no longer has a `pgnFilter` field. Selective PGN filtering is not performed at this layer; source preference filtering is handled upstream in `ipc-handlers.ts`.
+
+## Race Metadata / Provenance (Phase 2.8 / BE9)
+
+Each race DB now contains a `race_metadata` table (created at recording start). Fields:
+
+| Column | Type | Notes |
+|---|---|---|
+| `data_source` | `'ngt1'` \| `'gofree'` | Active acquisition source |
+| `serial_port` | TEXT \| NULL | NGT-1 port, null for GoFree |
+| `h5000_ip` | TEXT \| NULL | GoFree IP, null for NGT-1 |
+| `application_version` | TEXT | From `electron/build-info.ts` |
+| `git_commit` | TEXT | Short SHA baked in at build time via `scripts/gen-build-info.js` (prebuild hook) |
+| `boat_profile_id` | INTEGER \| NULL | Active polar profile id |
+| `polar_file` | TEXT \| NULL | Active polar profile name |
+| `recording_start` | TEXT | ISO timestamp |
+| `recording_end` | TEXT \| NULL | Set on clean stop; set to `recovered_end_time` on interrupted recovery |
+
+Migration is idempotent: `CREATE TABLE IF NOT EXISTS` — safe on existing DBs.
+
+**`recording_end` lifecycle:**
+- Clean stop (`recording:stop`): set to current time.
+- Interrupted recovery (`races:open` → `detectInterruptedRecording`): set to `recovered_end_time`.
+
+Build-info injection: `scripts/gen-build-info.js` runs as `npm prebuild` and writes `electron/build-info.ts` with the git short SHA and package version. The committed placeholder values (`'dev'`, `'1.0.0'`) are used in development and tests.
+
+## Data Quality Metrics (Phase 2.8 / BE10)
+
+Each race DB contains a `data_quality` table populated on `recording:stop`. Fields:
+
+| Column | Type | Notes |
+|---|---|---|
+| `bsp_availability_pct` | REAL | % of duration with BSP data (PGN 128259, 10s coverage window) |
+| `tws_availability_pct` | REAL | % with wind data (PGN 130306, 2s window) |
+| `twa_availability_pct` | REAL | % with wind data (PGN 130306, 2s window) |
+| `gps_availability_pct` | REAL | % with GPS data (PGN 129025/129026/129029, 5s window) |
+| `largest_bsp_gap_s` | REAL | Largest gap between consecutive BSP readings (seconds) |
+| `largest_wind_gap_s` | REAL | Largest gap between consecutive wind readings (seconds) |
+| `largest_gps_gap_s` | REAL | Largest gap between consecutive GPS readings (seconds) |
+| `disconnect_count` | INTEGER | NGT-1 unexpected disconnects + GoFree reconnects during recording |
+| `stale_data_events` | INTEGER | Watchdog stale state transitions during recording |
+| `invalid_pgn_count` | INTEGER | Unrecognized PGN events from serial manager during recording |
+| `recording_duration_s` | REAL | Total recording duration |
+
+Low-quality recordings are not rejected — this table only provides observability. Migration is idempotent.
+
+**`disconnect_count` sources:**
+- NGT-1: delta of `SerialManager.getDisconnectCount()` from recording start to stop.
+- GoFree: counted via `gofree:status` events with `state='reconnecting'` in `ipc-handlers.ts` (gofree-manager is read-only).
+
 ## TCP Connection Contract
 
 Default TCP target remains:

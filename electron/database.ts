@@ -15,6 +15,44 @@ try {
 
 type BetterSqlite3 = any;
 
+// ---------------------------------------------------------------------------
+// BE9 — Race metadata / acquisition provenance (PRD §3.9)
+// ---------------------------------------------------------------------------
+
+export interface RaceMetadata {
+  id: number;
+  race_id: number;
+  data_source: 'ngt1' | 'gofree';
+  serial_port: string | null;
+  h5000_ip: string | null;
+  application_version: string;
+  git_commit: string;
+  boat_profile_id: number | null;
+  polar_file: string | null;
+  recording_start: string;
+  recording_end: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// BE10 — Per-race data-quality metrics (PRD §3.10)
+// ---------------------------------------------------------------------------
+
+export interface DataQualityRow {
+  id: number;
+  race_id: number;
+  bsp_availability_pct: number;
+  tws_availability_pct: number;
+  twa_availability_pct: number;
+  gps_availability_pct: number;
+  largest_bsp_gap_s: number;
+  largest_wind_gap_s: number;
+  largest_gps_gap_s: number;
+  disconnect_count: number;
+  stale_data_events: number;
+  invalid_pgn_count: number;
+  recording_duration_s: number;
+}
+
 interface RaceMeta {
   id: number;
   created_at: string;
@@ -123,6 +161,44 @@ export class RaceDatabase {
     try {
       this.db.exec('ALTER TABLE race_meta ADD COLUMN recovered_end_time TEXT');
     } catch { /* column already exists */ }
+
+    // BE9 — Race metadata table (PRD §3.9). Idempotent: CREATE TABLE IF NOT EXISTS.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS race_metadata (
+        id INTEGER PRIMARY KEY,
+        race_id INTEGER NOT NULL REFERENCES race_meta(id),
+        data_source TEXT NOT NULL,
+        serial_port TEXT,
+        h5000_ip TEXT,
+        application_version TEXT NOT NULL,
+        git_commit TEXT NOT NULL,
+        boat_profile_id INTEGER,
+        polar_file TEXT,
+        recording_start TEXT NOT NULL,
+        recording_end TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_race_metadata_race ON race_metadata(race_id);
+    `);
+
+    // BE10 — Data quality table (PRD §3.10). Idempotent.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS data_quality (
+        id INTEGER PRIMARY KEY,
+        race_id INTEGER NOT NULL REFERENCES race_meta(id),
+        bsp_availability_pct REAL NOT NULL DEFAULT 0,
+        tws_availability_pct REAL NOT NULL DEFAULT 0,
+        twa_availability_pct REAL NOT NULL DEFAULT 0,
+        gps_availability_pct REAL NOT NULL DEFAULT 0,
+        largest_bsp_gap_s REAL NOT NULL DEFAULT 0,
+        largest_wind_gap_s REAL NOT NULL DEFAULT 0,
+        largest_gps_gap_s REAL NOT NULL DEFAULT 0,
+        disconnect_count INTEGER NOT NULL DEFAULT 0,
+        stale_data_events INTEGER NOT NULL DEFAULT 0,
+        invalid_pgn_count INTEGER NOT NULL DEFAULT 0,
+        recording_duration_s REAL NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_data_quality_race ON data_quality(race_id);
+    `);
   }
 
   /**
@@ -443,6 +519,80 @@ export class RaceDatabase {
     return this.db.prepare(
       'SELECT * FROM sail_tags WHERE race_id = ? ORDER BY start_time',
     ).all(raceId) as any[];
+  }
+
+  // ---------------------------------------------------------------------------
+  // BE9 — Race metadata / acquisition provenance (PRD §3.9)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Insert a race_metadata row at recording start.
+   * Only one metadata row per race_id is expected; calling twice is safe
+   * (the second call returns the existing row if one already exists).
+   */
+  insertRaceMetadata(meta: Omit<RaceMetadata, 'id' | 'recording_end'>): RaceMetadata {
+    const stmt = this.db.prepare(`
+      INSERT OR IGNORE INTO race_metadata
+        (race_id, data_source, serial_port, h5000_ip, application_version,
+         git_commit, boat_profile_id, polar_file, recording_start)
+      VALUES
+        (@race_id, @data_source, @serial_port, @h5000_ip, @application_version,
+         @git_commit, @boat_profile_id, @polar_file, @recording_start)
+    `);
+    stmt.run(meta);
+    const row = this.db.prepare('SELECT * FROM race_metadata WHERE race_id = ?').get(meta.race_id);
+    return row as unknown as RaceMetadata;
+  }
+
+  /**
+   * Set recording_end on the metadata row for a given race.
+   * Called on clean stop and on interrupted-recovery.
+   */
+  updateRecordingEnd(raceId: number, recordingEnd: string): void {
+    this.db.prepare(
+      'UPDATE race_metadata SET recording_end = ? WHERE race_id = ?',
+    ).run(recordingEnd, raceId);
+  }
+
+  /**
+   * Get the race_metadata row for a race (may be null for legacy recordings).
+   */
+  getRaceMetadata(raceId: number): RaceMetadata | null {
+    const row = this.db.prepare('SELECT * FROM race_metadata WHERE race_id = ?').get(raceId);
+    return row ? (row as unknown as RaceMetadata) : null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // BE10 — Per-race data-quality metrics (PRD §3.10)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Upsert a data_quality row for a race.
+   * Safe to call multiple times (overwrites previous values).
+   */
+  saveDataQuality(raceId: number, metrics: Omit<DataQualityRow, 'id' | 'race_id'>): DataQualityRow {
+    // Delete existing row first (idempotent upsert without UPSERT syntax for broad SQLite compat).
+    this.db.prepare('DELETE FROM data_quality WHERE race_id = ?').run(raceId);
+    const stmt = this.db.prepare(`
+      INSERT INTO data_quality
+        (race_id, bsp_availability_pct, tws_availability_pct, twa_availability_pct,
+         gps_availability_pct, largest_bsp_gap_s, largest_wind_gap_s, largest_gps_gap_s,
+         disconnect_count, stale_data_events, invalid_pgn_count, recording_duration_s)
+      VALUES
+        (@race_id, @bsp_availability_pct, @tws_availability_pct, @twa_availability_pct,
+         @gps_availability_pct, @largest_bsp_gap_s, @largest_wind_gap_s, @largest_gps_gap_s,
+         @disconnect_count, @stale_data_events, @invalid_pgn_count, @recording_duration_s)
+    `);
+    stmt.run({ race_id: raceId, ...metrics });
+    return this.db.prepare('SELECT * FROM data_quality WHERE race_id = ?').get(raceId) as unknown as DataQualityRow;
+  }
+
+  /**
+   * Get the data_quality row for a race (may be null for legacy recordings).
+   */
+  getDataQuality(raceId: number): DataQualityRow | null {
+    const row = this.db.prepare('SELECT * FROM data_quality WHERE race_id = ?').get(raceId);
+    return row ? (row as unknown as DataQualityRow) : null;
   }
 }
 

@@ -887,3 +887,107 @@ export function aggregatePerformance(
 
   return rows;
 }
+
+// ---------------------------------------------------------------------------
+// BE10 — Per-race data-quality metrics (PRD §3.10)
+// ---------------------------------------------------------------------------
+
+export interface DataQualityMetrics {
+  bsp_availability_pct: number;
+  tws_availability_pct: number;
+  twa_availability_pct: number;
+  gps_availability_pct: number;
+  largest_bsp_gap_s: number;
+  largest_wind_gap_s: number;
+  largest_gps_gap_s: number;
+  disconnect_count: number;
+  stale_data_events: number;
+  invalid_pgn_count: number;
+  recording_duration_s: number;
+}
+
+/**
+ * Compute % of the recording duration where data was available for a PGN group.
+ * Each reading is assumed to cover the time until the next reading, up to maxGapMs.
+ * Returns 0–100.
+ */
+function computeCoveragePercent(
+  sortedTimestampsMs: number[],
+  totalDurationMs: number,
+  maxGapMs: number,
+): number {
+  if (sortedTimestampsMs.length === 0 || totalDurationMs <= 0) return 0;
+  let covered = 0;
+  for (let i = 0; i < sortedTimestampsMs.length - 1; i++) {
+    covered += Math.min(sortedTimestampsMs[i + 1] - sortedTimestampsMs[i], maxGapMs);
+  }
+  return Math.min((covered / totalDurationMs) * 100, 100);
+}
+
+/** Return the largest gap in seconds between consecutive sorted timestamps. */
+function largestGapS(sortedTimestampsMs: number[]): number {
+  if (sortedTimestampsMs.length < 2) return 0;
+  let max = 0;
+  for (let i = 1; i < sortedTimestampsMs.length; i++) {
+    max = Math.max(max, (sortedTimestampsMs[i] - sortedTimestampsMs[i - 1]) / 1000);
+  }
+  return max;
+}
+
+/**
+ * Compute per-race data-quality metrics from raw n2k_points (PRD §3.10).
+ *
+ * PGN coverage windows match the freshness thresholds used in reconstructTimeSeries:
+ *   BSP   (PGN 128259): STW_FRESHNESS_MS = 10 s
+ *   Wind  (PGN 130306): AWS_AWA_FRESHNESS_MS = 2 s
+ *   GPS   (PGN 129025 / 129026 / 129029): SOG_FRESHNESS_MS = 5 s
+ *
+ * Low-quality recordings are NOT rejected — the caller flags them via this object.
+ */
+export function computeDataQuality(
+  rawRows: Array<{ timestamp: string; pgn: number }>,
+  recordingStartMs: number,
+  recordingEndMs: number,
+  disconnectCount: number,
+  staleDataEvents: number,
+  invalidPgnCount: number,
+): DataQualityMetrics {
+  const durationMs = Math.max(0, recordingEndMs - recordingStartMs);
+  const durationS = durationMs / 1000;
+
+  // Sorted timestamp arrays per PGN group
+  const bspTs: number[] = [];
+  const windTs: number[] = [];
+  const gpsTs: number[] = [];
+
+  for (const row of rawRows) {
+    const t = new Date(row.timestamp).getTime();
+    if (isNaN(t)) continue;
+    if (row.pgn === 128259) bspTs.push(t);
+    else if (row.pgn === 130306) windTs.push(t);
+    else if (row.pgn === 129025 || row.pgn === 129026 || row.pgn === 129029) gpsTs.push(t);
+  }
+
+  bspTs.sort((a, b) => a - b);
+  windTs.sort((a, b) => a - b);
+  gpsTs.sort((a, b) => a - b);
+
+  // Coverage windows (ms) matching analysis engine freshness thresholds
+  const BSP_COVERAGE_MS = 10_000;
+  const WIND_COVERAGE_MS = 2_000;
+  const GPS_COVERAGE_MS = 5_000;
+
+  return {
+    bsp_availability_pct: computeCoveragePercent(bspTs, durationMs, BSP_COVERAGE_MS),
+    tws_availability_pct: computeCoveragePercent(windTs, durationMs, WIND_COVERAGE_MS),
+    twa_availability_pct: computeCoveragePercent(windTs, durationMs, WIND_COVERAGE_MS),
+    gps_availability_pct: computeCoveragePercent(gpsTs, durationMs, GPS_COVERAGE_MS),
+    largest_bsp_gap_s: largestGapS(bspTs),
+    largest_wind_gap_s: largestGapS(windTs),
+    largest_gps_gap_s: largestGapS(gpsTs),
+    disconnect_count: disconnectCount,
+    stale_data_events: staleDataEvents,
+    invalid_pgn_count: invalidPgnCount,
+    recording_duration_s: durationS,
+  };
+}

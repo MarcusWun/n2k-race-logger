@@ -239,6 +239,23 @@ export class SerialManager extends EventEmitter {
   /** Tracked serial connection status for state-transition logic. */
   private _currentSerialStatus: ConnectionStatusEvent['status'] = 'disconnected';
 
+  // ---------------------------------------------------------------------------
+  // BE10: Disconnect counter — counts unexpected disconnects since last reset (PRD §3.10)
+  // ---------------------------------------------------------------------------
+
+  /** Cumulative count of unexpected serial disconnects (error/close events). */
+  private _disconnectCount = 0;
+
+  /** Returns the number of unexpected disconnects since construction or last reset. */
+  getDisconnectCount(): number {
+    return this._disconnectCount;
+  }
+
+  /** Reset disconnect count — call at recording start to get a per-recording delta. */
+  resetDisconnectCount(): void {
+    this._disconnectCount = 0;
+  }
+
   // Configurable options (set in constructor from SerialManagerOptions)
   private readonly _watchdogTimeoutMs: number;
   private readonly _backoffLadderMs: readonly number[];
@@ -625,6 +642,9 @@ export class SerialManager extends EventEmitter {
   private _handleSerialDisconnect(reason: string): void {
     // Guard: if a reconnect is already scheduled, do not stack another one.
     if (this.reconnectTimer !== null) return;
+
+    // BE10: count unexpected disconnects
+    this._disconnectCount++;
 
     // Clear all per-session resources before scheduling reconnect
     this._clearAllSerialSession();

@@ -55,6 +55,10 @@ const api = {
   getSailTags: (payload: { raceId: number }) => ipcRenderer.invoke('analysis:get-sail-tags', payload),
   getPerformanceSummary: () => ipcRenderer.invoke('analysis:performance-summary'),
 
+  // Phase 2.8 — provenance and data-quality (FE3 / FE4)
+  getRaceMetadata: () => ipcRenderer.invoke('races:metadata'),
+  getDataQuality: () => ipcRenderer.invoke('races:data-quality'),
+
   // Event listeners
   on: (channel: string, callback: (...args: any[]) => void) => {
     const validChannels = [

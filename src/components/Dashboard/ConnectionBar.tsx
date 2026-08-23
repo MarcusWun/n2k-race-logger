@@ -4,6 +4,7 @@ import { useConnectionStore } from '../../store/useConnectionStore';
 import type { ConnectionStatus, GofreeStatusPayload, SerialPortInfo } from '../../types/ipc';
 import { sanitizeTcpHost, validateTcpTarget } from '../../utils/tcp';
 import { getGofreeStatusLabel, getGofreeStatusColor } from '../../utils/gofree';
+import { getNgt1StatusLabel, getNgt1StatusColor } from '../../utils/ngt1';
 
 export default function ConnectionBar() {
   const {
@@ -100,25 +101,19 @@ export default function ConnectionBar() {
   // FE3: Status chip adapts to active data source
   const isGoFree = dataSource === 'gofree';
 
-  // 'stale' is transport-connected (socket open) — disable config controls and show Disconnect.
+  // 'stale' on NGT-1 means the serial port is open but no valid PGN arrived within the
+  // watchdog timeout (PRD §3.1 / FE1). Treat as "transport live" — keep controls disabled.
   const isConnected = isGoFree
     ? (gofreeStatus?.state === 'connected' || gofreeStatus?.state === 'stale')
-    : status.status === 'connected';
-
-  const ngt1StatusColor = {
-    disconnected: 'bg-gray-500',
-    connecting: 'bg-n2k-warning animate-pulse',
-    connected: 'bg-n2k-success',
-    error: 'bg-n2k-danger',
-  }[status.status];
+    : (status.status === 'connected' || status.status === 'stale');
 
   const statusDotColor = isGoFree
     ? getGofreeStatusColor(gofreeStatus?.state)
-    : ngt1StatusColor;
+    : getNgt1StatusColor(status.status);
 
   const statusLabel = isGoFree
     ? getGofreeStatusLabel(gofreeStatus)
-    : status.status;
+    : getNgt1StatusLabel(status);
 
   return (
     <div className="flex items-center gap-3 bg-n2k-surface rounded-lg px-4 py-2 flex-wrap">

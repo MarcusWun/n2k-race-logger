@@ -8,6 +8,7 @@ import type {
   PerformanceSummaryRow,
 } from '../types/analysis';
 import { DEFAULT_THRESHOLDS } from '../types/analysis';
+import type { RaceMetadata, DataQualityRow } from '../types/metadata';
 
 interface AnalysisStore {
   // Race browser
@@ -19,9 +20,14 @@ interface AnalysisStore {
   raceMeta: any | null;
   metrics: TimeSeries | null;
   timeRange: { start: number; end: number } | null;
+  // Phase 2.8: provenance + quality (BE9/BE10, FE3/FE4)
+  raceMetadata: RaceMetadata | null;
+  dataQuality: DataQualityRow | null;
 
   setLoadedRace: (path: string, meta: any, metrics: TimeSeries, timeRange: { start: number; end: number }) => void;
   clearLoadedRace: () => void;
+  setRaceMetadata: (metadata: RaceMetadata | null) => void;
+  setDataQuality: (quality: DataQualityRow | null) => void;
 
   // Segment detection
   thresholds: SegmentThresholds;
@@ -43,9 +49,9 @@ interface AnalysisStore {
   setViewRange: (start: number, end: number) => void;
   resetViewRange: () => void;
 
-  // Analysis sub-tab
-  analysisTab: 'polar' | 'summary' | 'segments';
-  setAnalysisTab: (tab: 'polar' | 'summary' | 'segments') => void;
+  // Analysis sub-tab (quality tab added for FE3/FE4)
+  analysisTab: 'polar' | 'summary' | 'segments' | 'quality';
+  setAnalysisTab: (tab: 'polar' | 'summary' | 'segments' | 'quality') => void;
 
   // Filters
   sailFilter: string | null;
@@ -62,6 +68,8 @@ export const useAnalysisStore = create<AnalysisStore>((set, get) => ({
   raceMeta: null,
   metrics: null,
   timeRange: null,
+  raceMetadata: null,
+  dataQuality: null,
 
   setLoadedRace: (path, meta, metrics, timeRange) => set({
     loadedRacePath: path,
@@ -73,6 +81,8 @@ export const useAnalysisStore = create<AnalysisStore>((set, get) => ({
     segments: [],
     sailTags: [],
     performanceSummary: [],
+    raceMetadata: null,
+    dataQuality: null,
   }),
   clearLoadedRace: () => set({
     loadedRacePath: null,
@@ -84,7 +94,11 @@ export const useAnalysisStore = create<AnalysisStore>((set, get) => ({
     segments: [],
     sailTags: [],
     performanceSummary: [],
+    raceMetadata: null,
+    dataQuality: null,
   }),
+  setRaceMetadata: (metadata) => set({ raceMetadata: metadata }),
+  setDataQuality: (quality) => set({ dataQuality: quality }),
 
   thresholds: { ...DEFAULT_THRESHOLDS },
   segments: [],

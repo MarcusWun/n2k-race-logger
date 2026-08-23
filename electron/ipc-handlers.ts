@@ -831,6 +831,24 @@ export function registerIPCHandlers(): void {
     return { success: true, metrics: analysisTimeSeries };
   });
 
+  // --- races:metadata (FE4) ---
+  // Returns the race_metadata row (provenance) for the currently loaded race.
+  // Returns { success: true, metadata: RaceMetadata | null } — null for legacy races (BE9).
+  ipcMain.handle('races:metadata', async () => {
+    if (!analysisDb || analysisRaceId == null) return { success: false, metadata: null };
+    const metadata = analysisDb.getRaceMetadata(analysisRaceId);
+    return { success: true, metadata };
+  });
+
+  // --- races:data-quality (FE3) ---
+  // Returns the data_quality row for the currently loaded race.
+  // Returns { success: true, quality: DataQualityRow | null } — null for legacy races (BE10).
+  ipcMain.handle('races:data-quality', async () => {
+    if (!analysisDb || analysisRaceId == null) return { success: false, quality: null };
+    const quality = analysisDb.getDataQuality(analysisRaceId);
+    return { success: true, quality };
+  });
+
   // --- analysis:performance-summary ---
   ipcMain.handle('analysis:performance-summary', async () => {
     if (!analysisDb || analysisRaceId == null) return { success: false, rows: [] };

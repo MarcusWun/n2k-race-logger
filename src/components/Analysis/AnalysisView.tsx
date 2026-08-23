@@ -1,11 +1,15 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { useAnalysisStore } from '../../store/useAnalysisStore';
+import { getIPC } from '../../ipc';
 import StripCharts from './StripCharts';
 import SegmentControls from './SegmentControls';
 import SailTagPanel from './SailTagPanel';
 import PolarOverlay from './PolarOverlay';
 import PerformanceSummary from './PerformanceSummary';
 import SegmentList from './SegmentList';
+import InterruptedBanner from './InterruptedBanner';
+import DataQualityPanel from './DataQualityPanel';
+import ProvenanceBlock from './ProvenanceBlock';
 
 interface AnalysisViewProps {
   onBack: () => void;
@@ -26,9 +30,28 @@ export default function AnalysisView({ onBack }: AnalysisViewProps) {
   const sailTags = useAnalysisStore((s) => s.sailTags);
   const analysisTab = useAnalysisStore((s) => s.analysisTab);
   const setAnalysisTab = useAnalysisStore((s) => s.setAnalysisTab);
+  const raceMetadata = useAnalysisStore((s) => s.raceMetadata);
+  const dataQuality = useAnalysisStore((s) => s.dataQuality);
+  const setRaceMetadata = useAnalysisStore((s) => s.setRaceMetadata);
+  const setDataQuality = useAnalysisStore((s) => s.setDataQuality);
 
   const nonExcluded = segments.filter((s) => !s.excluded);
   const duration = timeRange ? (timeRange.end - timeRange.start) / 1000 : 0;
+
+  // FE3/FE4: Fetch provenance and quality when a race is loaded.
+  useEffect(() => {
+    if (!raceMeta) return;
+    const ipc = getIPC();
+    if (!ipc) return;
+
+    ipc.getRaceMetadata().then((result: any) => {
+      setRaceMetadata(result?.metadata ?? null);
+    }).catch(() => setRaceMetadata(null));
+
+    ipc.getDataQuality().then((result: any) => {
+      setDataQuality(result?.quality ?? null);
+    }).catch(() => setDataQuality(null));
+  }, [raceMeta?.id]);
 
   return (
     <div className="flex flex-col gap-3 h-full">
@@ -54,6 +77,14 @@ export default function AnalysisView({ onBack }: AnalysisViewProps) {
         </div>
       </div>
 
+      {/* FE2: Interrupted-recording banner (shown only when was_interrupted is truthy) */}
+      {raceMeta && Boolean(raceMeta.was_interrupted) && (
+        <InterruptedBanner
+          wasInterrupted={raceMeta.was_interrupted}
+          recoveredEndTime={raceMeta.recovered_end_time}
+        />
+      )}
+
       {/* Main content: strip charts + sidebar */}
       <div className="flex gap-3 flex-1 min-h-0">
         {/* Strip charts */}
@@ -71,7 +102,7 @@ export default function AnalysisView({ onBack }: AnalysisViewProps) {
       {/* Bottom tabs */}
       <div className="bg-n2k-surface rounded-lg overflow-hidden flex flex-col" style={{ maxHeight: '45%' }}>
         <div className="flex border-b border-gray-800">
-          {(['polar', 'summary', 'segments'] as const).map((tab) => (
+          {(['polar', 'summary', 'segments', 'quality'] as const).map((tab) => (
             <button
               key={tab}
               onClick={() => setAnalysisTab(tab)}
@@ -81,7 +112,13 @@ export default function AnalysisView({ onBack }: AnalysisViewProps) {
                   : 'text-gray-500 hover:text-gray-300'
               }`}
             >
-              {tab === 'polar' ? 'Polar Overlay' : tab === 'summary' ? 'Performance Summary' : 'Segment List'}
+              {tab === 'polar'
+                ? 'Polar Overlay'
+                : tab === 'summary'
+                ? 'Performance Summary'
+                : tab === 'segments'
+                ? 'Segment List'
+                : 'Quality'}
             </button>
           ))}
         </div>
@@ -89,6 +126,20 @@ export default function AnalysisView({ onBack }: AnalysisViewProps) {
           {analysisTab === 'polar' && <PolarOverlay />}
           {analysisTab === 'summary' && <PerformanceSummary />}
           {analysisTab === 'segments' && <SegmentList />}
+          {analysisTab === 'quality' && (
+            <div className="flex gap-6">
+              {/* FE3: Data-quality summary */}
+              <div className="flex-1 min-w-0">
+                <div className="text-xs text-gray-400 uppercase tracking-wider mb-2">Data Quality</div>
+                <DataQualityPanel quality={dataQuality} />
+              </div>
+              {/* FE4: Acquisition provenance */}
+              <div className="w-56 shrink-0 border-l border-gray-800 pl-4">
+                <div className="text-xs text-gray-400 uppercase tracking-wider mb-2">Provenance</div>
+                <ProvenanceBlock metadata={raceMetadata} />
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

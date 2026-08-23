@@ -4,7 +4,11 @@ export interface ConnectionStatus {
   baud?: number;
   host?: string;
   tcpPort?: number;
-  status: 'disconnected' | 'connecting' | 'connected' | 'error';
+  /**
+   * NGT-1 connection state. 'stale' means the serial port is open but no valid
+   * PGN has arrived within the watchdog timeout (PRD §3.1 / FE1).
+   */
+  status: 'disconnected' | 'connecting' | 'connected' | 'stale' | 'error';
   error?: string;
 }
 

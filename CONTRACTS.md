@@ -2,6 +2,24 @@
 
 Shared contracts for Electron main process, preload bridge, renderer, and QA.
 
+## Phase A IPC Changes (2026-08-23)
+
+### Fix #4 — `polar:performance` push removed
+
+The `polar:performance` IPC channel now delivers results exclusively via `ipcMain.handle` return value (resolving the `ipcRenderer.invoke` promise). The unsolicited `getWebContents()?.send('polar:performance', result)` push was removed. The renderer must NOT register an `ipcRenderer.on('polar:performance', ...)` event listener — results arrive only through the `.then()` of the `invoke` call.
+
+### Fix S4 — `polar:get-load-error` (new handler)
+
+```ts
+ipcMain.handle('polar:get-load-error', async () => {
+  return { loadError: string | null };
+});
+```
+
+Returns the most recent `loadProfiles()` error message, or `null` if the last load succeeded. The renderer should query this on startup and display a non-blocking warning banner if `loadError` is non-null (e.g., "Could not load saved polar profiles — using default. Details: [message]"). The error is set by the current `PolarEngine` instance and resets on a fresh engine initialization.
+
+---
+
 ## Settings IPC
 
 ### `settings:get`

@@ -2,11 +2,12 @@
 /**
  * gen-build-info.js — Prebuild script.
  *
- * Writes `electron/build-info.ts` with the current git short SHA and
- * package.json version baked in as compile-time constants.
+ * Writes `electron/build-info.ts` with the current git short SHA, branch,
+ * build timestamp, and package.json version baked in as compile-time constants.
  * Run automatically via the `prebuild` npm script.
  *
- * If git is not available (e.g. CI without a checkout), falls back to 'unknown'.
+ * Falls back to copying `electron/build-info.default.ts` content when running
+ * outside a git repository (e.g. packaged source distribution).
  */
 
 'use strict';
@@ -17,6 +18,23 @@ const { join } = require('path');
 
 const root = join(__dirname, '..');
 const outPath = join(root, 'electron', 'build-info.ts');
+const defaultPath = join(root, 'electron', 'build-info.default.ts');
+
+// Detect whether we are inside a git repository
+let inGitRepo = true;
+try {
+  execSync('git rev-parse --is-inside-work-tree', { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] });
+} catch {
+  inGitRepo = false;
+}
+
+if (!inGitRepo) {
+  // Not a git repo — copy the committed default file so the import is always resolvable
+  const defaultContent = readFileSync(defaultPath, 'utf8');
+  writeFileSync(outPath, defaultContent, 'utf8');
+  console.log('[gen-build-info] Not in a git repo — copied build-info.default.ts to build-info.ts');
+  process.exit(0);
+}
 
 // Get git short SHA (7 chars)
 let gitCommit = 'unknown';
@@ -25,8 +43,21 @@ try {
     .toString()
     .trim();
 } catch {
-  // git not available or not a git repo — keep 'unknown'
+  // git rev-parse failed — keep 'unknown'
 }
+
+// Get current branch name
+let gitBranch = 'unknown';
+try {
+  gitBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] })
+    .toString()
+    .trim();
+} catch {
+  // keep 'unknown'
+}
+
+// Build timestamp (ISO 8601)
+const buildTime = new Date().toISOString();
 
 // Get app version from package.json
 let appVersion = '1.0.0';
@@ -44,7 +75,9 @@ const content = `/**
 
 export const GIT_COMMIT: string = '${gitCommit}';
 export const APP_VERSION: string = '${appVersion}';
+export const GIT_BRANCH: string = '${gitBranch}';
+export const BUILD_TIME: string = '${buildTime}';
 `;
 
 writeFileSync(outPath, content, 'utf8');
-console.log(`[gen-build-info] Wrote build-info.ts — git=${gitCommit} version=${appVersion}`);
+console.log(`[gen-build-info] Wrote build-info.ts — git=${gitCommit} branch=${gitBranch} version=${appVersion}`);

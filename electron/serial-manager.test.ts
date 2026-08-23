@@ -299,3 +299,244 @@ describe('SerialManager — BE1: NGT-1 Disconnect/Error Hardening (PRD §3.1)', 
     expect(statuses[statuses.length - 1]).toBe('disconnected');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Fix #7 — Backoff reset after successful reconnect (BE6)
+// ---------------------------------------------------------------------------
+
+describe('SerialManager — Fix #7: backoff resets to 0 after first valid PGN post-reconnect', () => {
+  beforeEach(() => {
+    MockSerialPort.instances = [];
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+  });
+
+  it('backoffIndex resets to 0 when first valid PGN arrives after a reconnect', async () => {
+    // Backoff ladder: [50, 100, 200] → after two failures, backoffIndex = 2 → delay 200ms
+    const mgr = makeManager({ backoffLadderMs: [50, 100, 200], watchdogTimeoutMs: 0 });
+    const mgrAny = mgr as any;
+
+    // Connect and receive a PGN (establishes session)
+    await mgr.connect({ mode: 'serial', port: 'COM3' });
+    mgr.emit('pgn', { pgn: 130306, fields: {} });
+    expect(mgrAny.backoffIndex).toBe(0);
+
+    // First unexpected close → backoffIndex = 1 (delay = 50ms used)
+    const port1 = MockSerialPort.instances[MockSerialPort.instances.length - 1];
+    port1.simulateClose();
+    expect(mgrAny.backoffIndex).toBe(1);
+
+    // Wait for reconnect attempt
+    await vi.advanceTimersByTimeAsync(60);
+
+    // Simulate the reconnect port closing immediately (second failure) → backoffIndex = 2
+    const port2 = MockSerialPort.instances[MockSerialPort.instances.length - 1];
+    port2.simulateClose();
+    expect(mgrAny.backoffIndex).toBe(2);
+
+    // Wait for third reconnect attempt (200ms delay)
+    await vi.advanceTimersByTimeAsync(210);
+
+    // Third port is now open — valid PGN arrives → backoffIndex should reset to 0
+    mgr.emit('pgn', { pgn: 130306, fields: {} });
+    expect(mgrAny.backoffIndex).toBe(0);
+
+    await mgr.disconnect();
+  });
+
+  it('second dropout after recovery uses the first (shortest) backoff step', async () => {
+    const mgr = makeManager({ backoffLadderMs: [50, 100, 200], watchdogTimeoutMs: 0 });
+    const mgrAny = mgr as any;
+
+    // First session
+    await mgr.connect({ mode: 'serial', port: 'COM3' });
+    mgr.emit('pgn', { pgn: 130306, fields: {} });
+
+    // First dropout → backoffIndex = 1
+    MockSerialPort.instances[0].simulateClose();
+    expect(mgrAny.backoffIndex).toBe(1);
+
+    // Reconnect + first PGN resets backoffIndex to 0
+    await vi.advanceTimersByTimeAsync(60);
+    mgr.emit('pgn', { pgn: 130306, fields: {} });
+    expect(mgrAny.backoffIndex).toBe(0);
+
+    // Second dropout — should start from backoffIndex = 0 → delay = 50ms (shortest)
+    const port2 = MockSerialPort.instances[MockSerialPort.instances.length - 1];
+    port2.simulateClose();
+    expect(mgrAny.backoffIndex).toBe(1); // incremented after using slot 0
+
+    // Only 60ms needed for reconnect (not 100ms or 200ms)
+    await vi.advanceTimersByTimeAsync(60);
+    expect(MockSerialPort.instances.length).toBe(3); // third port created at first backoff step
+
+    await mgr.disconnect();
+  });
+
+  it('backoff NOT reset on port open (silent port does not reset backoff)', async () => {
+    // watchdogTimeoutMs = 0 means no watchdog, but we track backoffIndex manually
+    const mgr = makeManager({ backoffLadderMs: [50, 100, 200], watchdogTimeoutMs: 0 });
+    const mgrAny = mgr as any;
+
+    await mgr.connect({ mode: 'serial', port: 'COM3' });
+
+    // First dropout → backoffIndex = 1
+    MockSerialPort.instances[0].simulateClose();
+    expect(mgrAny.backoffIndex).toBe(1);
+
+    // Wait for reconnect attempt — port opens but NO PGN emitted
+    await vi.advanceTimersByTimeAsync(60);
+
+    // Port opened but no PGN → backoffIndex must remain 1 (not reset)
+    expect(mgrAny.backoffIndex).toBe(1);
+
+    await mgr.disconnect();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix #8 — Open-failure retry (BE6)
+// ---------------------------------------------------------------------------
+
+describe('SerialManager — Fix #8: open-failure triggers backoff retry', () => {
+  beforeEach(() => {
+    MockSerialPort.instances = [];
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+  });
+
+  /** MockSerialPort that fails to open with a given error message. */
+  class FailingSerialPort extends EventEmitter {
+    static instances: FailingSerialPort[] = [];
+    isOpen = false;
+    path: string;
+    baudRate: number;
+    private readonly errorMsg: string;
+
+    constructor(opts: { path: string; baudRate: number; parity?: string; autoOpen?: boolean }, errorMsg = 'Access denied') {
+      super();
+      this.path = opts.path;
+      this.baudRate = opts.baudRate;
+      this.errorMsg = errorMsg;
+      FailingSerialPort.instances.push(this);
+    }
+
+    open(cb: (err: Error | null) => void): void {
+      Promise.resolve().then(() => cb(new Error(this.errorMsg)));
+    }
+
+    close(cb: () => void): void { Promise.resolve().then(() => cb()); }
+    pipe(_dest: any): this { return this; }
+    write(_data: any): void {}
+  }
+
+  it('port open failure schedules retry with first backoff delay', async () => {
+    FailingSerialPort.instances = [];
+    const mgr = makeManager({
+      SerialPortImpl: FailingSerialPort,
+      backoffLadderMs: [50, 100],
+      watchdogTimeoutMs: 0,
+    });
+    const statuses = collectStatuses(mgr);
+
+    // connect() should fail — error + reconnecting emitted
+    await mgr.connect({ mode: 'serial', port: 'COM3' });
+    expect(statuses).toContain('error');
+    expect(statuses).toContain('reconnecting');
+
+    // After first backoff delay, a second port should be created
+    const countBefore = FailingSerialPort.instances.length;
+    await vi.advanceTimersByTimeAsync(60);
+    expect(FailingSerialPort.instances.length).toBeGreaterThan(countBefore);
+
+    await mgr.disconnect();
+  });
+
+  it('open failure with userInitiatedStop=true schedules NO retry', async () => {
+    FailingSerialPort.instances = [];
+    const mgr = makeManager({
+      SerialPortImpl: FailingSerialPort,
+      backoffLadderMs: [50, 100],
+      watchdogTimeoutMs: 0,
+    });
+
+    // Simulate user stopping while connect is in flight: call connectSerial directly
+    // (bypassing connect() which calls disconnect() and resets userInitiatedStop).
+    // This reflects the scenario where disconnect() is called mid-connect.
+    (mgr as any).activeMode = 'serial';
+    (mgr as any).userInitiatedStop = true;
+    await (mgr as any).connectSerial({ port: 'COM3' });
+
+    const countAfterConnect = FailingSerialPort.instances.length;
+    expect(countAfterConnect).toBeGreaterThanOrEqual(1);
+
+    // No retry should be scheduled because userInitiatedStop = true
+    await vi.advanceTimersByTimeAsync(200);
+    expect(FailingSerialPort.instances.length).toBe(countAfterConnect);
+
+    (mgr as any).userInitiatedStop = false;
+    await mgr.disconnect();
+  });
+
+  it('open failure then retry succeeds → connected state reached', async () => {
+    let callCount = 0;
+    /** Fails on first call, succeeds on subsequent calls. */
+    class FlipSerialPort extends EventEmitter {
+      static instances: FlipSerialPort[] = [];
+      isOpen = false;
+      path: string;
+      baudRate: number;
+
+      constructor(opts: { path: string; baudRate: number; parity?: string; autoOpen?: boolean }) {
+        super();
+        this.path = opts.path;
+        this.baudRate = opts.baudRate;
+        FlipSerialPort.instances.push(this);
+        callCount++;
+      }
+
+      open(cb: (err: Error | null) => void): void {
+        if (callCount === 1) {
+          // First instance fails
+          Promise.resolve().then(() => cb(new Error('Port busy')));
+        } else {
+          this.isOpen = true;
+          Promise.resolve().then(() => cb(null));
+        }
+      }
+
+      close(cb: () => void): void {
+        this.isOpen = false;
+        Promise.resolve().then(() => cb());
+      }
+      pipe(_dest: any): this { return this; }
+      write(_data: any): void {}
+    }
+
+    FlipSerialPort.instances = [];
+    callCount = 0;
+
+    const mgr = makeManager({
+      SerialPortImpl: FlipSerialPort,
+      backoffLadderMs: [50],
+      watchdogTimeoutMs: 0,
+    });
+    const statuses = collectStatuses(mgr);
+
+    // First connect fails
+    await mgr.connect({ mode: 'serial', port: 'COM3' });
+    expect(statuses).toContain('error');
+
+    // After backoff, second port opens successfully
+    await vi.advanceTimersByTimeAsync(60);
+    expect(statuses).toContain('connected');
+
+    await mgr.disconnect();
+  });
+});

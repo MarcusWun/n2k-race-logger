@@ -36,16 +36,16 @@ jobs:
       - name: Run tests
         run: npm run test:run
 
-      - name: Build renderer and main process
-        run: npx tsc && npx vite build
+      - name: Typecheck
+        run: npm exec tsc -- --noEmit
 
       - name: Remove canboatjs native CAN socket binding (UNIX-only, not needed for serial)
         run: |
           Remove-Item -Path node_modules\@canboat\canboatjs\binding.gyp -Force -ErrorAction SilentlyContinue
           Remove-Item -Path node_modules\@canboat\canboatjs\native -Recurse -Force -ErrorAction SilentlyContinue
 
-      - name: Build Electron installer
-        run: npx electron-builder --win --config electron-builder.config.js
+      - name: Build
+        run: npm run build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

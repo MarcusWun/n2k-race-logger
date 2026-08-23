@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { PolarEngine, PolarTable } from './polar-engine';
+import { PolarEngine, PolarTable, assertPolarShape } from './polar-engine';
 
 // Test polar table: simple 3×3 grid for predictable interpolation
 const TEST_POLAR: PolarTable = {
@@ -28,7 +28,7 @@ describe('Polar file parsing', () => {
     engine = new PolarEngine();
   });
 
-  it('parses a .pol file into a PolarTable', () => {
+  it('parses a .pol file into a PolarTable — speeds[twsIdx][twaIdx]', () => {
     const polContent = `6\t10\t14
 40\t2.0\t3.5\t5.0
 60\t3.0\t5.0\t7.0
@@ -38,12 +38,16 @@ describe('Polar file parsing', () => {
     expect(table).not.toBeNull();
     expect(table!.tws).toEqual([6, 10, 14]);
     expect(table!.twa).toEqual([40, 60, 80]);
-    expect(table!.speeds[0]).toEqual([2.0, 3.5, 5.0]);
-    expect(table!.speeds[1]).toEqual([3.0, 5.0, 7.0]);
-    expect(table!.speeds[2]).toEqual([3.5, 5.5, 7.5]);
+    // Fix #1: outer index is TWS, inner is TWA
+    // speeds[0]=TWS6: [2.0@40°, 3.0@60°, 3.5@80°]
+    expect(table!.speeds[0]).toEqual([2.0, 3.0, 3.5]);
+    // speeds[1]=TWS10: [3.5@40°, 5.0@60°, 5.5@80°]
+    expect(table!.speeds[1]).toEqual([3.5, 5.0, 5.5]);
+    // speeds[2]=TWS14: [5.0@40°, 7.0@60°, 7.5@80°]
+    expect(table!.speeds[2]).toEqual([5.0, 7.0, 7.5]);
   });
 
-  it('parses a CSV file into a PolarTable', () => {
+  it('parses a CSV file into a PolarTable — speeds[twsIdx][twaIdx]', () => {
     const csvContent = `TWA,6,10,14
 40,2.0,3.5,5.0
 60,3.0,5.0,7.0
@@ -53,7 +57,11 @@ describe('Polar file parsing', () => {
     expect(table).not.toBeNull();
     expect(table!.tws).toEqual([6, 10, 14]);
     expect(table!.twa).toEqual([40, 60, 80]);
-    expect(table!.speeds[0]).toEqual([2.0, 3.5, 5.0]);
+    // Fix #1: outer index is TWS, inner is TWA
+    // speeds[0]=TWS6: [2.0@40°, 3.0@60°, 3.5@80°]
+    expect(table!.speeds[0]).toEqual([2.0, 3.0, 3.5]);
+    expect(table!.speeds[1]).toEqual([3.5, 5.0, 5.5]);
+    expect(table!.speeds[2]).toEqual([5.0, 7.0, 7.5]);
   });
 
   it('returns null for empty .pol content', () => {
@@ -444,7 +452,7 @@ describe('Regression guard: .pol and .csv parsing after Expedition support', () 
     engine = new PolarEngine();
   });
 
-  it('.pol parser still returns expected table', () => {
+  it('.pol parser still returns expected table (speeds[twsIdx][twaIdx])', () => {
     const polContent = `6\t10\t14
 40\t2.0\t3.5\t5.0
 60\t3.0\t5.0\t7.0
@@ -452,10 +460,13 @@ describe('Regression guard: .pol and .csv parsing after Expedition support', () 
     const table = engine.parsePolContent(polContent)!;
     expect(table.tws).toEqual([6, 10, 14]);
     expect(table.twa).toEqual([40, 60]);
-    expect(table.speeds[0]).toEqual([2.0, 3.5, 5.0]);
+    // speeds[0]=TWS6: [2.0@40°, 3.0@60°]
+    expect(table.speeds[0]).toEqual([2.0, 3.0]);
+    // speeds[1]=TWS10: [3.5@40°, 5.0@60°]
+    expect(table.speeds[1]).toEqual([3.5, 5.0]);
   });
 
-  it('.csv parser still returns expected table', () => {
+  it('.csv parser still returns expected table (speeds[twsIdx][twaIdx])', () => {
     const csvContent = `TWA,6,10,14
 40,2.0,3.5,5.0
 60,3.0,5.0,7.0
@@ -463,5 +474,163 @@ describe('Regression guard: .pol and .csv parsing after Expedition support', () 
     const table = engine.parseCsvContent(csvContent)!;
     expect(table.tws).toEqual([6, 10, 14]);
     expect(table.twa).toEqual([40, 60]);
+    // speeds[0]=TWS6: [2.0@40°, 3.0@60°]
+    expect(table.speeds[0]).toEqual([2.0, 3.0]);
+  });
+});
+
+// ===================================================================
+// Fix #1 — Round-trip tests: parse → interpolate must return seeded cell values
+// ===================================================================
+describe('Fix #1 — Polar parse round-trips (BE1 regression guard)', () => {
+  let engine: PolarEngine;
+
+  beforeEach(() => {
+    engine = new PolarEngine();
+  });
+
+  it('parsePolContent round-trip: interpolateSpeed returns exact seeded cell value', () => {
+    // TWS=6,10,14 ; TWA=40,60,80
+    // Row TWA=40: 2.0@TWS6, 3.5@TWS10, 5.0@TWS14
+    // Row TWA=60: 3.0@TWS6, 5.0@TWS10, 7.0@TWS14
+    const polContent = `6\t10\t14
+40\t2.0\t3.5\t5.0
+60\t3.0\t5.0\t7.0
+80\t3.5\t5.5\t7.5
+`;
+    const table = engine.parsePolContent(polContent)!;
+    expect(table).not.toBeNull();
+
+    // Exact grid point lookups must return the seeded value (bilinear = exact at grid corners)
+    expect(engine.interpolateSpeed(table, 6, 40, 'linear')).toBeCloseTo(2.0, 5);
+    expect(engine.interpolateSpeed(table, 10, 60, 'linear')).toBeCloseTo(5.0, 5);
+    expect(engine.interpolateSpeed(table, 14, 80, 'linear')).toBeCloseTo(7.5, 5);
+  });
+
+  it('parseCsvContent round-trip: interpolateSpeed returns exact seeded cell value', () => {
+    const csvContent = `TWA,6,10,14
+40,2.0,3.5,5.0
+60,3.0,5.0,7.0
+80,3.5,5.5,7.5
+`;
+    const table = engine.parseCsvContent(csvContent)!;
+    expect(table).not.toBeNull();
+
+    expect(engine.interpolateSpeed(table, 6, 40, 'linear')).toBeCloseTo(2.0, 5);
+    expect(engine.interpolateSpeed(table, 10, 60, 'linear')).toBeCloseTo(5.0, 5);
+    expect(engine.interpolateSpeed(table, 14, 80, 'linear')).toBeCloseTo(7.5, 5);
+  });
+
+  it('parseExpeditionContent round-trip: interpolateSpeed returns value in expected range', () => {
+    const expeditionContent = `!test polar
+6  0 0  43 5.50  60 6.00  90 6.00  180 3.00
+10 0 0  39 6.50  60 7.00  90 7.00  180 4.00
+`;
+    const table = engine.parseExpeditionContent(expeditionContent)!;
+    expect(table).not.toBeNull();
+
+    // At an exact grid point (TWS=6, TWA=60), should return ~6.0
+    const speed = engine.interpolateSpeed(table, 6, 60, 'linear');
+    expect(speed).not.toBeNull();
+    expect(speed!).toBeCloseTo(6.0, 2);
+
+    // At exact TWS=10, TWA=90 should return ~7.0
+    const speed2 = engine.interpolateSpeed(table, 10, 90, 'linear');
+    expect(speed2).not.toBeNull();
+    expect(speed2!).toBeCloseTo(7.0, 2);
+  });
+
+  it('assertPolarShape throws on a deliberately transposed matrix', () => {
+    // Correct shape: tws=[6,10], twa=[40,60,80] → speeds should be [2][3]
+    // Transposed (buggy) shape: speeds is [3][2]
+    const transposedTable: PolarTable = {
+      tws: [6, 10],     // 2 TWS values
+      twa: [40, 60, 80], // 3 TWA values
+      speeds: [           // 3 rows of length 2 → speeds[twaIdx][twsIdx] = WRONG
+        [2.0, 3.5],       // twaIdx=0
+        [3.0, 5.0],       // twaIdx=1
+        [3.5, 5.5],       // twaIdx=2
+      ],
+    };
+    // speeds.length = 3 but tws.length = 2 → mismatch
+    expect(() => assertPolarShape(transposedTable)).toThrow(/Polar shape mismatch/);
+  });
+
+  it('assertPolarShape does not throw on a correctly-shaped matrix', () => {
+    const correctTable: PolarTable = {
+      tws: [6, 10],       // 2 TWS values
+      twa: [40, 60, 80],  // 3 TWA values
+      speeds: [            // 2 rows (twsIdx=0,1) of length 3 (twaIdx=0,1,2)
+        [2.0, 3.0, 3.5],  // TWS=6
+        [3.5, 5.0, 5.5],  // TWS=10
+      ],
+    };
+    expect(() => assertPolarShape(correctTable)).not.toThrow();
+  });
+});
+
+// ===================================================================
+// Fix S4 — loadProfiles() error surfacing
+// ===================================================================
+describe('Fix S4 — loadProfiles error surfacing', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'polar-s4-test-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('corrupt JSON at profiles path → _profileLoadError non-null, seed polar returned', () => {
+    // Write corrupt JSON to the profiles path location
+    const configDir = path.join(tmpDir, 'config');
+    fs.mkdirSync(configDir, { recursive: true });
+    const profilesPath = path.join(configDir, 'boat-profiles.json');
+    fs.writeFileSync(profilesPath, '{ this is not valid JSON !!!', 'utf-8');
+
+    // Patch the engine to use our tmp paths (reach into the private fields)
+    const engine = new PolarEngine();
+    (engine as any).profilesPath = profilesPath;
+    (engine as any).profiles = new Map();
+    (engine as any).nextId = 1;
+    (engine as any)._profileLoadError = null;
+
+    // Trigger loadProfiles with the corrupt file
+    (engine as any).loadProfiles();
+
+    // Error should be surfaced
+    expect(engine.getProfileLoadError()).not.toBeNull();
+    expect(typeof engine.getProfileLoadError()).toBe('string');
+  });
+
+  it('valid JSON at profiles path → _profileLoadError is null, profiles load correctly', () => {
+    const configDir = path.join(tmpDir, 'config');
+    fs.mkdirSync(configDir, { recursive: true });
+    const profilesPath = path.join(configDir, 'boat-profiles.json');
+
+    const testProfile = [{
+      id: 1,
+      name: 'Test Boat',
+      hullType: 'monohull',
+      polarData: {
+        tws: [6, 10],
+        twa: [40, 60],
+        speeds: [[2.0, 3.0], [3.5, 5.0]],
+      },
+      createdAt: new Date().toISOString(),
+    }];
+    fs.writeFileSync(profilesPath, JSON.stringify(testProfile), 'utf-8');
+
+    const engine = new PolarEngine();
+    (engine as any).profilesPath = profilesPath;
+    (engine as any).profiles = new Map();
+    (engine as any).nextId = 1;
+    (engine as any)._profileLoadError = null;
+
+    (engine as any).loadProfiles();
+
+    expect(engine.getProfileLoadError()).toBeNull();
   });
 });

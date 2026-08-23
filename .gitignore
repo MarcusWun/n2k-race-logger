@@ -6,3 +6,6 @@ polars/
 *.log
 .env
 .DS_Store
+# Generated at build time by scripts/gen-build-info.js (prebuild hook).
+# Committed build-info.default.ts serves as the dev fallback.
+electron/build-info.ts

@@ -211,7 +211,9 @@ export class RaceDatabase {
       VALUES (?, ?, ?, ?, NULL, ?, 0)
     `);
 
-    // Use current timestamp as race ID (Unix ms, truncated)
+    // Use current timestamp as race ID (Unix seconds, 10-digit).
+    // Note: two races started in the same second will collide on the primary key.
+    // AUTOINCREMENT would eliminate this risk but requires a schema migration — deferred as non-blocking follow-up.
     const raceId = Math.floor(Date.now() / 1000);
 
     stmt.run(raceId, now, label, now, boatProfile || null);

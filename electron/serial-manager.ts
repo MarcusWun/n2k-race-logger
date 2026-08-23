@@ -309,10 +309,20 @@ export class SerialManager extends EventEmitter {
     // needing to wire through the full BST → canboatjs decoder chain.
     this.on('pgn', () => {
       if (this.activeMode !== 'serial') return;
+      // Fix #7: reset backoff on first valid PGN after a reconnect.
+      // _clearAllSerialSession sets lastValidPgnAt = null, so wasNull=true on the
+      // first PGN of every new session (initial or post-reconnect). Resetting here
+      // (rather than on port open) ensures an open-but-silent port does NOT
+      // prematurely reset the backoff ladder.
+      const wasNull = this.lastValidPgnAt === null;
       this.lastValidPgnAt = Date.now();
       if (this._currentSerialStatus === 'stale') {
         // Transition back to 'connected' — data has resumed
         this._emitSerialStatus('connected');
+      }
+      if (wasNull) {
+        // First valid PGN of this session: backoff ladder reset to start.
+        this.backoffIndex = 0;
       }
       this._resetWatchdog();
     });
@@ -476,9 +486,16 @@ export class SerialManager extends EventEmitter {
         // No data at this baud rate — try the next one
         console.log(`[SerialManager] No data at ${baudRate} baud, trying next rate...`);
       } catch (err: any) {
-        this._emitSerialStatus('error', err?.message || 'Unknown connection error');
+        const errorMsg = err?.message || 'Unknown connection error';
+        this._emitSerialStatus('error', errorMsg);
         this.port = null;
         this.pgnParser = null;
+        // Fix #8: route initial open-failure through the same backoff retry handler as
+        // mid-race disconnects, so the manager automatically retries instead of giving up.
+        // Guard with userInitiatedStop so intentional disconnects do not loop.
+        if (!this.userInitiatedStop) {
+          this._handleSerialDisconnect(`Open failed: ${errorMsg}`);
+        }
         return;
       }
     }
@@ -764,6 +781,9 @@ export class SerialManager extends EventEmitter {
       this.tcpSocket.connect(p, h, () => {
         this.tcpSocket!.removeListener('error', onError);
         this.tcpSocket!.removeListener('timeout', onTimeout);
+        // Fix S1: disarm the connect-timeout timer now that the connection is established.
+        // Without this, the 10-second timeout fires during normal operation on an idle socket.
+        this.tcpSocket!.setTimeout(0);
         const actual = `${this.tcpSocket!.remoteAddress || h}:${this.tcpSocket!.remotePort || p}`;
         console.log(`[SerialManager] TCP connected to ${actual} in ${Date.now() - startedAt}ms`);
 
@@ -830,13 +850,20 @@ export class SerialManager extends EventEmitter {
       this.pgnParser.removeAllListeners();
       this.pgnParser = null;
     }
-    if (this.port && this.port.isOpen) {
-      try {
-        await new Promise<void>((resolve) => {
-          this.port!.close(() => resolve());
-        });
-      } catch {
-        // ignore close errors
+    if (this.port) {
+      // Fix S2: remove all port listeners before closing to prevent stale event handlers
+      // from firing against a partially-torn-down manager state between close() and GC.
+      this.port.removeAllListeners('error');
+      this.port.removeAllListeners('close');
+      this.port.removeAllListeners('data');
+      if (this.port.isOpen) {
+        try {
+          await new Promise<void>((resolve) => {
+            this.port!.close(() => resolve());
+          });
+        } catch {
+          // ignore close errors
+        }
       }
     }
     this.port = null;

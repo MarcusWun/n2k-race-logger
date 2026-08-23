@@ -67,6 +67,24 @@ type SplineKey = string;
 const _splineCache = new WeakMap<PolarTable, Map<SplineKey, (x: number) => number>>();
 
 /**
+ * Assert that a PolarTable's speeds matrix has shape [tws.length][twa.length].
+ * Throws a clear error message if the shape is wrong, so callers get an
+ * actionable diagnostic rather than an opaque crash deep inside the spline builder.
+ */
+export function assertPolarShape(table: PolarTable): void {
+  if (table.speeds.length !== table.tws.length) {
+    throw new Error(
+      `Polar shape mismatch: speeds has ${table.speeds.length} rows but tws has ${table.tws.length} entries`,
+    );
+  }
+  if (table.speeds[0]?.length !== table.twa.length) {
+    throw new Error(
+      `Polar shape mismatch: speeds[0] has ${table.speeds[0]?.length} cols but twa has ${table.twa.length} entries`,
+    );
+  }
+}
+
+/**
  * Return a cached spline for a single TWS row of the polar table.
  * Builds it on first access, then reuses on subsequent calls for the same
  * (table, rowIndex, method) combination.
@@ -76,6 +94,7 @@ function getOrBuildSpline(
   rowIdx: number,
   method: 'pchip' | 'akima',
 ): (x: number) => number {
+  assertPolarShape(table);
   if (!_splineCache.has(table)) {
     _splineCache.set(table, new Map());
   }
@@ -94,6 +113,8 @@ export class PolarEngine {
   private nextId = 1;
   private polarDirectory: string;
   private profilesPath: string;
+  /** Non-null when loadProfiles() caught an error — mirrors the settings-store _loadError pattern. */
+  private _profileLoadError: string | null = null;
 
   constructor() {
     this.polarDirectory = path.join(os.homedir(), 'n2k-race-logger', 'polars');
@@ -142,10 +163,19 @@ export class PolarEngine {
         }
         return parsed;
       }
-    } catch {
-      // ignore
+    } catch (err: any) {
+      // Surface the error instead of silently discarding it — mirrors settings-store _loadError pattern.
+      this._profileLoadError = err?.message ?? String(err);
     }
     return [];
+  }
+
+  /**
+   * Return the most recent load error message from loadProfiles(), or null if the last load succeeded.
+   * Used by the IPC handler to surface corrupt-profile errors to the renderer.
+   */
+  getProfileLoadError(): string | null {
+    return this._profileLoadError;
   }
 
   /**
@@ -292,6 +322,7 @@ export class PolarEngine {
     if (twsValues.length === 0) return null;
 
     const twaValues: number[] = [];
+    // speeds[twsIdx][twaIdx] — fix #1: outer index is TWS (column), inner is TWA (row)
     const speeds: number[][] = [];
 
     for (let i = 1; i < lines.length; i++) {
@@ -302,12 +333,14 @@ export class PolarEngine {
 
       if (cols.length < 2) continue;
 
+      const twaIdx = twaValues.length;
       twaValues.push(cols[0]);
-      const rowSpeeds: number[] = [];
+      // Each data column j (1-based) corresponds to twsValues[j-1]
       for (let j = 1; j < cols.length; j++) {
-        rowSpeeds.push(isNaN(cols[j]) ? 0 : cols[j]);
+        const twsIdx = j - 1;
+        if (!speeds[twsIdx]) speeds[twsIdx] = [];
+        speeds[twsIdx][twaIdx] = isNaN(cols[j]) ? 0 : cols[j];
       }
-      speeds.push(rowSpeeds);
     }
 
     if (twaValues.length === 0 || speeds.length === 0) return null;
@@ -331,6 +364,7 @@ export class PolarEngine {
     if (twsValues.length === 0) return null;
 
     const twaValues: number[] = [];
+    // speeds[twsIdx][twaIdx] — fix #1: outer index is TWS (column), inner is TWA (row)
     const speeds: number[][] = [];
 
     for (let i = 1; i < lines.length; i++) {
@@ -338,13 +372,15 @@ export class PolarEngine {
       const twa = Number(cols[0]);
       if (isNaN(twa)) continue;
 
+      const twaIdx = twaValues.length;
       twaValues.push(twa);
-      const rowSpeeds: number[] = [];
+      // Each data column j (1-based) corresponds to twsValues[j-1]
       for (let j = 1; j < cols.length; j++) {
+        const twsIdx = j - 1;
         const val = Number(cols[j]);
-        rowSpeeds.push(isNaN(val) ? 0 : val);
+        if (!speeds[twsIdx]) speeds[twsIdx] = [];
+        speeds[twsIdx][twaIdx] = isNaN(val) ? 0 : val;
       }
-      speeds.push(rowSpeeds);
     }
 
     if (twaValues.length === 0) return null;
@@ -480,6 +516,9 @@ export class PolarEngine {
     // Validate inputs
     if (isNaN(tws) || isNaN(twa)) return null;
     if (tws <= 0 || twa < 0) return null;
+
+    // Assert correct matrix shape — catches transpose bugs at the earliest possible point
+    assertPolarShape(table);
 
     // Check TWS bounds
     const minTWS = table.tws[0];

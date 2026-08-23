@@ -9,6 +9,7 @@ import {
   reconstructTimeSeries,
   resampleToGrid,
   detectSegments,
+  splitSegmentsAtSailChanges,
   assignSailTags,
   computeSegmentPerformance,
   aggregatePerformance,
@@ -516,6 +517,13 @@ export function registerIPCHandlers(): void {
     return { success: true, polarData: profile.polarData };
   });
 
+  // --- polar:get-load-error (Fix S4) ---
+  // Returns the most recent profile-load error message, or null if the last load succeeded.
+  // The renderer can display a non-blocking warning when this is non-null.
+  ipcMain.handle('polar:get-load-error', async () => {
+    return { loadError: polarEngine!.getProfileLoadError() };
+  });
+
   // --- polar:performance ---
   ipcMain.handle('polar:performance', async (_event, payload: { tws: number | null; twa: number | null; stw: number | null; profileId: number }) => {
     const profile = polarEngine!.getProfile(payload.profileId);
@@ -529,8 +537,9 @@ export function registerIPCHandlers(): void {
       payload.stw,
     );
 
-    // Notify renderer
-    getWebContents()?.send('polar:performance', result);
+    // Fix #4: Return result via ipcMain.handle only (resolves the ipcRenderer.invoke promise).
+    // Removed the redundant getWebContents()?.send('polar:performance', result) push that
+    // caused double delivery and a stale-result race in the renderer (no ordering guard).
     return result;
   });
 
@@ -675,8 +684,12 @@ export function registerIPCHandlers(): void {
         };
       }
 
-      const startMs = Math.min(...allTimes);
-      const endMs = Math.max(...allTimes);
+      // Fix #2: allTimes is sorted ascending (reconstructTimeSeries processes timestamps in
+      // ascending order via sortedTimes). Use direct array access — O(1), no argument-count
+      // limit. Do NOT use Math.min(...allTimes) / Math.max(...allTimes): V8 enforces a
+      // maximum call-stack argument count (~150k) that causes a RangeError on long races.
+      const startMs = allTimes[0];
+      const endMs = allTimes[allTimes.length - 1];
 
       // Resample each metric
       const resampled = {
@@ -752,7 +765,19 @@ export function registerIPCHandlers(): void {
       endTime: new Date(r.end_time).getTime(),
     }));
 
-    let withSails = assignSailTags(segments, sailTags);
+    // Fix #6: split segments at sail-change boundaries before tagging.
+    // Without this, a segment straddling a boundary matches neither tag and
+    // receives sailConfig: null, silently dropping it from the performance summary.
+    const splitSegs = splitSegmentsAtSailChanges(
+      segments,
+      sailTags,
+      analysisTimeSeries.tws,
+      analysisTimeSeries.twa,
+      analysisTimeSeries.stw,
+      thresholds.minDuration,
+    );
+
+    let withSails = assignSailTags(splitSegs, sailTags);
 
     // Compute % of polar
     const profiles = polarEngine!.listProfiles();

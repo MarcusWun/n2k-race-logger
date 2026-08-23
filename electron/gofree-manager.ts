@@ -481,9 +481,32 @@ export class GoFreeManager extends EventEmitter {
     if (this.enableChannelProbe && availableIds.length > 0) {
       const knownSet = new Set(REQUIRED_CHANNEL_IDS);
       const probeIds = availableIds.filter((id) => !knownSet.has(id));
-      this.emit('debug', `[GoFree PROBE] Probing ${probeIds.length} additional channels once (inst=0)…`);
-      for (const id of probeIds) {
+
+      // Channels ≤ 100 respond to one-shot DataReq (repeat:false) and are
+      // probed once. Higher-numbered channels appear to require streaming
+      // subscriptions (repeat:true) — the H5000 silently ignores repeat:false
+      // for these (confirmed: no PROBE log appears for channels 118–515 with
+      // repeat:false). Subscribe them with repeat:true so they stream data and
+      // we can identify which channel carries the calibrated AWA/TWA value.
+      const lowIds = probeIds.filter((id) => id <= 100);
+      const highIds = probeIds.filter((id) => id > 100);
+
+      this.emit(
+        'debug',
+        `[GoFree PROBE] One-shot probing ${lowIds.length} channels ≤ 100 (repeat:false)…`,
+      );
+      for (const id of lowIds) {
         this.send({ DataReq: [{ id, repeat: false, inst: 0 }] });
+      }
+
+      if (highIds.length > 0) {
+        this.emit(
+          'debug',
+          `[GoFree PROBE] Streaming probe of ${highIds.length} channels > 100 (repeat:true) — look for channel with AWA value (~145°)…`,
+        );
+        for (const id of highIds) {
+          this.send({ DataReq: [{ id, repeat: true, inst: 0 }] });
+        }
       }
     }
 
@@ -616,7 +639,17 @@ export class GoFreeManager extends EventEmitter {
     let validCount = 0;
     for (const o of obs) {
       if (!o || typeof o.id !== 'number') continue;
-      if (o.valid === false) continue; // discard invalid observations
+      if (o.valid === false) {
+        // In probe mode, log invalid responses so we can see if the H5000 is
+        // responding at all for high-numbered channels (diagnosis for AWA/TWA).
+        if (this.enableChannelProbe) {
+          this.emit(
+            'debug',
+            `[GoFree PROBE-INVALID] ch${o.id}: valid=false val=${o.val ?? 'n/a'} valStr="${o.valStr ?? ''}"`,
+          );
+        }
+        continue; // discard invalid observations
+      }
 
       // Prefer numeric val; fall back to valStr (H5000 often sends string values
       // including scientific notation, e.g. "2.45909e+06").

@@ -27,6 +27,18 @@
 - **Regression test IDs:** `build-info.test.ts` — imports `build-info.ts` and `build-info.default.ts`, asserts all exports are strings with correct placeholder values.
 - **Prevention:** Always invoke builds via npm scripts (`npm run build`) rather than underlying tools directly, so pre/post hooks are preserved.
 
+### #4-renderer — polar:performance dead listener removed from Dashboard (P1 correctness)
+
+- **Root cause:** `Dashboard.tsx` registered `ipc.on('polar:performance', setPerformance)` (lines 221–223 pre-fix) to receive an unsolicited push from the backend. The backend Phase A fix (#4-backend, commit `870c898`) removed the `getWebContents()?.send('polar:performance', result)` push. With the push gone, the listener became dead code, but its registration and teardown remained. More critically, the listener had no requestId ordering guard — a slow response from a prior request could arrive after a later one and overwrite a fresher result. Even before the backend fix, the listener caused two `setPerformance` calls per request (one via invoke `.then()`, one via the push listener), producing a redundant re-render.
+- **Files:** `src/components/Dashboard/Dashboard.tsx`
+- **Fix:** Removed the `ipc.on('polar:performance', ...)` registration (3 lines) and its `unsubPerf()` teardown call. Removed `setPerformance` from the dependency array of the affected `useEffect` since it was only used there via the removed listener. The `requestId`-guarded `ipcRenderer.invoke` path in the second `useEffect` remains the sole delivery mechanism.
+- **Regression test IDs:** `electron/phase-a-correctness.test.ts` — "Fix #4 renderer — polar:performance dead listener removed from Dashboard (FE4a regression guard)" suite:
+  - Static analysis: `Dashboard.tsx` has no non-comment line with `.on(` and `'polar:performance'`.
+  - Functional: `requestLivePolarPerformance` (the invoke-path utility) calls `setPerformance` exactly once per call.
+  - Rapid-invoke ordering: two concurrent calls each produce exactly one `setPerformance` invocation (2 total), confirming single-delivery per request.
+- **Cross-reference:** Backend half documented above as `#4-backend`.
+- **Prevention:** For request-response IPC patterns, use `ipcMain.handle` return value (resolved via `ipcRenderer.invoke`) as the sole delivery mechanism. Any renderer listener on a push channel (`ipc.on`) must be paired with a requestId ordering guard. Audit new renderer listeners added in code review.
+
 ### #4-backend — polar:performance double delivery (P1 correctness)
 
 - **Root cause:** The `polar:performance` `ipcMain.handle` handler in `electron/ipc-handlers.ts` both returned its result (resolving the `ipcRenderer.invoke` promise) AND sent an unsolicited push via `getWebContents()?.send('polar:performance', result)`. The renderer's event listener for this push had no ordering guard, allowing stale results from slow prior requests to overwrite fresher results.

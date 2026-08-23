@@ -218,10 +218,6 @@ export default function Dashboard() {
       }
     });
 
-    const unsubPerf = ipc.on('polar:performance', (perf: any) => {
-      setPerformance(perf);
-    });
-
     // Subscribe to GoFree per-channel freshness events (PRD §4.2 / BE2 / BE5).
     // Stale channel IDs are forwarded from GoFreeManager via the IPC bridge.
     const unsubFreshness = ipc.on('gofree:freshness', (event: GoFreeFreshnessEvent) => {
@@ -230,10 +226,9 @@ export default function Dashboard() {
 
     return () => {
       unsubPgn();
-      unsubPerf();
       unsubFreshness();
     };
-  }, [setMetric, updateLastUpdated, setPerformance, setStaleChannels]);
+  }, [setMetric, updateLastUpdated, setStaleChannels]);
 
   return (
     <div className="flex flex-col gap-4 h-full">

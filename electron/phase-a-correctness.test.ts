@@ -5,12 +5,14 @@
  *   BE2 — Fix #2: Math.min/max spread crash on long races
  *   BE4a — Fix #4 backend half: polar:performance double delivery
  *   BE5 — Fix #6: splitSegmentsAtSailChanges wiring
+ *   FE4a — Fix #4 renderer half: polar:performance dead listener removed from Dashboard
  *
- * These tests exercise the fixed logic in ipc-handlers.ts and analysis-engine.ts
- * without needing a real Electron runtime.
+ * These tests exercise the fixed logic in ipc-handlers.ts, analysis-engine.ts,
+ * and renderer utilities without needing a real Electron or browser runtime.
  */
 
 import { describe, it, expect, vi } from 'vitest';
+import { requestLivePolarPerformance } from '../src/utils/livePolarPerformance';
 import {
   reconstructTimeSeries,
   detectSegments,
@@ -212,5 +214,106 @@ describe('Fix #6 — splitSegmentsAtSailChanges chain wiring (BE5 regression gua
 
     // No split should have occurred — segment count unchanged
     expect(splitSegments.length).toBe(segments.length);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FE4a — Fix #4 renderer half: dead polar:performance listener removed
+// ---------------------------------------------------------------------------
+
+describe('Fix #4 renderer — polar:performance dead listener removed from Dashboard (FE4a regression guard)', () => {
+  it('Dashboard.tsx does not register an ipc.on polar:performance listener (static analysis guard)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require('fs');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const path = require('path');
+    const src: string = fs.readFileSync(
+      path.join(__dirname, '..', 'src', 'components', 'Dashboard', 'Dashboard.tsx'),
+      'utf-8',
+    );
+
+    // Assert that no non-comment line registers a listener for 'polar:performance'.
+    // The push channel was removed from the backend at 870c898; the renderer listener
+    // is now dead code and was removed in this fix. A future re-addition would silently
+    // cause double-delivery and ordering bugs (no requestId guard on the listener path).
+    const hasDeadListener = src
+      .split('\n')
+      .filter((line: string) => !line.trim().startsWith('//'))
+      .some(
+        (line: string) =>
+          line.includes("'polar:performance'") && line.includes('.on('),
+      );
+    expect(hasDeadListener).toBe(false);
+  });
+
+  it('requestLivePolarPerformance (the sole remaining delivery path) calls setPerformance exactly once per invoke', async () => {
+    // Prior to the fix, each polar:performance request triggered TWO setPerformance calls:
+    //   1. Via ipcRenderer.invoke(...).then(setPerformance)  [requestId-guarded]
+    //   2. Via ipcRenderer.on('polar:performance', setPerformance)  [unguarded push — now removed]
+    // This test asserts the invoke path (requestLivePolarPerformance) calls the callback exactly once.
+    const performanceCalls: unknown[] = [];
+    await requestLivePolarPerformance(
+      {
+        getPerformance: async () => ({
+          percentPolar: 95,
+          targetSpeed: 6.5,
+          actualSpeed: 6.2,
+        }),
+      },
+      { stw: 6.2, tws: 12.0, twa: 45 },
+      7,
+      (performance) => performanceCalls.push(performance),
+    );
+
+    expect(performanceCalls).toHaveLength(1);
+    expect(performanceCalls[0]).toEqual({
+      percentPolar: 95,
+      targetSpeed: 6.5,
+      actualSpeed: 6.2,
+    });
+  });
+
+  it('requestLivePolarPerformance calls setPerformance exactly once even when invoked in rapid succession', async () => {
+    // Regression guard against ordering bugs under rapid consecutive invokes.
+    // Each call to requestLivePolarPerformance should produce exactly one setPerformance
+    // callback regardless of whether earlier calls resolve before or after later ones.
+    const calls: Array<{ index: number; performance: unknown }> = [];
+    let resolveFirst!: (v: unknown) => void;
+    const firstInflight = new Promise((res) => { resolveFirst = res; });
+
+    let callCount = 0;
+    const ipc = {
+      getPerformance: async (payload: unknown) => {
+        const myIndex = callCount++;
+        if (myIndex === 0) {
+          // First call blocks until we resolve it manually (simulates slow response)
+          await firstInflight;
+          return { percentPolar: 80, targetSpeed: 6.0, actualSpeed: 4.8 };
+        }
+        return { percentPolar: 95, targetSpeed: 6.5, actualSpeed: 6.2 };
+      },
+    };
+
+    // Fire first request but don't await — it is blocked
+    const p1 = requestLivePolarPerformance(ipc, { stw: 4.8, tws: 10, twa: 45 }, 7, (perf) =>
+      calls.push({ index: 0, performance: perf }),
+    );
+
+    // Fire second request immediately — resolves before first
+    await requestLivePolarPerformance(ipc, { stw: 6.2, tws: 12, twa: 45 }, 7, (perf) =>
+      calls.push({ index: 1, performance: perf }),
+    );
+
+    // Unblock the first request
+    resolveFirst(undefined);
+    await p1;
+
+    // Each call should have produced exactly one setPerformance invocation (2 total)
+    expect(calls).toHaveLength(2);
+    // Second call resolved first
+    expect(calls[0]).toMatchObject({ index: 1, performance: { percentPolar: 95 } });
+    // First call resolved after (stale response, no requestId guard in the utility itself —
+    // the Dashboard's requestId guard is what protects ordering; the utility just delivers once)
+    expect(calls[1]).toMatchObject({ index: 0, performance: { percentPolar: 80 } });
   });
 });

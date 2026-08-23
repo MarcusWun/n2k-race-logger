@@ -19,6 +19,15 @@
 - **Regression test IDs:** `phase-a-correctness.test.ts` — "Fix #2 — Time-range extraction from large allTimes arrays" suite (200k element no-throw, old spread throws, small array regression, sort invariant verified via reconstructTimeSeries).
 - **Prevention:** Avoid `Math.min/max(...array)` for arrays of unbounded size. Use reduce or direct access for sorted arrays.
 
+### #3 (follow-up) — CI tests fail: build-info.ts not generated before test step (2026-08-23)
+
+- **Root cause:** Fix #3 (commit `870c898`) gitignored `electron/build-info.ts` and relied on the `prebuild` hook of `npm run build` to generate it. The CI workflow runs `npm run test:run` **before** `npm run build`, so the file never existed on the Windows runner at test time. Local builds passed because a stale copy from a prior local build remained on disk — exactly the mock/prod drift class Fix #3 was meant to eliminate.
+- **Files:** `.github/workflows/build-windows.yml`
+- **Fix:** Inserted a dedicated "Generate build-info" step (`node scripts/gen-build-info.js`) between "Install dependencies" and "Run tests" in the workflow. This mirrors what `npm run build`'s prebuild hook does, but runs it early enough that both typecheck and test steps have the generated file available. No app code changes required.
+- **Reproduction (mandatory):** `rm electron/build-info.ts && node scripts/gen-build-info.js && npm run test:run` — both `build-info.test.ts` (8 tests) and `phase-2-8-p2.test.ts` (21 tests) pass with the freshly generated file.
+- **Prevention:** Any workflow that gitignores a generated file and generates it via a `pre<script>` npm hook MUST also include an explicit generation step early in the CI job — before typecheck and test steps. Local reproduction of CI's clean-checkout state (delete generated file → run generator → run tests) must be part of the pre-commit checklist for any gitignored-generator work. Do NOT verify correctness only on a local tree where stale generated artifacts may still exist.
+- **Cross-reference:** Original Fix #3 entry below.
+
 ### #3 — CI never regenerates build-info.ts (P1 correctness)
 
 - **Root cause:** `.github/workflows/build-windows.yml` invoked `npx tsc && npx vite build && npx electron-builder` directly, bypassing npm's `pre<script>` hook mechanism. The `prebuild` hook (`node scripts/gen-build-info.js`) was never triggered in CI, so every installer embedded a stale locally-committed SHA. Additionally, `npx tsc` without `--noEmit` emitted `.js` files into the working tree.

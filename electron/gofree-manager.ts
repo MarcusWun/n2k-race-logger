@@ -141,6 +141,14 @@ const REQUIRED_CHANNEL_IDS = [
 ];
 
 /**
+ * Channels excluded from freshness/staleness tracking.
+ * These are subscribed so they work if the firmware supports them, but they
+ * are NOT counted as stale when absent — the H5000 may not expose them on
+ * all firmware versions (e.g. ch421/ch422 for GPS position).
+ */
+const OPTIONAL_CHANNEL_IDS: ReadonlySet<number> = new Set([CH_LAT, CH_LON]);
+
+/**
  * BE5: Fast-group channel IDs — polled at fastPollIntervalMs (default 200 ms).
  * All other REQUIRED_CHANNEL_IDS belong to the normal group (default 1 000 ms).
  */
@@ -644,6 +652,7 @@ export class GoFreeManager extends EventEmitter {
       case CH_TWA: {
         // Signed degrees (negative = port). Normalize to 0–360° so downstream
         // normalizeWindAngle() logic matches the NGT-1 path.
+        this.emit('debug', `[GoFree ch45/TWA] raw val=${val.toFixed(4)}`);
         const deg360 = ((val % 360) + 360) % 360;
         this.lastTwa = { value: deg360, ts: now };  // BE3: store with timestamp
         const fields: Record<string, any> = {
@@ -671,6 +680,7 @@ export class GoFreeManager extends EventEmitter {
         break;
       }
       case CH_AWA: {
+        this.emit('debug', `[GoFree ch44/AWA] raw val=${val.toFixed(4)}`);
         const deg360 = ((val % 360) + 360) % 360;
         this.lastAwa = { value: deg360, ts: now };  // BE3: store with timestamp
         const fields: Record<string, any> = {
@@ -782,6 +792,9 @@ export class GoFreeManager extends EventEmitter {
     const staleChannels: number[] = [];
 
     for (const channelId of REQUIRED_CHANNEL_IDS) {
+      // Optional channels (e.g. GPS position) are subscribed but not tracked
+      // for staleness — they may not be exposed on all H5000 firmware versions.
+      if (OPTIONAL_CHANNEL_IDS.has(channelId)) continue;
       const lastSeen = this.lastSeenAt.get(channelId);
       const staleWindowMs = FAST_CHANNEL_IDS.has(channelId)
         ? this.fastStaleWindowMs

@@ -206,7 +206,7 @@ export default function Dashboard() {
           }
         }
       }
-      if (pgn === 129025) {
+      if (pgn === 129025 || pgn === 129029) {
         if (fields.latitude != null) {
           setMetric('lat', Number(fields.latitude));
           updateLastUpdated('lat');
@@ -224,9 +224,18 @@ export default function Dashboard() {
       setStaleChannels(event.staleChannels);
     });
 
+    // Clear GoFree stale markers when GoFree disconnects so NGT-1 GPS data
+    // (and any other channels that GoFree marked stale) can display normally.
+    const unsubGofreeStatus = ipc.on('gofree:status', (status: any) => {
+      if (status?.state === 'disconnected') {
+        setStaleChannels([]);
+      }
+    });
+
     return () => {
       unsubPgn();
       unsubFreshness();
+      unsubGofreeStatus();
     };
   }, [setMetric, updateLastUpdated, setStaleChannels]);
 
